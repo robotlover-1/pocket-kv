@@ -1,0 +1,4 @@
+cmd=HSET
+custom: qps=2028.43, vmrss_kb=41488.00, vmsize_kb=42752.00, mem_gap_kb=1264.00, fallback_alloc_calls=0.00
+jemalloc: qps=2061.45, vmrss_kb=27736.00, vmsize_kb=42200.00, mem_gap_kb=14464.00, fallback_alloc_calls=0.00
+libc: qps=2043.53, vmrss_kb=23892.00, vmsize_kb=25292.00, mem_gap_kb=1400.00, fallback_alloc_calls=0.00

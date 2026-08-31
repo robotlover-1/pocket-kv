@@ -1,0 +1,13 @@
+run_label,timestamp,backend,cmd,port,ops,value_size,warmup,elapsed_sec,qps,vmrss_kb,vmsize_kb,vmdata_kb,mem_gap_kb,info,memstat_backend,current_small_inuse,peak_small_inuse,total_small_page_bytes,current_large_inuse_bytes,peak_large_inuse_bytes,active_large_map_bytes,peak_active_large_map_bytes,fallback_alloc_calls,fallback_free_calls,current_fallback_inuse_bytes,peak_fallback_inuse_bytes,large_alloc_calls,small_alloc_calls,current_requested_bytes,current_allocated_bytes,internal_fragment_bytes,internal_fragment_rate,small_page_used_bytes,page_utilization
+hset_ops50000_val128,2026-03-30 00:00:00,libc,HSET,6500,50000,128,200,23.759645,2104.41,12960,14332,0,1372,"role:master mem:libc",libc,0,0,0,0,0,0,0,0,0,0,0,0,0,,,,,
+hset_ops50000_val128,2026-03-30 00:00:00,jemalloc,HSET,6501,50000,128,200,24.467009,2043.59,15908,30936,0,15028,"role:master mem:jemalloc",jemalloc,0,0,0,0,0,0,0,0,0,0,0,0,0,,,,,
+hset_ops50000_val128,2026-03-30 00:00:00,custom,HSET,6502,50000,128,200,25.648578,1949.40,21844,23100,0,1256,"role:master mem:custom",custom,0,0,0,0,0,0,0,0,0,0,0,0,0,,,,,
+hset_ops50000_val32,2026-03-30 00:00:00,libc,HSET,6500,50000,32,200,25.101532,1991.91,8204,9576,0,1372,"role:master mem:libc",libc,0,0,0,0,0,0,0,0,0,0,0,0,0,,,,,
+hset_ops50000_val32,2026-03-30 00:00:00,jemalloc,HSET,6501,50000,32,200,21.643513,2310.12,10400,23252,0,12852,"role:master mem:jemalloc",jemalloc,0,0,0,0,0,0,0,0,0,0,0,0,0,,,,,
+hset_ops50000_val32,2026-03-30 00:00:00,custom,HSET,6502,50000,32,200,22.116321,2260.72,12304,13564,0,1260,"role:master mem:custom",custom,0,0,0,0,0,0,0,0,0,0,0,0,0,,,,,
+hset_ops50000_val4096,2026-03-30 00:00:00,libc,HSET,6500,50000,4096,200,27.271328,1833.38,207268,208812,0,1544,"role:master mem:libc",libc,0,0,0,0,0,0,0,0,0,0,0,0,0,,,,,
+hset_ops50000_val4096,2026-03-30 00:00:00,jemalloc,HSET,6501,50000,4096,200,25.883088,1931.79,260952,307412,0,46460,"role:master mem:jemalloc",jemalloc,0,0,0,0,0,0,0,0,0,0,0,0,0,,,,,
+hset_ops50000_val4096,2026-03-30 00:00:00,custom,HSET,6502,50000,4096,200,32.474359,1539.65,409968,411260,0,1292,"role:master mem:custom",custom,0,0,0,0,0,0,0,0,0,0,0,0,0,,,,,
+hset_ops100000_val128,2026-03-30 00:00:00,libc,HSET,6500,100000,128,200,48.935669,2043.53,23892,25292,0,1400,"role:master mem:libc",libc,0,0,0,0,0,0,0,0,0,0,0,0,0,,,,,
+hset_ops100000_val128,2026-03-30 00:00:00,jemalloc,HSET,6501,100000,128,200,48.508191,2061.45,27736,42200,0,14464,"role:master mem:jemalloc",jemalloc,0,0,0,0,0,0,0,0,0,0,0,0,0,,,,,
+hset_ops100000_val128,2026-03-30 00:00:00,custom,HSET,6502,100000,128,200,49.299397,2028.43,41488,42752,0,1264,"role:master mem:custom",custom,0,0,0,0,0,0,0,0,0,0,0,0,0,,,,,

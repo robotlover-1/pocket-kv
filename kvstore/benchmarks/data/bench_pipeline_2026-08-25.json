@@ -1,0 +1,50 @@
+{
+  "1": {
+    "kv_echo": 229934.59999999998,
+    "rd_echo": 207359.87,
+    "kv_hset_disable": 201457.08000000002,
+    "kv_hset_always": 184653.315,
+    "rd_hset_disable": 188235.525,
+    "rd_hset_always": 73059.36499999999
+  },
+  "10": {
+    "kv_echo": 1699349.375,
+    "rd_echo": 1380839.435,
+    "kv_hset_disable": 1068694.625,
+    "kv_hset_always": 915612.4450000001,
+    "rd_hset_disable": 946263.0700000001,
+    "rd_hset_always": 410050.645
+  },
+  "20": {
+    "kv_echo": 2527433.24,
+    "rd_echo": 2150120.9,
+    "kv_hset_disable": 1447480.44,
+    "kv_hset_always": 1189775.715,
+    "rd_hset_disable": 1244200.505,
+    "rd_hset_always": 569407.64
+  },
+  "40": {
+    "kv_echo": 3311913.9800000004,
+    "rd_echo": 2839260.26,
+    "kv_hset_disable": 1823340.5899999999,
+    "kv_hset_always": 1460359.395,
+    "rd_hset_disable": 1520997.5350000001,
+    "rd_hset_always": 692786.2050000001
+  },
+  "80": {
+    "kv_echo": 3935668.715,
+    "rd_echo": 3347799.99,
+    "kv_hset_disable": 2076365.9449999998,
+    "kv_hset_always": 1554116.21,
+    "rd_hset_disable": 1792295.53,
+    "rd_hset_always": 824387.0349999999
+  },
+  "160": {
+    "kv_echo": 4497572.91,
+    "rd_echo": 3757542.81,
+    "kv_hset_disable": 2290070.955,
+    "kv_hset_always": 1660389.74,
+    "rd_hset_disable": 1958178.99,
+    "rd_hset_always": 968264.5249999999
+  }
+}

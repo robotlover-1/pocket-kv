@@ -1,0 +1,259 @@
+[sudo] password for pp: === kprobe 主从转发 QPS 对比 ===
+payload=64 bytes, count=10000
+模式: all
+none  = 纯echo不转发   sync = echo+同步转发   kprobe = echo+kprobe异步转发
+
+mode        size           qps      avg      p50      p99      min      max    slave      fwd
+----------  ------  ----------  -------  -------  -------  -------  -------  -------  -------
+[none   ] master ready, running client...
+[client] connected after retries
+[client] warmup done
+[client] starting test loop, 10000 reqs
+[client] test done, ok=10000 elapsed=358320us qps=27908
+[run_one_mode] returning qps=27908 completed=10000
+RESULT none        64           27908    36μs    36μs    36μs    36μs    36μs        0        0
+none        64           27908    36μs    36μs    36μs    36μs    36μs        0        0
+[sync   ] master ready, running client...
+[client] connected after retries
+[client] warmup done
+[client] starting test loop, 10000 reqs
+[client] test done, ok=10000 elapsed=365969us qps=27325
+[run_one_mode] returning qps=27325 completed=10000
+RESULT sync        64           27325    37μs    37μs    37μs    37μs    37μs    10459        0
+sync        64           27325    37μs    37μs    37μs    37μs    37μs    10459        0
+kprobe: using kprobe/kretprobe
+[kprobe] loaded, attached to tcp_recvmsg (PID=32129)
+[fwd] ready, polling ringbuf
+[kprobe ] master ready, running client...
+[client] connected after retries
+[client] warmup done
+[client] starting test loop, 10000 reqs
+[client] test done, ok=10000 elapsed=321767us qps=31078
+[fwd] exiting, forwarded=70998
+[run_one_mode] returning qps=31078 completed=10000
+RESULT kprobe      64           31078    32μs    32μs    32μs    32μs    32μs    57505    70998
+kprobe      64           31078    32μs    32μs    32μs    32μs    32μs    57505    70998
+
+完成。
+=== kprobe 主从转发 QPS 对比 ===
+payload=128 bytes, count=10000
+模式: all
+none  = 纯echo不转发   sync = echo+同步转发   kprobe = echo+kprobe异步转发
+
+mode        size           qps      avg      p50      p99      min      max    slave      fwd
+----------  ------  ----------  -------  -------  -------  -------  -------  -------  -------
+[none   ] master ready, running client...
+[client] connected after retries
+[client] warmup done
+[client] starting test loop, 10000 reqs
+[client] test done, ok=10000 elapsed=355922us qps=28096
+[run_one_mode] returning qps=28096 completed=10000
+RESULT none        128          28096    36μs    36μs    36μs    36μs    36μs        0        0
+none        128          28096    36μs    36μs    36μs    36μs    36μs        0        0
+[sync   ] master ready, running client...
+[client] connected after retries
+[client] warmup done
+[client] starting test loop, 10000 reqs
+[client] test done, ok=10000 elapsed=243197us qps=41119
+[run_one_mode] returning qps=41119 completed=10000
+RESULT sync        128          41119    24μs    24μs    24μs    24μs    24μs    10293        0
+sync        128          41119    24μs    24μs    24μs    24μs    24μs    10293        0
+kprobe: using kprobe/kretprobe
+[kprobe] loaded, attached to tcp_recvmsg (PID=32145)
+[fwd] ready, polling ringbuf
+[kprobe ] master ready, running client...
+[client] connected after retries
+[client] warmup done
+[client] starting test loop, 10000 reqs
+[client] test done, ok=10000 elapsed=386382us qps=25881
+[fwd] exiting, forwarded=55159
+[run_one_mode] returning qps=25881 completed=10000
+RESULT kprobe      128          25881    39μs    39μs    39μs    39μs    39μs    44341    55159
+kprobe      128          25881    39μs    39μs    39μs    39μs    39μs    44341    55159
+
+完成。
+=== kprobe 主从转发 QPS 对比 ===
+payload=256 bytes, count=10000
+模式: all
+none  = 纯echo不转发   sync = echo+同步转发   kprobe = echo+kprobe异步转发
+
+mode        size           qps      avg      p50      p99      min      max    slave      fwd
+----------  ------  ----------  -------  -------  -------  -------  -------  -------  -------
+[none   ] master ready, running client...
+[client] connected after retries
+[client] warmup done
+[client] starting test loop, 10000 reqs
+[client] test done, ok=10000 elapsed=337997us qps=29586
+[run_one_mode] returning qps=29586 completed=10000
+RESULT none        256          29586    34μs    34μs    34μs    34μs    34μs        0        0
+none        256          29586    34μs    34μs    34μs    34μs    34μs        0        0
+[sync   ] master ready, running client...
+[client] connected after retries
+[client] warmup done
+[client] starting test loop, 10000 reqs
+[client] test done, ok=10000 elapsed=346787us qps=28836
+[run_one_mode] returning qps=28836 completed=10000
+RESULT sync        256          28836    35μs    35μs    35μs    35μs    35μs    10465        0
+sync        256          28836    35μs    35μs    35μs    35μs    35μs    10465        0
+kprobe: using kprobe/kretprobe
+[kprobe] loaded, attached to tcp_recvmsg (PID=32157)
+[fwd] ready, polling ringbuf
+[kprobe ] master ready, running client...
+[client] connected after retries
+[client] warmup done
+[client] starting test loop, 10000 reqs
+[client] test done, ok=10000 elapsed=392565us qps=25473
+[fwd] exiting, forwarded=52871
+[run_one_mode] returning qps=25473 completed=10000
+RESULT kprobe      256          25473    39μs    39μs    39μs    39μs    39μs    42393    52871
+kprobe      256          25473    39μs    39μs    39μs    39μs    39μs    42393    52871
+
+完成。
+=== kprobe 主从转发 QPS 对比 ===
+payload=512 bytes, count=10000
+模式: all
+none  = 纯echo不转发   sync = echo+同步转发   kprobe = echo+kprobe异步转发
+
+mode        size           qps      avg      p50      p99      min      max    slave      fwd
+----------  ------  ----------  -------  -------  -------  -------  -------  -------  -------
+[none   ] master ready, running client...
+[client] connected after retries
+[client] warmup done
+[client] starting test loop, 10000 reqs
+[client] test done, ok=10000 elapsed=345672us qps=28929
+[run_one_mode] returning qps=28929 completed=10000
+RESULT none        512          28929    35μs    35μs    35μs    35μs    35μs        0        0
+none        512          28929    35μs    35μs    35μs    35μs    35μs        0        0
+[sync   ] master ready, running client...
+[client] connected after retries
+[client] warmup done
+[client] starting test loop, 10000 reqs
+[client] test done, ok=10000 elapsed=370592us qps=26984
+[run_one_mode] returning qps=26984 completed=10000
+RESULT sync        512          26984    37μs    37μs    37μs    37μs    37μs    10480        0
+sync        512          26984    37μs    37μs    37μs    37μs    37μs    10480        0
+kprobe: using kprobe/kretprobe
+[kprobe] loaded, attached to tcp_recvmsg (PID=32169)
+[fwd] ready, polling ringbuf
+[kprobe ] master ready, running client...
+[client] connected after retries
+[client] warmup done
+[client] starting test loop, 10000 reqs
+[client] test done, ok=10000 elapsed=408105us qps=24503
+[fwd] exiting, forwarded=55338
+[run_one_mode] returning qps=24503 completed=10000
+RESULT kprobe      512          24503    41μs    41μs    41μs    41μs    41μs    44867    55338
+kprobe      512          24503    41μs    41μs    41μs    41μs    41μs    44867    55338
+
+完成。
+[sudo] password for pp: === kprobe 主从转发 QPS 对比 ===
+payload=1024 bytes, count=10000
+模式: all
+none  = 纯echo不转发   sync = echo+同步转发   kprobe = echo+kprobe异步转发
+
+mode        size           qps      avg      p50      p99      min      max    slave      fwd
+----------  ------  ----------  -------  -------  -------  -------  -------  -------  -------
+[none   ] master ready, running client...
+[client] connected after retries
+[client] warmup done
+[client] starting test loop, 10000 reqs
+[client] test done, ok=10000 elapsed=322212us qps=31035
+[run_one_mode] returning qps=31035 completed=10000
+RESULT none        1024         31035    32μs    32μs    32μs    32μs    32μs        0        0
+none        1024         31035    32μs    32μs    32μs    32μs    32μs        0        0
+[sync   ] master ready, running client...
+[client] connected after retries
+[client] warmup done
+[client] starting test loop, 10000 reqs
+[client] test done, ok=10000 elapsed=365596us qps=27353
+[run_one_mode] returning qps=27353 completed=10000
+RESULT sync        1024         27353    37μs    37μs    37μs    37μs    37μs    10468        0
+sync        1024         27353    37μs    37μs    37μs    37μs    37μs    10468        0
+kprobe: using kprobe/kretprobe
+[kprobe] loaded, attached to tcp_recvmsg (PID=32226)
+[fwd] ready, polling ringbuf
+[kprobe ] master ready, running client...
+[client] connected after retries
+[client] warmup done
+[client] starting test loop, 10000 reqs
+[client] test done, ok=10000 elapsed=412914us qps=24218
+[fwd] exiting, forwarded=49243
+[run_one_mode] returning qps=24218 completed=10000
+RESULT kprobe      1024         24218    41μs    41μs    41μs    41μs    41μs    38723    49243
+kprobe      1024         24218    41μs    41μs    41μs    41μs    41μs    38723    49243
+
+完成。
+=== kprobe 主从转发 QPS 对比 ===
+payload=2048 bytes, count=10000
+模式: all
+none  = 纯echo不转发   sync = echo+同步转发   kprobe = echo+kprobe异步转发
+
+mode        size           qps      avg      p50      p99      min      max    slave      fwd
+----------  ------  ----------  -------  -------  -------  -------  -------  -------  -------
+[none   ] master ready, running client...
+[client] connected after retries
+[client] warmup done
+[client] starting test loop, 10000 reqs
+[client] test done, ok=10000 elapsed=358812us qps=27870
+[run_one_mode] returning qps=27870 completed=10000
+RESULT none        2048         27870    36μs    36μs    36μs    36μs    36μs        0        0
+none        2048         27870    36μs    36μs    36μs    36μs    36μs        0        0
+[sync   ] master ready, running client...
+[client] connected after retries
+[client] warmup done
+[client] starting test loop, 10000 reqs
+[client] test done, ok=10000 elapsed=280397us qps=35664
+[run_one_mode] returning qps=35664 completed=10000
+RESULT sync        2048         35664    28μs    28μs    28μs    28μs    28μs    10361        0
+sync        2048         35664    28μs    28μs    28μs    28μs    28μs    10361        0
+kprobe: using kprobe/kretprobe
+[kprobe] loaded, attached to tcp_recvmsg (PID=32193)
+[fwd] ready, polling ringbuf
+[kprobe ] master ready, running client...
+[client] connected after retries
+[client] warmup done
+[client] starting test loop, 10000 reqs
+[client] test done, ok=10000 elapsed=395303us qps=25297
+[fwd] exiting, forwarded=39346
+[run_one_mode] returning qps=25297 completed=10000
+RESULT kprobe      2048         25297    39μs    39μs    39μs    39μs    39μs    28867    39346
+kprobe      2048         25297    39μs    39μs    39μs    39μs    39μs    28867    39346
+
+完成。
+=== kprobe 主从转发 QPS 对比 ===
+payload=4096 bytes, count=10000
+模式: all
+none  = 纯echo不转发   sync = echo+同步转发   kprobe = echo+kprobe异步转发
+
+mode        size           qps      avg      p50      p99      min      max    slave      fwd
+----------  ------  ----------  -------  -------  -------  -------  -------  -------  -------
+[none   ] master ready, running client...
+[client] connected after retries
+[client] warmup done
+[client] starting test loop, 10000 reqs
+[client] test done, ok=10000 elapsed=361724us qps=27645
+[run_one_mode] returning qps=27645 completed=10000
+RESULT none        4096         27645    36μs    36μs    36μs    36μs    36μs        0        0
+none        4096         27645    36μs    36μs    36μs    36μs    36μs        0        0
+[sync   ] master ready, running client...
+[client] connected after retries
+[client] warmup done
+[client] starting test loop, 10000 reqs
+[client] test done, ok=10000 elapsed=285065us qps=35080
+[run_one_mode] returning qps=35080 completed=10000
+RESULT sync        4096         35080    28μs    28μs    28μs    28μs    28μs    10187        0
+sync        4096         35080    28μs    28μs    28μs    28μs    28μs    10187        0
+kprobe: using kprobe/kretprobe
+[kprobe] loaded, attached to tcp_recvmsg (PID=32244)
+[fwd] ready, polling ringbuf
+[kprobe ] master ready, running client...
+[client] connected after retries
+[client] warmup done
+[client] starting test loop, 10000 reqs
+[client] test done, ok=10000 elapsed=404657us qps=24712
+[fwd] exiting, forwarded=52092
+[run_one_mode] returning qps=24712 completed=10000
+RESULT kprobe      4096         24712    40μs    40μs    40μs    40μs    40μs    41607    52092
+kprobe      4096         24712    40μs    40μs    40μs    40μs    40μs    41607    52092
+
+完成。

@@ -1,0 +1,4 @@
+backend,port,ops,value_size,elapsed_sec,qps,vmrss_kb,vmsize_kb,vmdata_kb,mem_gap_kb,info,memstat_backend,current_small_inuse,peak_small_inuse,total_small_page_bytes,current_large_inuse_bytes,peak_large_inuse_bytes,active_large_map_bytes,peak_active_large_map_bytes,large_alloc_calls,small_alloc_calls
+libc,6500,500,64,0.377733,1323.69,5096,11324,896,6228,role:master mem:libc,libc,0,0,0,0,0,0,0,0,0
+jemalloc,6501,500,64,0.249864,2001.09,12468,19948,5136,7480,role:master mem:jemalloc,jemalloc,0,0,0,0,0,0,0,0,0
+custom,6502,500,64,0.249452,2004.39,5004,11532,1104,6528,role:master mem:custom,custom,112096,112320,262080,163936,163936,184320,184320,6,4905

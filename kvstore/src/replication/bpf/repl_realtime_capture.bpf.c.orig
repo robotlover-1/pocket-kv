@@ -1,0 +1,115 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+/*
+ * repl_realtime_capture.bpf.c — kprobe 捕获 + bpf_override_return
+ *
+ * 拦截 __sys_sendto，匹配 target_fd 后将数据拷贝到 ring buffer，
+ * 然后 bpf_override_return 阻止 TCP 发送。
+ * 用户态线程读 ring buffer → RDMA pipeline → Slave
+ *
+ * 内核要求: CONFIG_BPF_KPROBE_OVERRIDE=y, Linux >= 5.8
+ */
+
+#include <linux/bpf.h>
+#include <linux/types.h>
+#include <bpf/bpf_helpers.h>
+
+#ifndef BPF_MAP_TYPE_RINGBUF
+#define BPF_MAP_TYPE_RINGBUF 27
+#endif
+#ifndef EPERM
+#define EPERM 1
+#endif
+
+#define KVS_CAPTURE_CTL_ENABLED    0
+#define KVS_CAPTURE_CTL_TARGET_FD  1
+
+#define KVS_CAPTURE_STAT_COUNT     0
+#define KVS_CAPTURE_STAT_BYTES     1
+#define KVS_CAPTURE_STAT_BLOCKED   2
+#define KVS_CAPTURE_STAT_SKIP      3
+#define KVS_CAPTURE_STAT_RB_FAIL   4
+
+#define CAPTURE_MAX_DATA 2048
+
+struct capture_event {
+    __u64 len;
+    unsigned char data[CAPTURE_MAX_DATA];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 20);
+} capture_ringbuf SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 2);
+    __type(key, __u32);
+    __type(value, __u64);
+} capture_ctl SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 5);
+    __type(key, __u32);
+    __type(value, __u64);
+} capture_stats SEC(".maps");
+
+static __always_inline void stat_inc(__u32 key) {
+    __u64 *v = bpf_map_lookup_elem(&capture_stats, &key);
+    if (v) __sync_fetch_and_add(v, 1);
+}
+
+static __always_inline void stat_add(__u32 key, __u64 delta) {
+    __u64 *v = bpf_map_lookup_elem(&capture_stats, &key);
+    if (v) __sync_fetch_and_add(v, delta);
+}
+
+static __always_inline __u64 ctl_get(__u32 key) {
+    __u64 *v = bpf_map_lookup_elem(&capture_ctl, &key);
+    return v ? *v : 0;
+}
+
+/*
+ * kprobe/__sys_sendto
+ *
+ * 用整数算术从 pt_regs 读取寄存器（避免 struct pt_regs 不完整问题）：
+ *   x86_64:  di@+112, si@+104, dx@+96
+ */
+SEC("kprobe/__sys_sendto")
+int kp_capture_sendto(struct pt_regs *ctx) {
+    __u64 enabled = ctl_get(KVS_CAPTURE_CTL_ENABLED);
+    if (!enabled) return 0;
+
+    __u64 target_fd = ctl_get(KVS_CAPTURE_CTL_TARGET_FD);
+    if (!target_fd) return 0;
+
+    __u64 fd_val = 0, buf_val = 0, len_val = 0;
+    bpf_probe_read_kernel(&fd_val, sizeof(fd_val), (const void *)((unsigned long)ctx + 112));
+    bpf_probe_read_kernel(&buf_val, sizeof(buf_val), (const void *)((unsigned long)ctx + 104));
+    bpf_probe_read_kernel(&len_val, sizeof(len_val), (const void *)((unsigned long)ctx + 96));
+
+    if (fd_val != target_fd) {
+        stat_inc(KVS_CAPTURE_STAT_SKIP);
+        return 0;
+    }
+    if (len_val == 0) return 0;
+    __u64 copy_len = len_val > CAPTURE_MAX_DATA ? CAPTURE_MAX_DATA : len_val;
+
+    struct capture_event *e = bpf_ringbuf_reserve(&capture_ringbuf,
+        sizeof(struct capture_event), 0);
+    if (!e) { stat_inc(KVS_CAPTURE_STAT_RB_FAIL); return 0; }
+
+    e->len = len_val;
+    bpf_probe_read_user(e->data, copy_len, (void *)(unsigned long)buf_val);
+    bpf_ringbuf_submit(e, 0);
+
+    stat_inc(KVS_CAPTURE_STAT_COUNT);
+    stat_add(KVS_CAPTURE_STAT_BYTES, copy_len);
+
+    bpf_override_return(ctx, -EPERM);
+    stat_inc(KVS_CAPTURE_STAT_BLOCKED);
+    return 0;
+}
+
+char LICENSE[] SEC("license") = "GPL";

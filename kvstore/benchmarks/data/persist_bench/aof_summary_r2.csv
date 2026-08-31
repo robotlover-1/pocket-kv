@@ -1,0 +1,7 @@
+label,qps
+kvstore_echo,103391.23
+redis_echo,111284.22
+kvstore_aof_disable,110926.23
+kvstore_aof_always,55937.79
+redis_no_aof,122895.41
+redis_aof_always,45827.41

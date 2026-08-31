@@ -1,0 +1,3 @@
+RESULT aof_kv_echo=125203 aof_kv_dis=123641 aof_rd_echo=108666 aof_rd_dis=121053
+RESULT save_kv=126678 save_rd=122205
+RESULT pipe_kv_echo=125683 pipe_kv_dis=127788 pipe_rd_echo=109511 pipe_rd_dis=120518

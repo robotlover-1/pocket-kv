@@ -1,0 +1,27 @@
+=== AOF 并发性能对比（taskset 核 2/3，3 次取均值）===
+日期: Sun 02 Aug 2026 08:23:37 PM CST
+kvstore_echo r1=127502.23
+kvstore_echo r2=125517.76
+kvstore_echo r3=126534.23
+RESULT kvstore_echo mean=126518
+redis_echo r1=109134.56
+redis_echo r2=105797.72
+redis_echo r3=106033.30
+RESULT redis_echo mean=106989
+kvstore_aof_disable r1=128270.91
+kvstore_aof_disable r2=127421.00
+kvstore_aof_disable r3=125533.52
+RESULT kvstore_aof_disable mean=127075
+kvstore_aof_always r1=69079.86
+kvstore_aof_always r2=80991.34
+kvstore_aof_always r3=78112.80
+RESULT kvstore_aof_always mean=76061
+redis_no_aof r1=115273.77
+redis_no_aof r2=117288.30
+redis_no_aof r3=114771.03
+RESULT redis_no_aof mean=115778
+redis_aof_always r1=41965.67
+redis_aof_always r2=43905.87
+redis_aof_always r3=42087.54
+RESULT redis_aof_always mean=42653
+=== DONE ===

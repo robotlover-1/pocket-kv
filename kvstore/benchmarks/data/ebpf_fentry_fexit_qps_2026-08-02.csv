@@ -1,0 +1,13 @@
+mode,payload,median_qps
+none,64,63044
+sync,64,30838
+ebpf,64,28092
+sync,128,30345
+ebpf,128,28138
+none,128,62232
+sync,256,30931
+none,256,62779
+ebpf,256,28576
+ebpf,512,28070
+sync,512,30882
+none,512,63424
