@@ -1,6 +1,14 @@
 /**
  * @file kvs_vector.c
- * @brief 语义向量检索：遍历 global_hash 中 semcache:* 条目，暴力余弦 top-k
+ * @brief 语义向量检索：遍历 global_hash 中给定前缀条目，暴力余弦 top-k
+ *
+ * 命令: VSEARCH <dim> <query_vec> <topk> [prefix]
+ *   dim    ∈ {256, 384, 1024}
+ *   topk   ∈ [1, 100]
+ *   query_vec 二进制长度须 == dim*4
+ *   prefix 缺省 semcache:；须命中白名单 {"semcache:", "semd:e5s:v1:"}，
+ *          长度 1..64 且字符集 [A-Za-z0-9:_-]; 显式空前缀视为非法。
+ * 老三参调用向后兼容（默认 semcache:）。
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,8 +16,9 @@
 #include <math.h>
 #include "kvstore/kvstore.h"
 
-#define VSEARCH_PREFIX "semcache:"
-#define VSEARCH_PREFIX_LEN (sizeof(VSEARCH_PREFIX) - 1)
+#define VSEARCH_ALLOWED_DIMS 3              /* 256/384/1024 */
+static const int    VSEARCH_DIMS[]          = {256, 384, 1024};
+static const char  *VSEARCH_ALLOWED_PREFIX[] = {"semcache:", "semd:e5s:v1:"};
 
 /* 值布局: [u32 dim][float vec[dim]]（小端） */
 static int parse_vec(const char *value, size_t vlen, int want_dim, const float **vec_out, int *dim_out) {
@@ -37,21 +46,50 @@ static float cosine(const float *a, const float *b, int dim) {
 /* 候选：暴力 top-k（本地规模小，O(n*k) 足够） */
 typedef struct { const char *key; float score; } cand_t;
 
-int kvs_vector_search(int dim, const float *query, int topk, char *resp, int cap) {
-    if (!query || topk <= 0) return resp_error(resp, cap, "vsearch bad args");
+/* 前缀白名单校验：长度 1..64 + 字符集 + 须命中白名单 */
+static int valid_prefix(const char *p, int len) {
+    if (len < 1 || len > 64) return 0;
+    for (int i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)p[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == ':' || c == '_' || c == '-')) return 0;
+    }
+    for (size_t i = 0; i < sizeof(VSEARCH_ALLOWED_PREFIX)/sizeof(*VSEARCH_ALLOWED_PREFIX); i++)
+        if (len == (int)strlen(VSEARCH_ALLOWED_PREFIX[i]) &&
+            memcmp(p, VSEARCH_ALLOWED_PREFIX[i], (size_t)len) == 0) return 1;
+    return 0;
+}
+
+static int allowed_dim(int d) {
+    for (int i = 0; i < VSEARCH_ALLOWED_DIMS; i++) if (VSEARCH_DIMS[i] == d) return 1;
+    return 0;
+}
+
+int kvs_vector_search(int dim, const float *query, int topk,
+                      const char *prefix, int plen, char *resp, int cap) {
+    if (!query || !prefix) return resp_error(resp, cap, "vsearch bad args");
     if (cap < 16) return -1;
+
+    /* 参数校验：dim 白名单、1<=topk<=100、前缀白名单（显式空前缀 len<1 → 非法） */
+    if (!allowed_dim(dim) || topk < 1 || topk > 100) {
+        return resp_error(resp, cap, "vsearch bad args");
+    }
+    if (!valid_prefix(prefix, plen)) {
+        return resp_error(resp, cap, "vsearch bad prefix");
+    }
 
     cand_t *cands = (cand_t *)calloc((size_t)topk, sizeof(cand_t));
     if (!cands) return resp_error(resp, cap, "vsearch oom");
     int n = 0;
 
-    /* 遍历 ht[0]（rehash 中再查 ht[1]；节点只在一个表） */
+    /* 遍历 ht[0]（rehash 中再查 ht[1]；节点只在一个表），只收当前前缀条目；
+       parse_vec 以 want_dim=dim 要求同维，异维/异布局记录被跳过 */
     for (int t = 0; t < 2; t++) {
         if (t == 1 && global_hash.rehash_idx < 0) break;
         hashtable_t *ht = &global_hash.ht[t];
         for (int i = 0; i < ht->max_slots && ht->nodes; i++) {
             for (hashnode_t *node = ht->nodes[i]; node; node = node->next) {
-                if (strncmp(node->key, VSEARCH_PREFIX, VSEARCH_PREFIX_LEN) != 0) continue;
+                if (memcmp(node->key, prefix, (size_t)plen) != 0) continue;
                 const float *vec = NULL; int vdim = 0;
                 if (parse_vec(node->value, node->vlen, dim, &vec, &vdim) != 0) continue;
                 float s = cosine(query, vec, dim);

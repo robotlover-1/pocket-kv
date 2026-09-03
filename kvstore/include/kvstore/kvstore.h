@@ -188,7 +188,9 @@ int kvs_hash_mod(kvs_hash_t *hash, char *key, char *value);
 int kvs_hash_del(kvs_hash_t *hash, char *key);
 int kvs_hash_exist(kvs_hash_t *hash, char *key);
 /* kvs_vector.c：语义向量检索（VSEARCH 命令实现） */
-int kvs_vector_search(int dim, const float *query, int topk, char *resp, int cap);
+#define KVS_VSEARCH_DEFAULT_PREFIX "semcache:"
+int kvs_vector_search(int dim, const float *query, int topk,
+                      const char *prefix, int plen, char *resp, int cap);
 #endif
 
 #if ENABLE_SKIPTABLE

@@ -2131,14 +2131,17 @@ engine_dispatch:
         if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
         goto out;
         return 0;
-    } else if (!strcmp(op, "VSEARCH") && argc == 4) {
+    } else if (!strcmp(op, "VSEARCH") && (argc == 4 || argc == 5)) {
         int dim = atoi(argv[1]);
         float *query = (float *)argv[2];
         int topk = atoi(argv[3]);
+        /* 可选第 4 参数：缺省 semcache: 向后兼容老三参 */
+        const char *prefix = (argc == 5) ? argv[4] : KVS_VSEARCH_DEFAULT_PREFIX;
+        size_t plen = (argc == 5) ? argl[4] : sizeof(KVS_VSEARCH_DEFAULT_PREFIX) - 1;
         if (dim <= 0 || topk <= 0 || argl[2] != (size_t)dim * sizeof(float)) {
             n = resp_error(resp, BUFFER_CAP, "vsearch bad args");
         } else {
-            n = kvs_vector_search(dim, query, topk, resp, BUFFER_CAP);
+            n = kvs_vector_search(dim, query, topk, prefix, (int)plen, resp, BUFFER_CAP);
         }
         if (n < 0) n = resp_error(resp, BUFFER_CAP, "vsearch failed");
         if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
