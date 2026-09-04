@@ -132,3 +132,4 @@ tests/test_fullsync_protocol
 /kvstore/benchmarks/data/pipeline_bench/
 /kvstore/artifacts/**
 !/kvstore/artifacts/.gitkeep
+/kvstore/tests/test_vsearch_runtime
