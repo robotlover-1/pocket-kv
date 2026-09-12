@@ -153,8 +153,8 @@ AOF always 现在只比 AOF 关闭低 **4.5%**（118.7k vs 124.3k），比 Redis
 
 ## 相关
 
-- [`aof-fsync-modes-analysis.md`](aof-fsync-modes-analysis.md) — 四种 AOF 刷盘模式的方差根因分析（含崩溃窗口现状更新）
+- [`aof-fsync-modes-analysis.md`](../aof-fsync-modes-analysis.md) — 四种 AOF 刷盘模式的方差根因分析（含崩溃窗口现状更新）
 - [`save-aof-always-mode-comparison.md`](save-aof-always-mode-comparison.md) — SAVE + AOF always 对比分析报告（含吞吐现状更新）
-- [`optimization-history/aof-concurrent.md`](optimization-history/aof-concurrent.md) — AOF 并发性能对比 · 分析
+- [`optimization-history/aof-concurrent.md`](../optimization-history/aof-concurrent.md) — AOF 并发性能对比 · 分析
 - [`benchmark-methodology-qa.md`](benchmark-methodology-qa.md) — 基准测试方法论 QA（第七节：客户端测量边界）
 - 原始数据：`benchmarks/data/bench_aof_2026-08-11.json` / `bench_pipeline_2026-08-11.json`

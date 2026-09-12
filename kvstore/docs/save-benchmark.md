@@ -1,6 +1,6 @@
 # SAVE 持久化性能基准 — 测试记录
 
-> **⚠️ 历史基准**：本文档为 2026-06-11 的早期 SAVE 数据，已被 2026-08 数据（SAVE+AOF always 对比，见 [`save-aof-always-mode-comparison.md`](save-aof-always-mode-comparison.md)）与 README「性能基准」取代。
+> **⚠️ 历史基准**：本文档为 2026-06-11 的早期 SAVE 数据，已被 2026-08 数据（SAVE+AOF always 对比，见 [`save-aof-always-mode-comparison.md`](data_analysis/save-aof-always-mode-comparison.md)）与 README「性能基准」取代。
 
 ## 测试目的
 

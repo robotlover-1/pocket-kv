@@ -1626,8 +1626,9 @@ else if (!strcmp(cmd, "LOCK") && argc == 4) {
 
 ```mermaid
 flowchart TB
-    subgraph Unit["单元测试 (tests/unit/)"]
-        TEST_C["testcase.c\nC 测试程序"]
+    subgraph Unit["单元测试 (tests/)"]
+        FS["test_fullsync_protocol.c\n全量同步协议"]
+        VS["test_vsearch.c\nVSEARCH 参数校验"]
     end
 
     subgraph Integration["集成测试 (tests/integration/)"]
@@ -1637,7 +1638,7 @@ flowchart TB
         QUEUE["test_resp_queue_recovery.sh\n队列恢复验证"]
     end
 
-> ⚠️ **注意**：`tests/unit/` 目录存在但仅含 `.gitkeep`，**目前无实际单元测试**。所有测试均为集成测试级别。
+> ⚠️ **注意**：`tests/unit/` 目录存在但仅含 `.gitkeep`。真正的单元测试是 `tests/test_fullsync_protocol.c` 与 `tests/test_vsearch.c`（`make test_fullsync_protocol` / `make test_vsearch`），其余为集成测试级别。
 
     subgraph PersistTest["持久化测试 (tools/persist/)"]
         PERSIST["test_resp_persist_nc.sh\n基本链路"]
@@ -1835,7 +1836,7 @@ sudo ./kvstore --port 5160 --role master \
 ```
 
 **详细文档**：
-- [`docs/kprobe-rdma-incrsync-implementation.md`](./kprobe-rdma-incrsync-implementation.md)
+- [`docs/kprobe-rdma-incrsync-implementation.md`](./use/kprobe-rdma-incrsync-implementation.md)
 - [`docs/kprobe-rdma-debug-diagnosis.md`](./kprobe-rdma-debug-diagnosis.md)
 
 ---

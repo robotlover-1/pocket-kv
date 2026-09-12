@@ -84,7 +84,7 @@
 
 **核心机制：虚拟地址能否归还取决于分配方式（`mmap` vs `brk`）**：
 
-- **custom = `mmap` + `munmap`（虚拟地址完整归还）**：数据（slab 页）与连接缓冲（large mmap）都是 mmap 分配。HSET 小对象从 mmap 的 slab 页取固定槽位（**单个对象释放只还槽位到 `free_stack`，不 munmap**）；当整张页 `chunks_in_use == 0`（所有槽空）→ **整张页 `munmap`**（[`try_reclaim_page_locked`](src/memory/kvs_mem.c)），虚拟地址 + 物理页一起还。→ 释放后 VmSize 回基线。
+- **custom = `mmap` + `munmap`（虚拟地址完整归还）**：数据（slab 页）与连接缓冲（large mmap）都是 mmap 分配。HSET 小对象从 mmap 的 slab 页取固定槽位（**单个对象释放只还槽位到 `free_stack`，不 munmap**）；当整张页 `chunks_in_use == 0`（所有槽空）→ **整张页 `munmap`**（[`try_reclaim_page_locked`](../../src/memory/kvs_mem.c)），虚拟地址 + 物理页一起还。→ 释放后 VmSize 回基线。
 - **libc = `brk` 堆（虚拟地址大部分保留）**：数据在 glibc 堆（`[heap]`，brk 段）。free 进 bin 链表复用，物理页靠 `malloc_trim` 归还（**仅 top chunk 相邻**的空闲区），但**虚拟地址永久保留**——brk 只有 top chunk 空闲时 `brk()` 下降才还，中间碎片/非相邻 bin 块不还。→ 释放后 VmRSS 降到 3.7MB（trim 有效）但 VmSize 保留 ~63MB。
 - **jemalloc = `retain:false`（大部分归还）**：extent 释放后 `munmap` 归还虚拟地址，但保留 arena 虚拟预留（基线即 55MB）→ VmSize 回基线。
 

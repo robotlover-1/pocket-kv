@@ -1,8 +1,0 @@
-{
-  "kv_echo": 124401.45999999999,
-  "rd_echo": 106337.965,
-  "kv_hset_disable": 124271.11499999999,
-  "kv_hset_always": 118724.6,
-  "rd_hset_disable": 116090.1,
-  "rd_hset_always": 43521.78
-}

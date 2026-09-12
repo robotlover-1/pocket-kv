@@ -1,9 +1,0 @@
-scenario,write_qps,save_count,avg_save_ms,dump_bytes
-100w_hset_save_1_disable,110546.10,1,93.0,19579918
-10w_hset_save_10_disable,107411.38,10,9.8,1963176
-1w_hset_save_100_disable,102040.82,100,3.8,197199
-1k_hset_save_1000_disable,62500.00,1000,3.3,19290
-100w_hset_save_1_always,72113.66,1,92.0,19586583
-10w_hset_save_10_always,71174.38,10,9.2,1956914
-1w_hset_save_100_always,69444.45,100,4.0,195277
-1k_hset_save_1000_always,45454.55,1000,3.3,20096

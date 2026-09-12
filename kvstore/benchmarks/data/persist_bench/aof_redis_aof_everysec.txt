@@ -1,12 +1,0 @@
-HSET key:__rand_int__ __rand_int__ value: 0.00HSET key:__rand_int__ __rand_int__ value: 119908.38HSET key:__rand_int__ __rand_int__ value: 118770.46HSET key:__rand_int__ __rand_int__ value: 119165.12HSET key:__rand_int__ __rand_int__ value: 119720.27HSET key:__rand_int__ __rand_int__ value: 118878.49HSET key:__rand_int__ __rand_int__ value: 118918.72HSET key:__rand_int__ __rand_int__ value: 118962.30HSET key:__rand_int__ __rand_int__ value: 119214.40HSET key:__rand_int__ __rand_int__ value: 119564.20HSET key:__rand_int__ __rand_int__ value: 119656.54HSET key:__rand_int__ __rand_int__ value: 119188.30HSET key:__rand_int__ __rand_int__ value: 118941.36HSET key:__rand_int__ __rand_int__ value: 118880.66HSET key:__rand_int__ __rand_int__ value: 118923.45HSET key:__rand_int__ __rand_int__ value: 119107.98HSET key:__rand_int__ __rand_int__ value: 119191.95HSET key:__rand_int__ __rand_int__ value: 119358.51HSET key:__rand_int__ __rand_int__ value: 119541.66HSET key:__rand_int__ __rand_int__ value: 119537.36HSET key:__rand_int__ __rand_int__ value: 119404.52HSET key:__rand_int__ __rand_int__ value: 119476.10HSET key:__rand_int__ __rand_int__ value: 119253.95HSET key:__rand_int__ __rand_int__ value: 119099.81HSET key:__rand_int__ __rand_int__ value: 119183.80HSET key:__rand_int__ __rand_int__ value: 119186.05HSET key:__rand_int__ __rand_int__ value: 119092.30HSET key:__rand_int__ __rand_int__ value: 119014.22HSET key:__rand_int__ __rand_int__ value: 119023.28HSET key:__rand_int__ __rand_int__ value: 118988.97HSET key:__rand_int__ __rand_int__ value: 119005.60HSET key:__rand_int__ __rand_int__ value: 118969.94HSET key:__rand_int__ __rand_int__ value: 118876.63HSET key:__rand_int__ __rand_int__ value: 118949.34====== HSET key:__rand_int__ __rand_int__ value ======
-  1000000 requests completed in 8.40 seconds
-  50 parallel clients
-  64 bytes payload
-  keep alive: 1
-
-99.40% <= 1 milliseconds
-99.82% <= 2 milliseconds
-99.99% <= 3 milliseconds
-100.00% <= 3 milliseconds
-119033.45 requests per second
-

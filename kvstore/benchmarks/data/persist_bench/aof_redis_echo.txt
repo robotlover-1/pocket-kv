@@ -1,12 +1,0 @@
-echo __rand_int__: -nanecho __rand_int__: 113688.00echo __rand_int__: 114792.00echo __rand_int__: 114684.00echo __rand_int__: 114806.00echo __rand_int__: 114796.80echo __rand_int__: 114386.66echo __rand_int__: 113768.00echo __rand_int__: 113652.00echo __rand_int__: 113556.89echo __rand_int__: 113229.60echo __rand_int__: 112905.82echo __rand_int__: 112356.66echo __rand_int__: 112353.54echo __rand_int__: 112550.86echo __rand_int__: 112380.53echo __rand_int__: 112289.75echo __rand_int__: 112127.30echo __rand_int__: 112146.89echo __rand_int__: 112149.05echo __rand_int__: 112311.40echo __rand_int__: 112422.09echo __rand_int__: 112408.00echo __rand_int__: 112200.52echo __rand_int__: 111953.00echo __rand_int__: 111874.08echo __rand_int__: 111714.30echo __rand_int__: 111612.45echo __rand_int__: 111537.57echo __rand_int__: 111524.83echo __rand_int__: 111519.87echo __rand_int__: 111531.35echo __rand_int__: 111518.38echo __rand_int__: 111529.45echo __rand_int__: 111569.88echo __rand_int__: 111639.77====== echo __rand_int__ ======
-  1000000 requests completed in 8.95 seconds
-  50 parallel clients
-  64 bytes payload
-  keep alive: 1
-
-99.83% <= 1 milliseconds
-99.98% <= 2 milliseconds
-99.99% <= 3 milliseconds
-100.00% <= 3 milliseconds
-111694.41 requests per second
-

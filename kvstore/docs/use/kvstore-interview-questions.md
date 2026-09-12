@@ -4,6 +4,8 @@
 > 覆盖 C 语言基础、系统编程、网络、存储、RDMA、eBPF、BPF、设计等多维度。
 > 每题标注考察维度、难度、和答题要点。
 
+> **注意（当前实现口径）**：本文档的复制章节（6 / 11.3 / 12.3 / 13.2）早期以 kprobe+RDMA 为默认实时通道。**现在默认的实时（增量）传输是 `ebpf+tcp`**：Master 在 `repl_realtime_transport=ebpf+tcp` 时自动拉起独立的 `ebpf-proxy` 进程，由它用 `fexit/tcp_recvmsg` 抓包并经 ringbuf + TCP 转发给 Slave（全量仍是 `repl_fullsync_transport=rdma`）。`kprobe-rdma` 已标记 legacy，需显式配置 `repl_realtime_transport=kprobe-rdma` 才启用。因此下文与 kprobe 相关的问答，请当作对该**仍然保留、可显式启用**的子系统的深度剖析，而非对默认路径的描述。
+
 ---
 
 ## 目录
@@ -331,6 +333,7 @@
    - replid 匹配且 offset 在 backlog 范围 → **部分同步** (CONTINUE + backlog 数据)
    - 否则 → **全量同步** (FULLRESYNC + 快照数据)
 3. TCP 保底：任何时候 RDMA/eBPF/kprobe-rdma 路径失败，`repl_transport_trigger_fallback()` 自动降级到 TCP
+   - **例外（当前默认）**：`ebpf+tcp` 下转发由独立的 `ebpf-proxy` 进程全权负责，这条 kprobe 健康检查 / fallback 路径会被跳过（`src/replication/kvs_repl_kprobe.c:1141,1159` 对 `KVS_REPL_TRANSPORT_EBPF_TCP` 直接 `continue`），不存在"降级"动作
 
 ---
 
@@ -374,6 +377,8 @@
 **难度**：⭐⭐⭐⭐
 
 **问题**：`test_repl_5w5w --pre 50000 --post 50000` 全部通过，能证明 RDMA WRITE 路径在工作吗？如果不能，还需要什么手段？
+
+> 说明：以下验证仅适用于 `repl_realtime_transport=kprobe-rdma`。默认 `ebpf+tcp` 下等价检查点是 `ebpf-proxy` 进程是否存在及其 ringbuf 统计。
 
 **答题要点**：
 - **不能证明**——数据可能全部走 TCP 保底路径到达，RDMA WRITE 全程静默失败
@@ -699,7 +704,7 @@ C 源码 → clang -target bpf → BPF ELF 对象 (.bpf.o)
 **考察维度**：架构演进  
 **难度**：⭐⭐⭐
 
-**问题**：从 TCP → RDMA SEND/RECV → eBPF sockmap → kprobe+RDMA WRITE，这四种传输层实现的演进思路是什么？每增加一种带来了什么新能力？
+**问题**：从 TCP → RDMA SEND/RECV → eBPF sockmap → kprobe+RDMA WRITE，再到当前默认的 `ebpf+tcp` 独立 `ebpf-proxy` 进程，这条演进路线是什么？每增加一种带来了什么新能力？
 
 **答题要点**：
 
@@ -708,9 +713,10 @@ C 源码 → clang -target bpf → BPF ELF 对象 (.bpf.o)
 | TCP | 基础复制 | 延迟高、CPU 开销大 |
 | RDMA SEND/RECV | 全量零拷贝 | 需要专用硬件 |
 | eBPF sockmap | 内核态转发 | 依赖内核版本、BPF 特性 |
-| kprobe+RDMA WRITE | 单边写入，Slave CPU 零参与 | 最高复杂度 |
+| kprobe+RDMA WRITE | 单边写入，Slave CPU 零参与 | 最高复杂度（**已标记 legacy，需显式启用**） |
+| `ebpf+tcp` + 独立 `ebpf-proxy` | 抓包/转发与主进程解耦：`fexit/tcp_recvmsg` 抓包 → 64MB ringbuf（32MB/8MB 水位背压）→ proxy 走 TCP 转发给 Slave | 多一个进程；转发不再由 `repl_broadcast` 发送（**当前默认/推荐**） |
 
-- 四种传输层通过 `repl_transport_ops_t` 接口实现**策略模式**——新增传输层不需要修改上层逻辑
+- 前四种传输层是**进程内**的，通过 `repl_transport_ops_t` 接口实现**策略模式**（`src/replication/kvs_repl.c:1981-2075` 现有 5 张 op 表）——新增传输层不需要修改上层逻辑；第 5 阶段则是**独立进程架构**，Master 在 `repl_realtime_transport=ebpf+tcp` 时自动拉起 `ebpf-proxy`（`spawn_ebpf_proxy()`，`src/main/kvstore.c:2900`）
 
 ---
 
@@ -760,6 +766,8 @@ C 源码 → clang -target bpf → BPF ELF 对象 (.bpf.o)
 
 **问题**：假设你怀疑 kprobe+RDMA WRITE 路径实际并没有工作，数据全走 TCP 过来的，有什么手段能**实锤**？
 
+> 说明：以下验证仅适用于 `repl_realtime_transport=kprobe-rdma`。默认 `ebpf+tcp` 下等价检查点是 `ebpf-proxy` 进程是否在跑及其 ringbuf 统计（转发/溢出计数）。
+
 **答题要点**：
 1. **最直接**：临时封掉 TCP 端口（iptables DROP），看增量数据是否还能复制
 2. **统计对比**：Master 侧 `g_rdma_writes` 是否为 0
@@ -793,9 +801,10 @@ C 源码 → clang -target bpf → BPF ELF 对象 (.bpf.o)
 **考察维度**：背压设计  
 **难度**：⭐⭐⭐⭐
 
-**问题**：BPF ringbuf（1MB）如果瞬间写满了（`bpf_ringbuf_output` 返回 -ENOSPC），当前代码会丢失数据。怎么设计一个背压机制来防止丢失？
+**问题**：BPF ringbuf 如果瞬间写满了（`bpf_ringbuf_output` 返回 -ENOSPC），会丢失数据。怎么设计一个背压机制来防止丢失？
 
 **答题要点**：
+- **先纠正前提**：说"当前代码会丢数据"已经过时。legacy kprobe 的 `repl_ringbuf` 是 **4MB**（`repl_kprobe.bpf.c:67`，`1 << 22`，并非 1MB）；当前默认路径的 `repl_client_capture` ringbuf 是 **64MB**（`repl_client_capture.bpf.c:91`，`1 << 26`），并已实现水位背压：高水位 32MB 触发、低水位 8MB 解除
 - 当前行为：`bpf_ringbuf_output` 失败 → 更新 `rb_err` 统计 → 丢弃
 - 改进方案：
   1. **增大 ringbuf**：`max_entries` 改为 2MB 或更大
@@ -828,9 +837,9 @@ C 源码 → clang -target bpf → BPF ELF 对象 (.bpf.o)
 **问题**：事件循环中同时处理网络 I/O 和 TTL 过期扫描，如果过期扫描耗时过长会阻塞新的网络请求。怎么解决？
 
 **答题要点**：
-- 当前方案：`kvs_active_expire_cycle(budget=20)`——每次最多扫描 20 个 key
-- `budget` 控制每次的 CPU 时间，避免单次扫描过长
-- 如果 20 个 key 的扫描时间仍太长（比如删除操作涉及大内存释放）：
+- 当前方案：`kvs_active_expire_cycle()` 使用**自适应预算** `expire_cycle_budget()`（`src/core/reactor.c:19-28`）——默认 32 个 key，随 key 总量递增：≥1k→128、≥1万→256、≥3万→512、≥10万→1024、≥30万→2048、**≥100万→4096**（注：旧的固定 `budget=20` 已不存在）
+- `budget` 控制每次的 CPU 时间，避免单次扫描过长；自适应做法在 key 多时提高吞吐、key 少时压低单次延迟
+- 如果当前预算下的扫描时间仍太长（比如删除操作涉及大内存释放）：
   1. 进一步减小 budget
   2. 延迟删除（标记为过期，由后台线程异步释放内存）
   3. 将过期扫描移到独立线程

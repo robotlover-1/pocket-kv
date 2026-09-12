@@ -70,12 +70,12 @@ make clean && make        # 根 Makefile 委派到 kvstore/；或 cd kvstore && 
 
 ### 启动（主从复制）
 
-> **权限说明**: eBPF+tcp 增量同步需加载 client_capture BPF（kprobe/tcp_recvmsg），必须用 `sudo` 启动 Master。
+> **权限说明**: eBPF+tcp 增量同步需加载 client_capture BPF（`fexit/tcp_recvmsg`），必须用 `sudo` 启动 Master。
 > Slave 不需要 BPF，无需 `sudo`。BPF 加载失败时自动降级为纯 TCP 同步。
 > 二进制和默认配置都在 `kvstore/` 下，先 `cd kvstore`（`kvstore.conf` 的 dump/aof 相对路径依赖 CWD）。
 
 ```bash
-cd /home/pp/Desktop/ls_study/proj/9.1-kvstore/kvstore
+cd kvstore
 
 # ── RDMA 全量 + eBPF+tcp 增量（推荐，需 root 启动 Master）──
 sudo ./kvstore kvstore.conf --role master    # Master（需 root 加载 BPF）
@@ -85,7 +85,7 @@ sudo ./kvstore kvstore.conf --role master    # Master（需 root 加载 BPF）
 ./kvstore kvstore.conf --role master --repl-fullsync-transport tcp --repl-realtime-transport tcp
 ./kvstore kvstore.conf --role slave  --repl-fullsync-transport tcp --repl-realtime-transport tcp
 
-# ── 本地两实例测试（避开与 ai-chat 的 5160 冲突，用 TCP）──
+# ── 本地两实例测试（换端口避免与默认 5160 冲突，用 TCP）──
 ./kvstore kvstore.conf --role master --port 6380 \
   --repl-fullsync-transport tcp --repl-realtime-transport tcp &
 ./kvstore kvstore.conf --role slave  --port 6381 \
@@ -96,7 +96,7 @@ sudo ./kvstore kvstore.conf --role master    # Master（需 root 加载 BPF）
 ./kvstore --config kvstore.conf --port 6380 --mem jemalloc
 ```
 
-> ⚠️ **端口冲突**：ai-chat 的 kvstore 运行在 5160（配置 `configs/kvstore-ai.conf`，由根 `start.sh` 启动）。`kvstore/kvstore.conf` 默认也是 `port=5160`——测主从复制时用其他端口（如 6380/6381），或先 `./stop.sh` 停掉 ai-chat 栈。两者配置不同，别混用：`configs/kvstore-ai.conf`（ai-chat 运行时）≠ `kvstore/kvstore.conf`（课设默认）。
+> ⚠️ **端口**：`kvstore/kvstore.conf` 默认 `port=5160`。测主从复制时建议换用其他端口（如 6380/6381）。
 
 ### 快速验证
 
@@ -106,8 +106,6 @@ printf '*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n' | nc 127.0.0.1 5160
 printf '*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n' | nc 127.0.0.1 5160
 ```
 
-> **提示**: kprobe+RDMA 需要 root 权限加载 BPF。启动时加 `sudo` 启用，不加则自动降级为 TCP 增量同步，其余功能完全正常。
-
 或使用 Redis 客户端（如 `redis-cli`）直接连接 5160 端口。
 
 ---
@@ -115,52 +113,53 @@ printf '*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n' | nc 127.0.0.1 5160
 ## 项目结构
 
 ```
-kvstore/
-├── src/                          # 核心 C 源码
-│   ├── main/kvstore.c            #   入口、RESP 协议、命令分发
-│   ├── core/                     #   网络模型 (reactor / proactor / ntyco)
-│   ├── storage/                  #   存储引擎 (array / hash / rbtree / skiptable / doc)
-│   ├── memory/kvs_mem.c          #   内存后端 (libc / jemalloc / custom)
-│   ├── expire/kvs_expire.c       #   TTL 过期管理
-│   ├── persistence/kvs_persist.c #   持久化 (dump + AOF)
-│   ├── replication/              #   主从复制、RDMA、eBPF、哨兵（含 bpf/ 子目录）
-│   ├── ebpf_proxy/               #   独立 ebpf-proxy 进程（增量转发，fentry 捕获）
-│   └── utils/hash.c              #   哈希工具
-├── include/kvstore/              # 公共头文件
-├── NtyCo/                        # 协程库 (git submodule)
-├── tools/                        # 测试 & 辅助脚本
-│   ├── bench/                    #   性能基准脚本
-│   ├── persist/                  #   持久化验证脚本
-│   ├── repl/                     #   复制验证脚本 (TCP/RDMA/eBPF)
-│   ├── rdma/                     #   RDMA 探测脚本
-│   └── tests/                    #   通用测试辅助脚本
-├── tests/                        # 测试代码
-│   ├── integration/              #   集成测试脚本
-│   ├── unit/                     #   单元测试
-│   ├── test.c                    #   空文件（预留）
-│   └── testcase.c                #   C 测试用例框架
-├── testdata/                     # 静态测试数据 (样例 AOF/dump/配置)
-├── artifacts/                    # 测试运行时产物 (gitignored)
-│   ├── persist/                  #   持久化测试产物
-│   ├── repl/                     #   复制测试产物
-│   ├── rdma/                     #   RDMA 测试产物
-│   ├── bench/                    #   基准测试产物
-│   └── legacy/                   #   旧版产物
-├── benchmarks/                   # 基准测试数据与图表
-│   ├── data/                     #   CSV 测试数据
-│   └── plots/                    #   可视化图表
-├── assets/diagrams/              # 架构图 / 流程图
-├── clients/                      # 多语言客户端示例 (Go/Java/JS/Python/Rust)
-├── docs/                         # 文档中心
-│   ├── tech-roadmap.md           #   技术路线与实现详解 ← 新手必读
-│   ├── rdma-fullsync-implementation.md  # RDMA 全量复制实现
-│   ├── plan.md                   #   项目演进规划
-│   ├── iteration-summary.md      #   迭代总结
-│   └── examples/                 #   API 使用示例
-├── kvstore.conf                  # 默认配置文件
-├── Makefile                      # 构建入口
-├── .github/workflows/ci.yml      # GitHub CI 配置
+pocket-kv/
+├── kvstore/                      # 引擎（代码主体）
+│   ├── src/                      # 核心 C 源码
+│   │   ├── main/kvstore.c        #   入口、RESP 协议、命令分发
+│   │   ├── core/                 #   网络模型 (reactor / proactor / ntyco)
+│   │   ├── storage/              #   存储引擎 (array / hash / rbtree / skiptable / doc / vector)
+│   │   ├── memory/kvs_mem.c      #   内存后端 (libc / jemalloc / custom)
+│   │   ├── expire/kvs_expire.c   #   TTL 过期管理
+│   │   ├── persistence/kvs_persist.c  # 持久化 (dump + AOF)
+│   │   ├── replication/          #   主从复制、RDMA、eBPF、哨兵（含 bpf/ 子目录）
+│   │   ├── ebpf_proxy/           #   独立 ebpf-proxy 进程（增量转发，fexit 捕获）
+│   │   └── utils/hash.c          #   哈希工具
+│   ├── include/kvstore/          # 公共头文件
+│   ├── NtyCo/                    # 协程库 (git submodule)
+│   ├── third_party/libbpf/       # 预编译 libbpf（ebpf-proxy 链接用）
+│   ├── tools/                    # 测试 & 辅助脚本
+│   │   ├── bench/                #   性能基准脚本
+│   │   ├── persist/              #   持久化验证脚本
+│   │   ├── repl/                 #   复制验证脚本 (TCP/RDMA/eBPF)
+│   │   ├── rdma/                 #   RDMA 探测脚本
+│   │   ├── ebpf/                 #   eBPF 独立守护进程
+│   │   └── tests/                #   通用测试辅助脚本
+│   ├── tests/                    # 测试代码
+│   │   ├── integration/          #   集成测试 shell 脚本
+│   │   ├── perf/                 #   性能测试 C 程序（独立 Makefile.perf）
+│   │   ├── unit/                 #   单元测试目录（预留，仅 .gitkeep）
+│   │   └── test_*.c              #   C 测试程序
+│   ├── testdata/                 # 静态测试数据（样例配置）
+│   ├── benchmarks/               # 基准结果与图表（本地留存，不入库）
+│   ├── assets/diagrams/          # 架构图 / 流程图
+│   ├── clients/                  # 多语言客户端示例 (Go/Java/JS/Python/Rust)
+│   ├── docs/                     # 文档中心
+│   │   ├── tech-roadmap.md       #   技术路线与实现详解 ← 新手必读
+│   │   ├── data_analysis/        #   基准数据分析
+│   │   ├── optimization-history/ #   优化历程
+│   │   ├── use/                  #   实现详解与 QA
+│   │   └── examples/             #   API 使用示例
+│   ├── kvstore.conf              # 默认配置
+│   ├── kvstore-ebpf.conf         # eBPF 守护进程配置
+│   ├── vmlinux.h                 # BPF 编译用内核类型（由 BTF 生成）
+│   └── Makefile                  # 构建入口
+├── README.md
+├── LICENSE
+└── Makefile                      # 委派到 kvstore/
 ```
+
+> `artifacts/` 为测试运行时产物目录，由脚本按需创建，已在 `.gitignore` 中；`kvstore/benchmarks/` 同样只保留在本地，不随仓库分发。
 
 ---
 
@@ -256,19 +255,6 @@ kvstore/
 | `APPENDFSYNC policy` | 设置 AOF 同步策略     |
 | `--aof-disable`      | 启动时禁用 AOF 持久化 |
 
-### 文档对象
-
-
-| 命令                     | 说明         |
-| ------------------------ | ------------ |
-| `DOCSET key field value` | 设置字段     |
-| `DOCGET key field`       | 获取字段     |
-| `DOCDEL key field`       | 删除字段     |
-| `DOCDROP key`            | 删除整个文档 |
-| `DOCEXIST key`           | 文档是否存在 |
-| `DOCCOUNT key`           | 字段数量     |
-| `DOCGETALL key`          | 获取全部字段 |
-
 ### 分布式锁
 
 
@@ -308,7 +294,7 @@ kvstore/
 
 ### 全部配置项
 
-完整配置见 [`kvstore.conf`](kvstore.conf)，以下为主要选项：
+完整配置见 [`kvstore.conf`](kvstore/kvstore.conf)，以下为主要选项：
 
 
 | 配置项                       | 默认值            | 说明                                                                  |
@@ -336,60 +322,64 @@ kvstore/
 
 > 命令行参数优先级高于配置文件。启动时只需 `./kvstore kvstore.conf --role master`。
 > **双通道模式（推荐）**：`repl_fullsync_transport=rdma` + `repl_realtime_transport=ebpf+tcp`。
-> RDMA 负责全量快照传输，eBPF+tcp 负责增量同步。**REPLDONE 是分界线**：
 >
-> ```
->        ← 全量同步 (RDMA) →|← 增量同步 (repl_broadcast TCP) →
->  Master: 发送快照 → 发送 REPLDONE → flush eBPF 缓存 → 实时广播
->  Slave:  接收快照 → 收到 REPLDONE → 应用缓存数据 → 接收实时增量
-> ```
->
-> - **全量同步期间**：eBPF client_capture（kprobe/tcp_recvmsg）缓存客户端写入到 L1(4MB)+L2(磁盘)
-> - **REPLDONE 后**：Master 关闭 RDMA，flush 缓存到 slave，`g_repl_fullsync_in_progress=0` 触发增量同步
-> - **增量同步**：repl_broadcast 通过 TCP 发送；Master 自知 REPLDONE 时机，无需 BPF 探测
-> - **自动回退**：RDMA 不可用 → TCP 全量；BPF 加载失败 → 纯 TCP 增量
->   完整配置项见 [`kvstore.conf`](kvstore.conf) 文件注释。
+> 完整配置项见 [`kvstore.conf`](kvstore/kvstore.conf) 文件注释。
 
 ### 命令行参数
 
-```
+```bash
 # ── 最简启动（所有选项从 kvstore.conf 读取）──
 sudo ./kvstore kvstore.conf --role master          # RDMA 全量 + eBPF+tcp 增量（需 root）
 ./kvstore kvstore.conf --role slave                # Slave（无需 root，无需手动启动任何进程）
+
+# ── 逐项参数覆盖 ──
+./kvstore --port 5160 --role master --repl-fullsync-transport rdma \
+  --repl-realtime-transport kprobe-rdma --rdma-dev siw0 \
+  --rdma-recv-slots 64 --kprobe-enabled --appendfsync always
 ```
 
 > **eBPF+tcp 增量：ebpf-proxy 由 Master 自动拉起（2026-08-14 起）**。Master 以 `repl_realtime_transport=ebpf+tcp` 启动时会自动 `posix_spawn` 独立的 `build/ebpf_proxy` 进程（仍单独进程，继承 root 权限加载 BPF），**无需手动启动**；日志可见 `master: spawned ebpf-proxy pid=...`。可覆盖 `ebpf_proxy_bin` / `ebpf_client_capture_obj`（conf 或 `--ebpf-proxy-bin` / `--ebpf-client-capture-obj`）。若 proxy_cfg 已被外部手动启动的 ebpf-proxy pin，则不会重复 spawn。
->
-> 三种增量传输对照：
->
-> - `repl_realtime_transport=ebpf+tcp`（推荐）— master 自动拉起 ebpf-proxy（fentry 捕获 tcp_recvmsg → ringbuf → TCP 转发）
-> - `repl_realtime_transport=kprobe-rdma` — master 内部线程捕获，无需 ebpf-proxy
-> - `repl_realtime_transport=tcp` — 纯 TCP 增量，无需 ebpf-proxy
-
-# ── 逐项参数覆盖 ──
-
-./kvstore --port 5160 --role master --repl-fullsync-transport rdma
---repl-realtime-transport kprobe-rdma --rdma-dev siw0
---rdma-recv-slots 64 --kprobe-enabled --appendfsync always
-
-```
 
 ---
 
 ## 文档索引
 
 
-| 文档                                                                                           | 说明                                                                   |
-| ---------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
-| [`docs/tech-roadmap.md`](docs/tech-roadmap.md)                                                 | ⭐**技术路线与实现详解** — 新手必读，覆盖所有模块的架构、流程图、代码 |
-| [`docs/rdma-fullsync-implementation.md`](docs/rdma-fullsync-implementation.md)                 | RDMA 全量复制的代码级实现分析                                          |
-| [`docs/ebpf-forwarding-optimization-journey.md`](docs/ebpf-forwarding-optimization-journey.md) | eBPF 增量转发优化历程（当前 ebpf+tcp 架构关键）                        |
-| [`docs/replication-mechanism-qa.md`](docs/replication-mechanism-qa.md)                         | 复制机制 QA（RDMA 全量 + eBPF+tcp 增量）                               |
-| [`docs/tests-guide.md`](docs/tests-guide.md)                                                   | 完整测试教程（各测试的编译/运行/验证详解）                             |
-| [`docs/benchmark-methodology-qa.md`](docs/benchmark-methodology-qa.md)                         | 基准测试方法论 QA（含 redis-benchmark 客户端测量边界）                 |
-| [`docs/aof-group-commit.md`](docs/aof-group-commit.md)                                         | AOF 异步批量攒批窗口优化历程（瓶颈→分析→方法→验证→踩坑）              |
-| [`docs/memory-backend-analysis.md`](docs/memory-backend-analysis.md)                           | 内存后端（libc/jemalloc/custom）分析                                   |
-| [`docs/examples/kvs_skiptable.c`](docs/examples/kvs_skiptable.c)                               | Skiptable 引擎 API 使用示例                                            |
+| 文档                                                                                                   | 说明                                                               |
+| ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------ |
+| [`kvstore/docs/tech-roadmap.md`](kvstore/docs/tech-roadmap.md)                                         | ⭐**技术路线与实现详解** — 新手必读，覆盖所有模块的架构、流程图、代码 |
+| [`kvstore/docs/kvstore-data-flow.md`](kvstore/docs/kvstore-data-flow.md)                               | 数据流全景（命令→存储→持久化→复制的时序与路径）                    |
+| [`kvstore/docs/tests-guide.md`](kvstore/docs/tests-guide.md)                                           | 完整测试教程（各测试的编译/运行/验证详解）                         |
+| [`kvstore/docs/rdma-fullsync-implementation.md`](kvstore/docs/rdma-fullsync-implementation.md)         | RDMA 全量复制的代码级实现分析                                      |
+| [`kvstore/docs/replication-mechanism-qa.md`](kvstore/docs/replication-mechanism-qa.md)                 | 复制机制 QA（RDMA 全量 + eBPF+tcp 增量）                           |
+| [`kvstore/docs/ebpf-forwarding-optimization-journey.md`](kvstore/docs/ebpf-forwarding-optimization-journey.md) | eBPF 增量转发优化历程（当前 ebpf+tcp 架构关键）                    |
+| [`kvstore/docs/kprobe-rdma-debug-diagnosis.md`](kvstore/docs/kprobe-rdma-debug-diagnosis.md)           | kprobe+RDMA 路径调试与诊断（legacy 传输，按需）                    |
+| [`kvstore/docs/use/kprobe-rdma-incrsync-implementation.md`](kvstore/docs/use/kprobe-rdma-incrsync-implementation.md) | kprobe+RDMA 增量同步实现详解（legacy 传输，按需）                  |
+| [`kvstore/docs/use/kvstore-interview-questions.md`](kvstore/docs/use/kvstore-interview-questions.md)   | 项目面试题库（C/网络/存储/复制/内存逐题详解）                      |
+| [`kvstore/docs/save-analysis.md`](kvstore/docs/save-analysis.md)                                       | SAVE 耗时与开销分析                                                |
+| [`kvstore/docs/save-benchmark.md`](kvstore/docs/save-benchmark.md)                                     | SAVE 基准测试记录                                                  |
+| [`kvstore/docs/aof-fsync-modes-analysis.md`](kvstore/docs/aof-fsync-modes-analysis.md)                 | AOF fsync 模式分析                                                 |
+| [`kvstore/docs/examples/kvs_skiptable.c`](kvstore/docs/examples/kvs_skiptable.c)                       | Skiptable 引擎 API 使用示例                                        |
+
+**基准数据分析**（`kvstore/docs/data_analysis/`）
+
+
+| 文档                                                                                                                     | 说明                                             |
+| ------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------ |
+| [`benchmark-methodology-qa.md`](kvstore/docs/data_analysis/benchmark-methodology-qa.md)                                   | 基准测试方法论 QA（含 redis-benchmark 测量边界） |
+| [`aof-group-commit.md`](kvstore/docs/data_analysis/aof-group-commit.md)                                                   | AOF 异步批量攒批窗口优化历程                     |
+| [`save-aof-always-mode-comparison.md`](kvstore/docs/data_analysis/save-aof-always-mode-comparison.md)                     | SAVE 与 AOF always 模式对比                      |
+| [`memory-backend-analysis.md`](kvstore/docs/data_analysis/memory-backend-analysis.md)                                     | 内存后端（libc/jemalloc/custom）分析             |
+| [`rdma-one-sided-mtu-optimization.md`](kvstore/docs/data_analysis/rdma-one-sided-mtu-optimization.md)                     | 单边 RDMA MTU 与并行 QP 优化                     |
+
+**优化历程**（`kvstore/docs/optimization-history/`）
+
+
+| 文档                                                                                             | 说明                     |
+| ------------------------------------------------------------------------------------------------ | ------------------------ |
+| [`pipeline-analysis.md`](kvstore/docs/optimization-history/pipeline-analysis.md)                 | Pipeline 批量性能分析    |
+| [`aof-concurrent.md`](kvstore/docs/optimization-history/aof-concurrent.md)                       | AOF 并发优化             |
+| [`custom-allocator.md`](kvstore/docs/optimization-history/custom-allocator.md)                   | custom 分配器优化（Phase 1-5） |
 
 ---
 
@@ -569,7 +559,7 @@ cmd[0] == 'X' → Skiptable 引擎
 
 **统一命令分发**：命令前缀确定引擎 → 函数指针路由 → 写命令统一走 `persist_append_raw` + `repl_broadcast`。详见 `src/main/kvstore.c` 的 `handle_parsed_command()`。
 
-> 实现细节（RESP 解析、持久化、主从复制、TTL 过期、内存管理等）见 [`docs/tech-roadmap.md`](docs/tech-roadmap.md)。
+> 实现细节（RESP 解析、持久化、主从复制、TTL 过期、内存管理等）见 [`docs/tech-roadmap.md`](kvstore/docs/tech-roadmap.md)。
 
 ## 测试体系
 
@@ -643,7 +633,7 @@ gcc -I./include -o test_kvstore tests/test_kvstore.c
 
 ---
 
-> **完整测试教程**：每个测试的编译/运行/验证/选项表详解见 [`docs/tests-guide.md`](docs/tests-guide.md)。
+> **完整测试教程**：每个测试的编译/运行/验证/选项表详解见 [`docs/tests-guide.md`](kvstore/docs/tests-guide.md)。
 
 
 | 测试程序                 | 说明                                                   |
@@ -807,7 +797,7 @@ python3 tools/tests/run_all_tests.py --only check,check-bulk-1w,check-mass-ttl
 | RDMA pingpong          | `artifacts/rdma/pingpong/`          | 延迟/吞吐报告                     |
 | 基准测试               | `artifacts/bench/`                  | CSV 数据、图表                    |
 
-> 此外，`testdata/` 存放手工编写的静态测试数据（样例 AOF、dump 文件、测试用配置文件），不会被脚本覆盖。
+> 此外，`testdata/` 存放静态测试配置样例（如 `kvstore.test.conf`），不会被脚本覆盖。
 
 ---
 
@@ -824,7 +814,7 @@ python3 tools/tests/run_all_tests.py --only check,check-bulk-1w,check-mass-ttl
 | `jemalloc` | 高性能分配器，减少碎片                  |
 | `custom`   | 自研 slab + mmap 分配器，可观测碎片统计 |
 
-##### 内存占用（100w HSET 写入/释放，完整方法与环境见 [`docs/memory-backend-analysis.md`](docs/memory-backend-analysis.md)）
+##### 内存占用（100w HSET 写入/释放，完整方法与环境见 [`docs/memory-backend-analysis.md`](kvstore/docs/data_analysis/memory-backend-analysis.md)）
 
 > 测试脚本：`python3 tools/bench/mem_pool_bench.py`；写入 100w 条 HSET → 释放 100w 条 HDEL，在 1%/10%/50%/80%/100% 进度点采样 `/proc/<pid>/status` 的 VmSize/VmRSS。
 
@@ -841,10 +831,9 @@ python3 tools/tests/run_all_tests.py --only check,check-bulk-1w,check-mass-ttl
 
 - **写满峰值受连接缓冲主导**：50 连接 × 1.28MB（inbuf 1MB + out_ring 256KB）= 64MB 缓冲，写满 RSS 差异来自缓冲物理占用与归还（jemalloc 及时 purge 最低，custom/libc 缓冲残留多）；**数据本身三后端差异小**
 - **释放后归还**：custom/libc 靠「slab 页 munmap + `malloc_trim`」几乎全还（残留 348/132KB，接近基线）；jemalloc 有固定 ~2.4MB **arena 元数据**（purge 清不掉）
-- ⚠️ 旧结论「custom 省 libc 6x（随机 key 12.4 vs 74.9MB）」**已废弃**——那是 20 万 key + settle 后读的连接缓冲归还差异，非数据密度；统一 50 连接口径后消失
 - **基线 VmSize 高 ≠ 物理内存**：线程栈虚拟预留（`MAP_STACK|PROT_NONE`，RSS 0 成本）+ jemalloc arena 虚拟保留；VmRSS 基线仅 4-7MB
 - **吞吐**：三后端持平（±3%，多连接实测），custom 无吞吐优势
-- custom 分配器优化历程（Phase 1-5）见 [`docs/optimization-history/custom-allocator.md`](docs/optimization-history/custom-allocator.md)
+- custom 分配器优化历程（Phase 1-5）见 [`docs/optimization-history/custom-allocator.md`](kvstore/docs/optimization-history/custom-allocator.md)
 
 ### 持久化性能基准
 
@@ -874,11 +863,9 @@ python3 tools/tests/run_all_tests.py --only check,check-bulk-1w,check-mass-ttl
 | ├─ 无 AOF                      | —           | **187,382**  | baseline    |
 | ├─ AOF always                  | —           | **75,124**   | 40%         |
 
-> 方法论（2026-08-25 统一标准）：populate 1M 键后 `memtier -t 2 -c 50 --test-time=5` 测稳态 QPS，2 轮中位。**kvstore AOF always 为先回复 + 异步批量 group commit（默认 `aof_group_commit_window_us=2000` 攒批窗口）**：回包不等 fsync，命令攒批由 AOF 独立线程按磁盘最大 fsync 率定频刷盘，与 redis 落盘才回包语义不同。**kv AOF always 相对 AOF 关闭仅 −13%（175k vs 202k）**（fsync 瓶颈已被攒批窗口消除）；**redis AOF always 掉到 40%（75k vs 187k）**。**kv AOF always 是 redis 的 2.33×**（175k vs 75k）；echo/hset 基础吞吐 kv 也超 redis（echo 1.12×、hset 1.08×）。
-
 ##### 分析
 
-> 已移至 [`docs/optimization-history/aof-concurrent.md`](docs/optimization-history/aof-concurrent.md)。README 只保留测试数据与测试方法。完整优化历程：`docs/aof-group-commit.md`。
+> 已移至 [`docs/optimization-history/aof-concurrent.md`](kvstore/docs/optimization-history/aof-concurrent.md)。README 只保留测试数据与测试方法。完整优化历程：`docs/aof-group-commit.md`。
 
 ---
 
@@ -913,7 +900,7 @@ python3 tools/tests/run_all_tests.py --only check,check-bulk-1w,check-mass-ttl
 
 ##### 结果分析
 
-> SAVE 耗时与数据量分析、SAVE 开销、BGSAVE 最佳策略详见 [`docs/save-analysis.md`](docs/save-analysis.md)。
+> SAVE 耗时与数据量分析、SAVE 开销、BGSAVE 最佳策略详见 [`docs/save-analysis.md`](kvstore/docs/save-analysis.md)。
 
 #### Pipeline 批量性能测试
 
@@ -964,23 +951,7 @@ python3 tools/tests/run_all_tests.py --only check,check-bulk-1w,check-mass-ttl
 | 80     | 1,554,116       | 824,387       | **189%** | 75%        | 46%           |
 | 160    | 1,660,390       | 968,265       | **171%** | 73%        | 49%           |
 
-> **2026-08-25 统一标准**：HSET 配置 populate 1M 键（真实数据量）后测稳态 QPS（memtier 多连接随机键 RNG 跨连接碰撞只写 ~2 万键，空表测的"100w"是虚的）。**P=1 HSET（202k）与 AOF/SAVE 100w 一致（202k）**。kv 三项全 P 超 redis（echo 1.11-1.23×、hset off 1.07-1.20×、hset always 1.71-2.53×）。本数据基于 3 项优化后重测：(1) [reactor.c](kvstore/src/core/reactor.c) 去掉读路径冗余 EPOLLOUT 预注册；(2) [kvstore.c](kvstore/src/main/kvstore.c) `repl_broadcast` 无副本早退；(3) HSET/HGET/HDEL/HMOD 分派 fast path。
-
-> **AOF开销** = 各自 `AOF always ÷ AOF 关闭` QPS（越高=AOF 开销越小，100%=无开销）。
->
-> 2026-08-11 重测（分离核 server 2,3 / client 0；P=1 独立测 10 次中位数，其余 P 交错测 kv/redis 5 轮中位数）。**kvstore AOF always 为先回复 + 异步批量 group commit（默认攒批窗口 `aof_group_commit_window_us=2000`）**：回包不等 fsync，命令攒批由 AOF 独立线程按磁盘最大 fsync 率定频刷盘，崩溃窗口稳态 ~2.5ms / 最坏 ~10ms；与 redis 的落盘才回包语义不同。攒批窗口消除了 fsync 吞吐瓶颈：P=1 从旧默认 45.7k → **118.7k**（追平 AOF 关闭 122.3k），各 P 均大幅领先 redis（170%-268%）。
->
-> **kv/redis 比值随 P 下降的根因（2026-08-11 分解验证）**：比值 = `kvAOF × 基础优势 ÷ rdAOF`。**kv AOF开销恒定 ~91-97%**（异步 + 2000µs 时间窗攒批，fsync 节奏由时间窗决定、不随 P 变，开销本就 ~5-9%）；**redis AOF开销从 38% 摊薄到 66%**（redis `always` 为同步 per-事件循环迭代 fsync，P 越大每迭代摊的命令越多，fsync 从主导降到可忽略）。分母（redis 开销）升 ×1.94 快于分子（基础优势仅 ×1.13）→ 比值单调降。**这是 redis 追自身 no-AOF 天花板的比例效应，非 kv 变差**——kv 绝对领先仍从 74k 扩到 454k，且即使 P=160 redis 开销仍有 34%、kv 仅 4%。
-
-> **分析**：
->
-> - **P=1（客户端 RTT 封顶）**：异步批量/同步批量/Redis 均 ~43k——批内摊薄 fsync 后三者同频；异步逐条 32k（每命令一次 fsync 延迟进入回包路径）；同步逐条 2.5k（每条命令阻塞 reactor 于 fdatasync，CPU 空转）。
-> - **高 P 只有批量能涨**：异步批量 1.02M > 同步批量 903k > Redis 599k > 异步逐条 250-284k ≫ 同步逐条 2.5k。批量越大一次 fsync 摊得越薄；逐条封顶（异步靠高并发内核合并同 inode fsync 才到 ~250k，同步逐条对 P 无感恒定 2.5k）。
-> - **异步 vs 同步批量**：io_uring 重叠 vs 阻塞。P=1 持平（都是 RTT 封顶），P≥10 异步领先 13-43%（P=160 收窄到 13%）；同步批量高 P 仍超 Redis 15-51%（P=160 达 151%）。
-> - **异步 vs 同步逐条**：不阻塞 vs 阻塞。异步随 P 从 32k 涨到 250-284k；同步恒定 2.5k（对 P 完全无感，死锁在串行 fsync）。
-> - **结论**：默认异步批量是唯一全面超 Redis 的方案（P=1 打平、高 P 151-184%）；同步批量是"Redis 同步语义 + 窄损失窗口"的备选（全 P 也超 Redis 2-51%）；逐条（尤其同步逐条）无吞吐价值，仅"每条命令独立确认"语义可用。
-
-> 已移至 [`docs/optimization-history/pipeline-analysis.md`](docs/optimization-history/pipeline-analysis.md)。README 只保留测试数据与测试方法。
+> 已移至 [`docs/optimization-history/pipeline-analysis.md`](kvstore/docs/optimization-history/pipeline-analysis.md)。README 只保留测试数据与测试方法。
 
 ### eBPF fentry+fexit 主从转发 QPS 对比
 
@@ -1012,11 +983,6 @@ python3 tools/tests/run_all_tests.py --only check,check-bulk-1w,check-mass-ttl
 |  80 | 2,990,567 | 2,240,621 | 2,178,977 |     0.749 |     0.729 |     0.972 |
 | 160 | 3,097,276 | 2,184,952 | 2,377,404 |     0.705 |     0.768 |     1.088 |
 
-> **2026-08-28 重测（修复 `SO_*BUF` 锁窗口后）**：旧表（2026-08-27）用 tcpsink 默认（`SO_RCVBUF=1MB`）作对端，显式 `SO_RCVBUF` **禁用 Linux TCP 接收窗口 autotuning**（窗口锁死 ~56KB），把 sync/ebpf 跨机 QPS 压到 ~1.5-1.7M。本轮修复并重测：① 对端 `tcpsink --no-rcvbuf`（保留 autotuning）；② 生产 `src/ebpf_proxy/proxy_slave.c` 去掉显式 `SO_SNDBUF/SO_RCVBUF`（同样保留 autotuning）。**新数据高 P 比值 sync/ebpf 从 ~0.53/0.48 → ~0.74/0.74**；ebpf P=160 由 1.53M → 2.34M 且**完整性核对通过**（master 捕获 3814MB vs tcpsink 实收 3824MB，~99.7% 送达；旧值丢 36%）。剩余瓶颈 = master 产生 + 转发每命令 CPU（跨机网络 softirq 占 128 CPU 7.6% vs 同机 1.5%），**非网络带宽**（iperf3 大包 10G）。
->
-> **2026-08-30 补充（修复 harness `backpressured()` 无缓存）**：追查"同机 ebpf P=1 低于 README"发现 harness 未提交改动把 `backpressured()` 的 1ms 缓存去掉，P=1 每命令 read 前 **2 次 `bpf_map_lookup_elem` syscall** 占满 master 单核（87.5%）。恢复缓存后 **ebpf P=1 由 161k 修正到 ~200k**（与 sync 相当、无损），跨机 P=160 仍无损；生产 `repl_ebpf_backpressure()` 有 2ms 缓存不受影响。**高 P ebpf 无 proxy 转发瓶颈**（实测 ebpf P=160 = 2.38M、`backp_stalls=0`、proxy 跟得上），与 sync 相当；全 P 快照中 P=160 的 1.93M 是环境波动，取中位 ~2.3M。P=10/160 各 +6%/-3%（波动内）。详见文档 3 §8/Q5 与 `kvstore/tests/perf/tcpsink.c`（`--no-rcvbuf`）。
-
-
 ### 全量同步文件传输对比（KVSD dump 文件，本地 + 跨机）
 
 #### chunk 大小扫描（85MB dump，全 RDMA WRITE，每 chunk 3 次中位数）
@@ -1045,7 +1011,7 @@ python3 tools/tests/run_all_tests.py --only check,check-bulk-1w,check-mass-ttl
 | 9000                | **3.14 Gbps**               | **2.09 Gbps** | **8.9 Gbps** |
 | 9216+               | 链路断（vSwitch 上限 9000） |               |              |
 
-> 详情见 [`docs/rdma-one-sided-mtu-optimization.md`](docs/rdma-one-sided-mtu-optimization.md)。当前生产用 siw0 单设备（rxe0 双设备破坏跨机连接），siw0 @ MTU 9000 为 2.09 Gbps。
+> 详情见 [`docs/rdma-one-sided-mtu-optimization.md`](kvstore/docs/data_analysis/rdma-one-sided-mtu-optimization.md)。当前生产用 siw0 单设备（rxe0 双设备破坏跨机连接），siw0 @ MTU 9000 为 2.09 Gbps。
 
 #### RPS + 并行 QP（跨机效率终测，2026-08-13）
 
@@ -1062,7 +1028,7 @@ python3 tools/tests/run_all_tests.py --only check,check-bulk-1w,check-mass-ttl
 | RDMA N=2            |    5.52 Gbps |           ~56% |        ~63% |
 | RDMA N=4            |    5.15 Gbps |           ~53% |        ~59% |
 
-> 完整实验过程 / 数据 / 分析见 [`docs/rdma-one-sided-mtu-optimization.md`](docs/rdma-one-sided-mtu-optimization.md) §8。
+> 完整实验过程 / 数据 / 分析见 [`docs/rdma-one-sided-mtu-optimization.md`](kvstore/docs/data_analysis/rdma-one-sided-mtu-optimization.md) §8。
 
 ---
 
@@ -1141,4 +1107,4 @@ printf '*1\r\n$7\r\nMEMSTAT\r\n' | nc 127.0.0.1 5160
 
 ---
 
-*最后更新：2026 年 8 月 2 日*
+*最后更新：2026 年 9 月 12 日*

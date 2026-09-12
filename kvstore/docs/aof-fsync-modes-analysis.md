@@ -1,6 +1,6 @@
 # kvstore AOF always 四种刷盘模式分析报告
 
-> **⚠️ 现状更新（2026-08-03）**：本报告的结论（§5/§6）建议"同步批量改默认"。后续实测发现异步波动的根源是**测量方法**（非架构），**当前默认已定为异步批量 group commit**（`aof_fsync_per_command=0`），见 [`optimization-history/aof-concurrent.md`](optimization-history/aof-concurrent.md) 与 [`save-aof-always-mode-comparison.md`](save-aof-always-mode-comparison.md)。本文档保留为四种刷盘模式的分析记录。
+> **⚠️ 现状更新（2026-08-03）**：本报告的结论（§5/§6）建议"同步批量改默认"。后续实测发现异步波动的根源是**测量方法**（非架构），**当前默认已定为异步批量 group commit**（`aof_fsync_per_command=0`），见 [`optimization-history/aof-concurrent.md`](optimization-history/aof-concurrent.md) 与 [`save-aof-always-mode-comparison.md`](data_analysis/save-aof-always-mode-comparison.md)。本文档保留为四种刷盘模式的分析记录。
 >
 > **⚠️ 语义现状更新（2026-08-06）**：现默认异步批量采用**先回复 + 有界窗口**——回包不等 fsync，AOF 独立线程按磁盘最大 fsync 率定频刷盘，崩溃窗口稳态 ~1.3ms / 最坏 ~7ms（受 `MAX_OUTSTANDING=16` 背压约束），不再对齐 redis 的落盘才回包语义。
 >

@@ -10,7 +10,7 @@
 
 ## 1. 背景
 
-上轮分析（[aof-fsync-modes-analysis.md](aof-fsync-modes-analysis.md)）已确认：kvstore 的 AOF always 方差根源是**异步架构**（run-ahead → io_uring ring 满 → 停滞 → 突发），并建议**同步批量（`--aof-fsync-sync-batch`）改为默认**；该建议曾于 08-01 落地为默认，后经多次调整，现定为**异步批量 group commit 默认**（`src/main/kvstore.c` 现默认 `.aof_fsync_per_command=0, .aof_fsync_sync=0`）——攒批共享 fsync，吞吐/稳定性兼顾。
+上轮分析（[aof-fsync-modes-analysis.md](../aof-fsync-modes-analysis.md)）已确认：kvstore 的 AOF always 方差根源是**异步架构**（run-ahead → io_uring ring 满 → 停滞 → 突发），并建议**同步批量（`--aof-fsync-sync-batch`）改为默认**；该建议曾于 08-01 落地为默认，后经多次调整，现定为**异步批量 group commit 默认**（`src/main/kvstore.c` 现默认 `.aof_fsync_per_command=0, .aof_fsync_sync=0`）——攒批共享 fsync，吞吐/稳定性兼顾。
 
 本轮按 README「SAVE + AOF always 对比」方法论：
 - **kvstore 异步批量 group commit**（现默认，per_command=0, sync=0）
@@ -174,5 +174,5 @@ done
 
 ## 8. 相关文档
 
-- [aof-fsync-modes-analysis.md](aof-fsync-modes-analysis.md) — 四种 AOF 刷盘模式的方差根因分析（异步架构放大 fsync 抖动）
-- [save-benchmark.md](save-benchmark.md) — SAVE 性能基线
+- [aof-fsync-modes-analysis.md](../aof-fsync-modes-analysis.md) — 四种 AOF 刷盘模式的方差根因分析（异步架构放大 fsync 抖动）
+- [save-benchmark.md](../save-benchmark.md) — SAVE 性能基线

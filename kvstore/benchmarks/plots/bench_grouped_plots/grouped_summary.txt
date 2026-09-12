@@ -1,5 +1,0 @@
-skiptable_100k_val256 | XSET ops=100,000 | value=256B
-  libc: qps=1603.64, vmrss_kb=44452.00, vmsize_kb=45948.00, mem_gap_kb=1496.00, internal_fragment_rate=0.000000, page_utilization=0.000000, fallback_alloc_calls=0.00
-  jemalloc: qps=1587.41, vmrss_kb=47288.00, vmsize_kb=67844.00, mem_gap_kb=20556.00, internal_fragment_rate=0.000000, page_utilization=0.000000, fallback_alloc_calls=0.00
-  custom: qps=1590.74, vmrss_kb=62160.00, vmsize_kb=63432.00, mem_gap_kb=1272.00, internal_fragment_rate=0.285953, page_utilization=0.840580, fallback_alloc_calls=0.00
-

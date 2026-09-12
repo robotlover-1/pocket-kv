@@ -2,7 +2,7 @@
 
 custom slab 分配器（`src/memory/kvs_mem.c`）从初始实现到当前的优化历史，按内存占用维度演进。
 
-> 当前数据与内存后端对比见 [`../memory-backend-analysis.md`](../memory-backend-analysis.md)；benchmark 原始数据在 `benchmarks/data/`。
+> 当前数据与内存后端对比见 [`../memory-backend-analysis.md`](../data_analysis/memory-backend-analysis.md)；benchmark 原始数据在 `benchmarks/data/`。
 
 四次优化将峰值 VmSize 从 97 MB 降到 70 MB，释放率从 0% 提升到 97%。
 
@@ -85,5 +85,5 @@ typedef struct small_chunk_s {        typedef struct small_chunk_s {
 
 ## 2026-08-02 补充（P5：class 8/136 + array 惰性分配）
 
-- **class 调优**（`src/memory/kvs_mem.c`）：17→19 级，加 class `8`（接 forward 8B，消除 50% 浪费）和 `136`（接 value 129，消除 24% 浪费）。效果：XSET 300k 内部碎片率 **14.1%→5.0%**、RSS **94→86MB**（贴平 libc/jemalloc 87MB），HSET 与吞吐无回退。skiptable 节点做 3 次分配，value 129 是主碎片源（详见 [`../memory-backend-analysis.md`](../memory-backend-analysis.md) §4）。
-- **array 惰性分配**（`src/storage/kvs_array.c`）：`KVS_ARRAY_SIZE` 提到 1M 槽后 `kvs_array_create` 无条件预分配 16MB。改为首次 SET 才分配（`table=NULL` 惰性），基线 VmSize 36.7→**20.3MB**、VmRSS 21→**4.6MB**，SET/SAVE/恢复验证通过（见 [`../memory-backend-analysis.md`](../memory-backend-analysis.md) §5）。
+- **class 调优**（`src/memory/kvs_mem.c`）：17→19 级，加 class `8`（接 forward 8B，消除 50% 浪费）和 `136`（接 value 129，消除 24% 浪费）。效果：XSET 300k 内部碎片率 **14.1%→5.0%**、RSS **94→86MB**（贴平 libc/jemalloc 87MB），HSET 与吞吐无回退。skiptable 节点做 3 次分配，value 129 是主碎片源（详见 [`../memory-backend-analysis.md`](../data_analysis/memory-backend-analysis.md) §4）。
+- **array 惰性分配**（`src/storage/kvs_array.c`）：`KVS_ARRAY_SIZE` 提到 1M 槽后 `kvs_array_create` 无条件预分配 16MB。改为首次 SET 才分配（`table=NULL` 惰性），基线 VmSize 36.7→**20.3MB**、VmRSS 21→**4.6MB**，SET/SAVE/恢复验证通过（见 [`../memory-backend-analysis.md`](../data_analysis/memory-backend-analysis.md) §5）。

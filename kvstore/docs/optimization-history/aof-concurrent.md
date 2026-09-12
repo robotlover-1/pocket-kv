@@ -22,7 +22,7 @@ kvstore AOF always（异步批量，现默认）相对 AOF 关闭（124,493）**
 
 ## ④b 先回复（reply-first）改造后 P-sweep（2026-08-06/07）
 
-AOF 独立线程 + write-in-place 槽 + 先回复改造（HEAD=98eeefc）后，完整 P-sweep 对比改造前基线（README 08-04 异步批量默认、durable-before-reply）。方法同口径：`redis-benchmark -n 1000000 -c 50 -P N -d 64 -r 1000000 HSET key:__rand_int__ value`，每 P 重启空库 + 预热取 1 轮。完整报告：[docs/superpowers/bench/2026-08-06-aof-thread-reply-first.md](../superpowers/bench/2026-08-06-aof-thread-reply-first.md)。
+AOF 独立线程 + write-in-place 槽 + 先回复改造（HEAD=98eeefc）后，完整 P-sweep 对比改造前基线（README 08-04 异步批量默认、durable-before-reply）。方法同口径：`redis-benchmark -n 1000000 -c 50 -P N -d 64 -r 1000000 HSET key:__rand_int__ value`，每 P 重启空库 + 预热取 1 轮。完整报告见 git 历史（原 docs/superpowers/bench/2026-08-06-aof-thread-reply-first.md，已随开发过程稿清理）。
 
 | P | 新实现(reply-first) | 基线(README 08-04) | 变化 |
 |---|---:|---:|---:|
