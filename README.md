@@ -345,41 +345,41 @@ sudo ./kvstore kvstore.conf --role master          # RDMA 全量 + eBPF+tcp 增�
 ## 文档索引
 
 
-| 文档                                                                                                   | 说明                                                               |
-| ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------ |
-| [`kvstore/docs/tech-roadmap.md`](kvstore/docs/tech-roadmap.md)                                         | ⭐**技术路线与实现详解** — 新手必读，覆盖所有模块的架构、流程图、代码 |
-| [`kvstore/docs/kvstore-data-flow.md`](kvstore/docs/kvstore-data-flow.md)                               | 数据流全景（命令→存储→持久化→复制的时序与路径）                    |
-| [`kvstore/docs/tests-guide.md`](kvstore/docs/tests-guide.md)                                           | 完整测试教程（各测试的编译/运行/验证详解）                         |
-| [`kvstore/docs/rdma-fullsync-implementation.md`](kvstore/docs/rdma-fullsync-implementation.md)         | RDMA 全量复制的代码级实现分析                                      |
-| [`kvstore/docs/replication-mechanism-qa.md`](kvstore/docs/replication-mechanism-qa.md)                 | 复制机制 QA（RDMA 全量 + eBPF+tcp 增量）                           |
-| [`kvstore/docs/ebpf-forwarding-optimization-journey.md`](kvstore/docs/ebpf-forwarding-optimization-journey.md) | eBPF 增量转发优化历程（当前 ebpf+tcp 架构关键）                    |
-| [`kvstore/docs/kprobe-rdma-debug-diagnosis.md`](kvstore/docs/kprobe-rdma-debug-diagnosis.md)           | kprobe+RDMA 路径调试与诊断（legacy 传输，按需）                    |
-| [`kvstore/docs/use/kprobe-rdma-incrsync-implementation.md`](kvstore/docs/use/kprobe-rdma-incrsync-implementation.md) | kprobe+RDMA 增量同步实现详解（legacy 传输，按需）                  |
-| [`kvstore/docs/use/kvstore-interview-questions.md`](kvstore/docs/use/kvstore-interview-questions.md)   | 项目面试题库（C/网络/存储/复制/内存逐题详解）                      |
-| [`kvstore/docs/save-analysis.md`](kvstore/docs/save-analysis.md)                                       | SAVE 耗时与开销分析                                                |
-| [`kvstore/docs/save-benchmark.md`](kvstore/docs/save-benchmark.md)                                     | SAVE 基准测试记录                                                  |
-| [`kvstore/docs/aof-fsync-modes-analysis.md`](kvstore/docs/aof-fsync-modes-analysis.md)                 | AOF fsync 模式分析                                                 |
-| [`kvstore/docs/examples/kvs_skiptable.c`](kvstore/docs/examples/kvs_skiptable.c)                       | Skiptable 引擎 API 使用示例                                        |
+| 文档                                                                                                                 | 说明                                                                   |
+| -------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| [`kvstore/docs/tech-roadmap.md`](kvstore/docs/tech-roadmap.md)                                                       | ⭐**技术路线与实现详解** — 新手必读，覆盖所有模块的架构、流程图、代码 |
+| [`kvstore/docs/kvstore-data-flow.md`](kvstore/docs/kvstore-data-flow.md)                                             | 数据流全景（命令→存储→持久化→复制的时序与路径）                     |
+| [`kvstore/docs/tests-guide.md`](kvstore/docs/tests-guide.md)                                                         | 完整测试教程（各测试的编译/运行/验证详解）                             |
+| [`kvstore/docs/rdma-fullsync-implementation.md`](kvstore/docs/rdma-fullsync-implementation.md)                       | RDMA 全量复制的代码级实现分析                                          |
+| [`kvstore/docs/replication-mechanism-qa.md`](kvstore/docs/replication-mechanism-qa.md)                               | 复制机制 QA（RDMA 全量 + eBPF+tcp 增量）                               |
+| [`kvstore/docs/ebpf-forwarding-optimization-journey.md`](kvstore/docs/ebpf-forwarding-optimization-journey.md)       | eBPF 增量转发优化历程（当前 ebpf+tcp 架构关键）                        |
+| [`kvstore/docs/kprobe-rdma-debug-diagnosis.md`](kvstore/docs/kprobe-rdma-debug-diagnosis.md)                         | kprobe+RDMA 路径调试与诊断（legacy 传输，按需）                        |
+| [`kvstore/docs/use/kprobe-rdma-incrsync-implementation.md`](kvstore/docs/use/kprobe-rdma-incrsync-implementation.md) | kprobe+RDMA 增量同步实现详解（legacy 传输，按需）                      |
+| [`kvstore/docs/use/kvstore-interview-questions.md`](kvstore/docs/use/kvstore-interview-questions.md)                 | 项目面试题库（C/网络/存储/复制/内存逐题详解）                          |
+| [`kvstore/docs/save-analysis.md`](kvstore/docs/save-analysis.md)                                                     | SAVE 耗时与开销分析                                                    |
+| [`kvstore/docs/save-benchmark.md`](kvstore/docs/save-benchmark.md)                                                   | SAVE 基准测试记录                                                      |
+| [`kvstore/docs/aof-fsync-modes-analysis.md`](kvstore/docs/aof-fsync-modes-analysis.md)                               | AOF fsync 模式分析                                                     |
+| [`kvstore/docs/examples/kvs_skiptable.c`](kvstore/docs/examples/kvs_skiptable.c)                                     | Skiptable 引擎 API 使用示例                                            |
 
 **基准数据分析**（`kvstore/docs/data_analysis/`）
 
 
-| 文档                                                                                                                     | 说明                                             |
-| ------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------ |
-| [`benchmark-methodology-qa.md`](kvstore/docs/data_analysis/benchmark-methodology-qa.md)                                   | 基准测试方法论 QA（含 redis-benchmark 测量边界） |
-| [`aof-group-commit.md`](kvstore/docs/data_analysis/aof-group-commit.md)                                                   | AOF 异步批量攒批窗口优化历程                     |
-| [`save-aof-always-mode-comparison.md`](kvstore/docs/data_analysis/save-aof-always-mode-comparison.md)                     | SAVE 与 AOF always 模式对比                      |
-| [`memory-backend-analysis.md`](kvstore/docs/data_analysis/memory-backend-analysis.md)                                     | 内存后端（libc/jemalloc/custom）分析             |
-| [`rdma-one-sided-mtu-optimization.md`](kvstore/docs/data_analysis/rdma-one-sided-mtu-optimization.md)                     | 单边 RDMA MTU 与并行 QP 优化                     |
+| 文档                                                                                                  | 说明                                             |
+| ----------------------------------------------------------------------------------------------------- | ------------------------------------------------ |
+| [`benchmark-methodology-qa.md`](kvstore/docs/data_analysis/benchmark-methodology-qa.md)               | 基准测试方法论 QA（含 redis-benchmark 测量边界） |
+| [`aof-group-commit.md`](kvstore/docs/data_analysis/aof-group-commit.md)                               | AOF 异步批量攒批窗口优化历程                     |
+| [`save-aof-always-mode-comparison.md`](kvstore/docs/data_analysis/save-aof-always-mode-comparison.md) | SAVE 与 AOF always 模式对比                      |
+| [`memory-backend-analysis.md`](kvstore/docs/data_analysis/memory-backend-analysis.md)                 | 内存后端（libc/jemalloc/custom）分析             |
+| [`rdma-one-sided-mtu-optimization.md`](kvstore/docs/data_analysis/rdma-one-sided-mtu-optimization.md) | 单边 RDMA MTU 与并行 QP 优化                     |
 
 **优化历程**（`kvstore/docs/optimization-history/`）
 
 
-| 文档                                                                                             | 说明                     |
-| ------------------------------------------------------------------------------------------------ | ------------------------ |
-| [`pipeline-analysis.md`](kvstore/docs/optimization-history/pipeline-analysis.md)                 | Pipeline 批量性能分析    |
-| [`aof-concurrent.md`](kvstore/docs/optimization-history/aof-concurrent.md)                       | AOF 并发优化             |
-| [`custom-allocator.md`](kvstore/docs/optimization-history/custom-allocator.md)                   | custom 分配器优化（Phase 1-5） |
+| 文档                                                                             | 说明                           |
+| -------------------------------------------------------------------------------- | ------------------------------ |
+| [`pipeline-analysis.md`](kvstore/docs/optimization-history/pipeline-analysis.md) | Pipeline 批量性能分析          |
+| [`aof-concurrent.md`](kvstore/docs/optimization-history/aof-concurrent.md)       | AOF 并发优化                   |
+| [`custom-allocator.md`](kvstore/docs/optimization-history/custom-allocator.md)   | custom 分配器优化（Phase 1-5） |
 
 ---
 
@@ -476,90 +476,6 @@ sequenceDiagram
     H->>N: "queue_bytes(resp)"
     N->>C: "on_write() → send()"
 ```
-
-### 存储引擎 — 五种数据结构
-
-kvstore 实现了五种存储引擎，通过**命令前缀**切换。所有引擎共享同一套 TTL 过期系统和复制层。
-
-#### Array 引擎 (`SET` / `GET` / `DEL`)
-
-- **数据结构**：固定大小线性数组（`KVS_ARRAY_SIZE=1024`），每个 slot 包含 `(key, value)` 指针
-- **查找**：线性扫描 O(n)，n ≤ 1024
-- **限制**：最多 1024 个 key，满了返回 `-ERR operation failed`
-
-```
-table = [slot0, slot1, ..., slot1023]
-          │       │
-     (key,val)  NULL
-```
-
-源码: `src/storage/kvs_array.c` — 线性扫描 O(n)，最多 1024 个 key。
-
-#### Hash 引擎 (`HSET` / `HGET` / `HDEL`)
-
-- **数据结构**：链地址哈希表，`MAX_TABLE_SIZE=1024` 个桶，**FNV-1a 非加密哈希**
-- **查找**：O(1) avg，冲突通过链表解决
-- **与 Array 的区别**：链地址法无固定容量限制
-
-```
-hash(key) → idx
-buckets[idx] → node → node → NULL   (链地址法)
-```
-
-源码: `src/storage/kvs_hash.c` — FNV-1a 哈希 + 链地址法，O(1) avg 查找。
-
-#### RBTREE 引擎 (`RSET` / `RGET` / `RDEL`)
-
-- **数据结构**：**红黑树**，节点颜色标记红/黑，插入后通过左旋/右旋/变色保持平衡
-- **查找**：O(log n)，中序遍历可得有序序列
-- **特点**：通过 5 条红黑树性质保证平衡性
-
-源码: `src/storage/kvs_rbtree.c`
-
-#### Skiptable 引擎 (`XSET` / `XGET` / `XDEL`)
-
-- **数据结构**：**跳表**，多层链表，每层以 50% 概率提升层数（最高 16 层）
-- **查找**：O(log n) avg，从最高层开始逐层向下
-- **与 RBTREE 的对比**：红黑树通过旋转保持平衡，跳表通过概率层数实现平衡；跳表实现更简单，但红黑树最坏情况有保证
-
-```
-head
-  │  ┌─────────────────────────────────┐
-  ├──┤  L3: 10 ──────────────→ 90      │
-  ├──┤  L2: 10 ─────→ 50 ───→ 90      │
-  └──┤  L1: 10 → 30 → 50 → 70 → 90    │
-     └─────────────────────────────────┘
-```
-
-源码: `src/storage/kvs_skiptable.c`
-
-#### Doc 引擎 (`DOCSET` / `DOCGET` / `DOCDEL`)
-
-- **数据结构**：文档型 value，按 `key` 哈希找到文档，文档内部再按 `field` 哈希存储
-- **两层哈希**：外层 `key → doc`，内层 `field → value`
-- **用途**：一个 key 下存储多个字段，类似 Redis Hash
-
-```
-key → doc { fields[0] → (f1,v1) → (f2,v2)
-            fields[1] → (f3,v3) → NULL }
-```
-
-源码: `src/storage/kvs_doc.c`
-
-#### 命令前缀路由
-
-```
-cmd[0] == 'R' → RBTREE 引擎
-cmd[0] == 'H' → Hash 引擎
-cmd[0] == 'X' → Skiptable 引擎
-其他         → Array 引擎
-```
-
-`handle_parsed_command()` 根据前缀路由，`strip_prefix()` 去掉前缀后执行统一的操作名（如 `HSET` → HASH 引擎执行 `SET`）。
-
-**统一命令分发**：命令前缀确定引擎 → 函数指针路由 → 写命令统一走 `persist_append_raw` + `repl_broadcast`。详见 `src/main/kvstore.c` 的 `handle_parsed_command()`。
-
-> 实现细节（RESP 解析、持久化、主从复制、TTL 过期、内存管理等）见 [`docs/tech-roadmap.md`](kvstore/docs/tech-roadmap.md)。
 
 ## 测试体系
 
