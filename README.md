@@ -1,4 +1,4 @@
-# kvstore — 高性能键值存储系统
+# PocketKV — 高性能键值存储系统
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![C](https://img.shields.io/badge/language-C-blue.svg)](https://en.wikipedia.org/wiki/C_(programming_language))
@@ -7,9 +7,9 @@
 [![eBPF](https://img.shields.io/badge/eBPF-supported-blueviolet)]()
 [![kprobe+RDMA](https://img.shields.io/badge/kprobe--RDMA-supported-success)]()
 
-kvstore 是一个用 **C 语言** 实现的类 Redis 键值存储系统，面向学习和研究。
+PocketKV 是一个用 **C 语言** 实现的类 Redis 键值存储系统，面向学习和研究。
 
-**多存储引擎 · 多网络模型 · 多内存后端 · 持久化 · 主从复制 · 文档型 Value · TTL · RDMA · eBPF**
+**多存储引擎 · 多网络模型 · 多内存后端 · 持久化 · 主从复制 · TTL · RDMA · eBPF**
 
 </div>
 
@@ -117,15 +117,21 @@ pocket-kv/
 ├── kvstore/                      # 引擎（代码主体）
 │   ├── src/                      # 核心 C 源码
 │   │   ├── main/kvstore.c        #   入口、RESP 协议、命令分发
-│   │   ├── core/                 #   网络模型 (reactor / proactor / ntyco)
+│   │   ├── core/                 #   网络模型 (reactor.c / proactor.c / ntyco.c)
 │   │   ├── storage/              #   存储引擎 (array / hash / rbtree / skiptable / doc / vector)
 │   │   ├── memory/kvs_mem.c      #   内存后端 (libc / jemalloc / custom)
 │   │   ├── expire/kvs_expire.c   #   TTL 过期管理
 │   │   ├── persistence/kvs_persist.c  # 持久化 (dump + AOF)
-│   │   ├── replication/          #   主从复制、RDMA、eBPF、哨兵（含 bpf/ 子目录）
+│   │   ├── replication/          #   复制子系统
+│   │   │   ├── kvs_repl.c        #     增量复制（传输抽象：TCP/RDMA/eBPF）
+│   │   │   ├── kvs_fullsync.c    #     全量同步
+│   │   │   ├── kvs_repl_ebpf.c   #     eBPF+tcp 增量链路
+│   │   │   ├── kvs_repl_kprobe.c #     kprobe+RDMA 路径（legacy）
+│   │   │   ├── kvs_sentinel.c    #     哨兵（故障切换）
+│   │   │   └── bpf/              #     BPF 程序源码 (*.bpf.c)
 │   │   ├── ebpf_proxy/           #   独立 ebpf-proxy 进程（增量转发，fexit 捕获）
 │   │   └── utils/hash.c          #   哈希工具
-│   ├── include/kvstore/          # 公共头文件
+│   ├── include/kvstore/          # 公共头文件 (core / storage / replication / ...)
 │   ├── NtyCo/                    # 协程库 (git submodule)
 │   ├── third_party/libbpf/       # 预编译 libbpf（ebpf-proxy 链接用）
 │   ├── tools/                    # 测试 & 辅助脚本
@@ -133,19 +139,21 @@ pocket-kv/
 │   │   ├── persist/              #   持久化验证脚本
 │   │   ├── repl/                 #   复制验证脚本 (TCP/RDMA/eBPF)
 │   │   ├── rdma/                 #   RDMA 探测脚本
-│   │   ├── ebpf/                 #   eBPF 独立守护进程
+│   │   ├── ebpf/                 #   eBPF 独立守护进程 (repl_ebpf_daemon.c)
 │   │   └── tests/                #   通用测试辅助脚本
 │   ├── tests/                    # 测试代码
 │   │   ├── integration/          #   集成测试 shell 脚本
 │   │   ├── perf/                 #   性能测试 C 程序（独立 Makefile.perf）
 │   │   ├── unit/                 #   单元测试目录（预留，仅 .gitkeep）
-│   │   └── test_*.c              #   C 测试程序
+│   │   ├── test.conf             #   测试用配置
+│   │   └── test_*.c              #   C 测试程序（含 test_vsearch.c 向量检索）
 │   ├── testdata/                 # 静态测试数据（样例配置）
-│   ├── benchmarks/               # 基准结果与图表（本地留存，不入库）
-│   ├── assets/diagrams/          # 架构图 / 流程图
+│   ├── assets/diagrams/          # 架构图 / 流程图 (Excalidraw)
 │   ├── clients/                  # 多语言客户端示例 (Go/Java/JS/Python/Rust)
 │   ├── docs/                     # 文档中心
 │   │   ├── tech-roadmap.md       #   技术路线与实现详解 ← 新手必读
+│   │   ├── kvstore-data-flow.md  #   数据流全景
+│   │   ├── tests-guide.md        #   完整测试教程
 │   │   ├── data_analysis/        #   基准数据分析
 │   │   ├── optimization-history/ #   优化历程
 │   │   ├── use/                  #   实现详解与 QA
@@ -156,10 +164,12 @@ pocket-kv/
 │   └── Makefile                  # 构建入口
 ├── README.md
 ├── LICENSE
+├── .gitignore
+├── .gitmodules                   # NtyCo submodule 声明
 └── Makefile                      # 委派到 kvstore/
 ```
 
-> `artifacts/` 为测试运行时产物目录，由脚本按需创建，已在 `.gitignore` 中；`kvstore/benchmarks/` 同样只保留在本地，不随仓库分发。
+> `artifacts/`（测试运行时产物）与 `kvstore/benchmarks/`（基准结果与图表）均由脚本按需创建，已在 `.gitignore` 中，只保留在本地、不随仓库分发。
 
 ---
 
