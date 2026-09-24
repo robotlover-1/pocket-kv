@@ -3223,7 +3223,19 @@ void repl_slave_finish_fullsync(void) {
                 fprintf(stderr, "repl: slave fullsync rename to %s failed: %s\n",
                         g_cfg.dump_path, strerror(errno));
             } else {
-                fprintf(stderr, "repl: slave fullsync dump saved to %s\n", g_cfg.dump_path);
+                /* 快照成为新的持久化基线：
+                 *  ① 头部的 aof_offset 是 master 生成时写入的 **master 复制 offset**，
+                 *     从机恢复却拿它当"自己 AOF 跳过的字节数"，量纲完全不同 ——
+                 *     不改写会在重启时跳过几乎全部本地 AOF（实测 5w 条只剩 ~1300 条）。
+                 *  ② 截断本地 AOF：快照之前的命令已被取代，留着会在恢复时重放到快照之上。
+                 * 两者必须成对做：头部写 0，AOF 也确实是 0 基线。 */
+                if (kvs_dump_set_aof_offset(g_cfg.dump_path, 0) != 0)
+                    fprintf(stderr, "repl: slave fullsync patch dump aof_offset failed: %s\n",
+                            strerror(errno));
+                if (persist_aof_rebase() != 0)
+                    fprintf(stderr, "repl: slave fullsync aof rebase failed\n");
+                fprintf(stderr, "repl: slave fullsync dump saved to %s "
+                                "(aof rebased to 0)\n", g_cfg.dump_path);
             }
         } else {
             fprintf(stderr, "repl: slave fullsync finished but no temp file\n");

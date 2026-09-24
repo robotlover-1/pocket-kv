@@ -226,19 +226,44 @@ static int persist_uring_init_once(void) {
             | IORING_SETUP_SQPOLL;
     p.sq_thread_idle = 2000;
 
-    if (io_uring_queue_init_params(1024, &g_persist_uring, &p) != 0) {
+    int rc = io_uring_queue_init_params(1024, &g_persist_uring, &p);
+    if (rc != 0) {
+        fprintf(stderr, "persist: io_uring init(SQPOLL) failed rc=%d(%s), retrying without SQPOLL\n",
+                rc, strerror(-rc));
         memset(&p, 0, sizeof(p));
         p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN;
-        if (io_uring_queue_init_params(1024, &g_persist_uring, &p) != 0)
-            return -1;
+        rc = io_uring_queue_init_params(1024, &g_persist_uring, &p);
+    }
+    if (rc != 0) {
+        /* 第三次回退：不带任何 flags 的裸 io_uring。
+         * SINGLE_ISSUER / COOP_TASKRUN 都是 kernel 6.0+ 才有的 flag，5.15 这类老内核会
+         * 直接拒绝（实测 EPERM），于是前两次都失败 → g_persist_fatal_error=1 →
+         * 此后所有 append 返回 ERR，进程看起来一切正常但 AOF 永远 0 字节、
+         * durable_offset 冻结，复制从机还会据此上报一个自己恢复不了的 offset。
+         * 丢掉的只是性能优化（少一次自旋锁/少一次 IPI），语义不受影响：
+         * ring 仍只由 AOF 线程提交，单 issuer 纪律照旧。 */
+        fprintf(stderr, "persist: io_uring init(SINGLE_ISSUER|COOP_TASKRUN) failed rc=%d(%s), "
+                        "retrying with plain flags\n", rc, strerror(-rc));
+        memset(&p, 0, sizeof(p));
+        rc = io_uring_queue_init_params(1024, &g_persist_uring, &p);
+    }
+    if (rc != 0) {
+        /* 静默返回会让上层只看到 "applied 在涨、durable 不动"，排查成本极高
+         * （复制从机的 AOF 全空就是这么暴露出来的），因此必须打出来。 */
+        fprintf(stderr, "persist: io_uring init failed rc=%d(%s) — AOF 将无法落盘，"
+                        "此后所有 append 返回 KVS_PERSIST_ERR\n", rc, strerror(-rc));
+        return -1;
     }
 
     g_persist_eventfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (g_persist_eventfd < 0) {
+        fprintf(stderr, "persist: eventfd failed errno=%d(%s)\n", errno, strerror(errno));
         io_uring_queue_exit(&g_persist_uring);
         return -1;
     }
     if (io_uring_register_eventfd(&g_persist_uring, g_persist_eventfd) != 0) {
+        fprintf(stderr, "persist: io_uring_register_eventfd failed errno=%d(%s)\n",
+                errno, strerror(errno));
         close(g_persist_eventfd);
         g_persist_eventfd = -1;
         io_uring_queue_exit(&g_persist_uring);
@@ -869,6 +894,38 @@ void persist_close(void) {
     g_aof_buf = NULL;
     g_aof_buf_len = 0;
     g_aof_buf_cap = 0;
+}
+
+/* AOF 运行时内部状态（供 INFO 诊断）。复制从机出现 "applied 在涨但 durable 不动" 时，
+ * 第一个要看的就是这里：aof_fatal=1 说明 AOF 线程的 io_uring 提交/CQE 出过错，
+ * 此后 persist_append_prepare() 一律返回 KVS_PERSIST_ERR，复制数据只进内存不落 AOF。 */
+void persist_aof_debug_state(kvs_aof_debug_t *out) {
+    if (!out) return;
+    out->aof_fd = g_aof_fd;
+    out->aof_disabled = g_aof_disabled;
+    out->aof_fatal = g_persist_fatal_error;
+    out->aof_thread_created = g_aof_thread_created;
+    out->aof_write_submitted = g_aof_write_submitted;
+    out->aof_write_offset = g_aof_write_offset;
+    out->aof_outstanding = (int)atomic_load_explicit(&g_outstanding, memory_order_relaxed);
+}
+
+/* 全量同步完成后把 AOF 重定基线：drain 在途写 → 截断为 0 → 计数归零。
+ * 语义：快照就是新的持久化基线，快照之前的 AOF 内容已被取代；留着不仅浪费空间，
+ * 还会在恢复时把旧命令重放到快照之上（复活已删 key、非幂等命令双倍执行）。
+ * 调用方（从机 fullsync 收尾）必须同步把 dump 头部的 aof_offset 也改成 0。 */
+int persist_aof_rebase(void) {
+    if (g_aof_disabled || g_aof_fd < 0) return -1;
+    persist_drain_pending();                       /* 等在途批次落盘，之后才可安全截断 */
+    if (ftruncate(g_aof_fd, 0) != 0) {
+        fprintf(stderr, "persist: aof rebase ftruncate failed errno=%d(%s)\n",
+                errno, strerror(errno));
+        return -1;
+    }
+    g_aof_write_offset = 0;
+    g_aof_write_submitted = 0;
+    g_cur_slot = NULL;
+    return 0;
 }
 
 int persist_set_aof_policy(kvs_aof_fsync_policy_t policy) {

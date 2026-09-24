@@ -214,6 +214,21 @@ sudo  ./kvstore kvstore.conf --role slave
 | `ebpf_proxy_cache_dropped`      | 0                 | 被作废丢弃的节点数；**增长说明发生了重新同步**              |
 | `ebpf_proxy_cache_invalid`      | 0                 | 1 表示本 session 的 cache 已作废（硬上限触发）              |
 
+**从机持久化自检**（`applied_offset` 在涨但 `durable_offset` 不动 = 复制数据没落 AOF）：
+
+| INFO 字段            | 预期     | 含义                                                     |
+| -------------------- | -------- | -------------------------------------------------------- |
+| `aof_fd`             | >= 0     | AOF 是否打开                                             |
+| `aof_fatal`          | **0**    | 1 = AOF 线程 io_uring 出过错，此后所有 append 返回 ERR     |
+| `aof_thread`         | 1        | AOF 线程是否创建成功                                      |
+| `aof_submitted`      | 随写入增长 | 已交给 AOF 的字节数                                      |
+| `aof_written`        | 追上 submitted | 已落盘字节数；`durable_offset` 应随之推进              |
+
+> **已知坑（已修）**：`IORING_SETUP_SINGLE_ISSUER` / `COOP_TASKRUN` 是 kernel 6.0+ 才有的 flag。
+> 老内核（如 5.15）会拒绝，若 io_uring 初始化只试这两种组合就会失败 →
+> `aof_fatal=1` → AOF 永远 0 字节且**没有任何报错**。现已回退到裸 flags，并把失败打出来。
+> 排查从机"数据不同步"时，先看 `aof_fatal`。
+
 **两种典型自检：**
 
 ```bash

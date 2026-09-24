@@ -7,6 +7,7 @@
 #include <ctype.h>
 #include <strings.h>
 #include <spawn.h>
+#include <dirent.h>
 
 extern char **environ;
 
@@ -1804,10 +1805,12 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
     if (!strcmp(cmd, "INFO")) {
         char info[12288];
         char recover[1024] = {0};
+        kvs_aof_debug_t aof_dbg;
         kvs_repl_ebpf_stats_t ebpf_stats;
         kvs_ebpf_proxy_stats_t proxy_stats;
         kvs_repl_kprobe_stats_t kprobe_stats;
         int recover_n = persist_build_recover_text(recover, sizeof(recover));
+        persist_aof_debug_state(&aof_dbg);
         repl_ebpf_get_stats(&ebpf_stats);
         repl_ebpf_proxy_get_stats(&proxy_stats);
         repl_kprobe_rdma_get_stats(&kprobe_stats);
@@ -1828,6 +1831,11 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             "bgsave_pid:%ld\n"
             "aof_fsync:%s\n"
             "aof_max_batch_age_us:%lld\n"
+            "aof_fd:%d\n"
+            "aof_fatal:%d\n"
+            "aof_thread:%d\n"
+            "aof_submitted:%lld\n"
+            "aof_written:%lld\n"
             "aof_rewrite:%s\n"
             "aof_rewrite_pid:%ld\n"
             "master_host:%s\n"
@@ -1916,6 +1924,11 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             (long)g_bgsave_pid,
             persist_aof_policy_name(),
             persist_aof_max_batch_age_us(),
+            aof_dbg.aof_fd,
+            aof_dbg.aof_fatal,
+            aof_dbg.aof_thread_created,
+            aof_dbg.aof_write_submitted,
+            aof_dbg.aof_write_offset,
             persist_bgrewriteaof_state_name(),
             (long)(persist_bgrewriteaof_in_progress() ? 1 : -1),
             g_cfg.master_host[0] ? g_cfg.master_host : "",
@@ -3102,6 +3115,21 @@ static int dump_skiptable_write_kv(const char *key, const char *value, void *arg
     return 0;
 }
 
+/* 改写 KVSD dump 头部的 aof_offset 字段（前 8 字节）。
+ * 从机全量同步时拿到的 dump 是 master 生成的，头部那个值语义是 **master 的复制 offset**，
+ * 而从机恢复时把它当成"自己 AOF 要跳过的字节数"（见 persist_recover）。两者根本不是同一个
+ * 量：从机 AOF 只有 snap_base 之后的增量，按 master offset 跳会跳过绝大部分内容。
+ * 实测从机重启后 5w 条增量只剩最后 ~1300 条。因此从机在把收到的快照 rename 成正式 dump
+ * 时，必须把它改写为自己 AOF 的真实基线（配合 AOF 截断，即 0）。 */
+int kvs_dump_set_aof_offset(const char *path, unsigned long long off) {
+    if (!path) return -1;
+    int fd = open(path, O_RDWR);
+    if (fd < 0) return -1;
+    ssize_t w = pwrite(fd, &off, sizeof(off), 0);
+    close(fd);
+    return (w == (ssize_t)sizeof(off)) ? 0 : -1;
+}
+
 int kvs_dump_to_fd(int fd, unsigned long long aof_offset) {
     if (fd < 0) return -1;
 
@@ -3204,13 +3232,61 @@ int kvs_dump_to_fd(int fd, unsigned long long aof_offset) {
 /* master 启动时 spawn 独立的 ebpf-proxy 进程（仍单独进程，但无需手动启动）。
  * 若 proxy_cfg map 已 pin（proxy 已由外部手动启动），不重复 spawn。
  * ebpf-proxy 需 root 加载 BPF，由 master（sudo 启动）fork 出的子进程继承 root 权限。 */
+/* 陈旧 pin 会让"已有 proxy 在跑"的判断失真：proxy 被 kill -9 后 pin 仍留在 bpffs 里，
+ * 后续每次启动 master 都会据此跳过 spawn → 没有任何进程在捕获，但 client_ctl 仍被
+ * 写得好好的（ebpf_capture_enabled 甚至读到 1），复制静默失效。实测踩到过。
+ * 因此判断"proxy 是否在跑"必须看**活性**与**绑定关系**，而不是 pin 是否存在：
+ *   ① client_ctl[5]（proxy 心跳，100ms 一跳）在观察窗口内必须推进；
+ *   ② client_ctl[1]（BPF 过滤用的 master pid）必须等于本进程 ——
+ *      否则那是上一任 master 留下的 proxy，capture 抓的是已经不存在的 pid。
+ * 两者任一不满足即视为陈旧：清掉旧 pin 后重新 spawn。 */
+static int ebpf_proxy_stale_pin(void) {
+    __u64 hb1 = repl_ebpf_client_ctl_get(KVS_CTL_PROXY_HEARTBEAT);
+    __u64 pid_seen = repl_ebpf_client_ctl_get(KVS_CTL_MASTER_PID);
+    usleep(400000);
+    __u64 hb2 = repl_ebpf_client_ctl_get(KVS_CTL_PROXY_HEARTBEAT);
+    if (hb2 == hb1) {
+        fprintf(stderr, "master: ebpf-proxy pin exists but heartbeat frozen "
+                        "(%llu) — stale pin\n", (unsigned long long)hb1);
+        return 1;
+    }
+    if (pid_seen != (__u64)getpid()) {
+        fprintf(stderr, "master: ebpf-proxy pin bound to old master pid=%llu "
+                        "(we are %d) — stale pin\n",
+                (unsigned long long)pid_seen, (int)getpid());
+        return 1;
+    }
+    return 0;
+}
+
+/* 清掉 pin 目录下的所有 pinned map，让新的 ebpf-proxy 可以重新 pin。 */
+static void ebpf_pin_dir_clear(void) {
+    DIR *d = opendir(g_cfg.ebpf_pin_path);
+    if (d) {
+        struct dirent *e;
+        char path[1024];
+        while ((e = readdir(d)) != NULL) {
+            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+            snprintf(path, sizeof(path), "%s/%s", g_cfg.ebpf_pin_path, e->d_name);
+            if (unlink(path) != 0)
+                fprintf(stderr, "master: unlink stale pin %s failed: %s\n",
+                        path, strerror(errno));
+        }
+        closedir(d);
+    }
+}
+
 static int spawn_ebpf_proxy(void) {
     if (!g_cfg.ebpf_proxy_bin[0] || !g_cfg.ebpf_client_capture_obj[0]) return 0;
 
     char cfg_path[512];
     snprintf(cfg_path, sizeof(cfg_path), "%s/proxy_cfg", g_cfg.ebpf_pin_path);
     int fd = bpf_obj_get(cfg_path);
-    if (fd >= 0) { close(fd); return 0; }   /* ebpf-proxy 已在跑 */
+    if (fd >= 0) {
+        close(fd);
+        if (!ebpf_proxy_stale_pin()) return 0;   /* ebpf-proxy 确实在跑且绑的是本进程 */
+        ebpf_pin_dir_clear();                    /* 陈旧 pin：清掉，走下面的重新 spawn */
+    }
 
     pid_t pid;
     char *argv[] = {

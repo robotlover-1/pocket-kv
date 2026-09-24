@@ -596,6 +596,20 @@ int persist_init(void);
 void persist_close(void);
 
 /* async append return codes */
+/* AOF 运行时状态快照（INFO 诊断用，见 persist_aof_debug_state） */
+typedef struct {
+    int aof_fd;                 /* AOF fd，-1 表示未打开 */
+    int aof_disabled;
+    int aof_fatal;              /* 1 = AOF 线程出过错，此后所有 append 返回 ERR */
+    int aof_thread_created;
+    long long aof_write_submitted;   /* 已交给 AOF 的字节数 */
+    long long aof_write_offset;      /* 已落盘的字节数 */
+    int aof_outstanding;             /* 在途批次 */
+} kvs_aof_debug_t;
+void persist_aof_debug_state(kvs_aof_debug_t *out);
+/* 全量同步后重定 AOF 基线（截断为 0 + 计数归零），配合 kvs_dump_set_aof_offset(0) */
+int persist_aof_rebase(void);
+
 #define KVS_PERSIST_OK      0
 #define KVS_PERSIST_PENDING 1
 #define KVS_PERSIST_ERR     -1
@@ -617,6 +631,8 @@ int persist_recover_in_progress(void);
 int kvs_snapshot_to_fp(FILE *fp);
 int kvs_snapshot_to_fd(int fd);
 int kvs_dump_to_fd(int fd, unsigned long long aof_offset);
+/* 改写 dump 头部的 aof_offset（从机采用 master 快照后必须重写为自己的 AOF 基线） */
+int kvs_dump_set_aof_offset(const char *path, unsigned long long off);
 unsigned long long replay_dump_file(const char *path);
 int kvs_load_dump_from_fd(int fd);
 int persist_bgsave_start(void);

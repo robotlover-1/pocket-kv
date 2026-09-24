@@ -254,6 +254,17 @@ parse_resp_stream(c, buf, &len, from_replication)
          (aof_offset = X)       └─ 跳过这部分，因为 dump 已包含
 ```
 
+> ⚠️ **aof_offset 只在"本机自己产生的 dump"上成立**。它必须是**本机 AOF 文件的字节偏移**。
+>
+> 从机通过 FULLRESYNC 拿到的 dump 是 master 生成的，头部那个值是 **master 的复制 offset**，
+> 与从机 AOF 的字节偏移完全不是一个量纲。若照搬当跳过量，从机会跳过自己绝大部分 AOF ——
+> 实测 5w 条增量重启后只剩最后 ~1300 条（且无声无息，只在数据对不上时才暴露）。
+>
+> 因此从机在 `repl_slave_finish_fullsync()` 里把快照 rename 成正式 dump 时成对做两件事：
+> 1. `kvs_dump_set_aof_offset(dump_path, 0)` —— 把头部改写成从机自己的 AOF 基线；
+> 2. `persist_aof_rebase()` —— 截断从机 AOF 并归零计数（快照之前的命令已被取代，
+>    留着会在恢复时重放到快照之上，复活已删 key / 非幂等命令双倍执行）。
+
 ### 3.3 SNAPSHOT 格式（全量同步、BGREWRITEAOF 使用，RESP 文本）
 
 SNAPSHOT 是**另一种格式**，生成 RESP 命令序列，消费者（slave 或 AOF 重写目标文件）可以直接用 `parse_resp_stream` 解析。
