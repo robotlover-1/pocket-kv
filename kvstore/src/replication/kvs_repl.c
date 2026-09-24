@@ -450,6 +450,14 @@ static char g_repl_transport_active[32] = "tcp";
 static char g_repl_transport_fallback_reason[64] = "";
 static long long g_repl_transport_fallback_until_ms = 0;
 static repl_backlog_t g_repl_backlog = {0};
+/* backlog 历史连续性（§2.2/§10）：无 Slave 期间 master_repl_offset 仍在推进而
+ * repl_backlog_feed 直接 return，backlog 与 master 之间出现空洞。此标志一旦为 0，
+ * partial resync 一律拒绝，强制 FULLRESYNC。由 repl_backlog_reset()（新 session 建立
+ * 全量边界时）恢复为 1。 */
+static int g_repl_backlog_contiguous = 1;
+/* replication session 身份（§7/§9）：首个 Slave 建立复制会话时生成，最后一个
+ * Slave 离开时清零。proxy_cache 只允许在本 session 内使用。 */
+static unsigned long long g_repl_session_id = 0;
 static char g_slave_master_replid[41] = "?";
 static unsigned long long g_slave_repl_offset = 0;
 static unsigned long long g_slave_repl_applied_offset = 0;
@@ -2349,11 +2357,33 @@ static int ensure_repl_backlog(void) {
     return 0;
 }
 
+/* 以 base 重建 backlog 边界（FULLRESYNC 建立新复制历史时调，§5/§6/§10）。
+ * 丢弃旧历史：快照已经覆盖 base 之前的全部状态，旧字节再留着只会让 partial resync
+ * 误判（或与 proxy_cache 双重回放）。此后 [base, master_offset) 由 feed 逐字节累积，
+ * 与 master_repl_offset 同步推进，历史重新连续。 */
+void repl_backlog_reset(unsigned long long base) {
+    pthread_mutex_lock(&g_backlog_lock);
+    if (g_repl_backlog.buf) {
+        g_repl_backlog.head = 0;
+        g_repl_backlog.histlen = 0;
+    }
+    g_repl_backlog.start_offset = base;
+    g_repl_backlog.end_offset = base;
+    g_repl_backlog_contiguous = 1;
+    pthread_mutex_unlock(&g_backlog_lock);
+}
+
 int repl_backlog_feed(const unsigned char *buf, size_t len) {
     pthread_mutex_lock(&g_backlog_lock);
     if (!buf || len == 0) { pthread_mutex_unlock(&g_backlog_lock); return 0; }
-    /* 无 slave 连接时不分配 backlog，节省 10 MB */
-    if (!g_replicas) { pthread_mutex_unlock(&g_backlog_lock); return 0; }
+    /* 无 slave 连接时不分配 backlog，节省 10 MB。
+     * 但 master_repl_offset 仍在推进（repl_note_broadcast 无条件计数），这段写
+     * 永远进不了 backlog —— 记为历史不连续，禁止后续 partial resync（§2.2/§10）。 */
+    if (!g_replicas) {
+        g_repl_backlog_contiguous = 0;
+        pthread_mutex_unlock(&g_backlog_lock);
+        return 0;
+    }
     if (ensure_repl_backlog() != 0) { pthread_mutex_unlock(&g_backlog_lock); return -1; }
     if (len >= g_repl_backlog.cap) {
         buf += len - g_repl_backlog.cap;
@@ -2475,6 +2505,42 @@ const char *repl_master_id(void) {
 
 unsigned long long repl_master_offset(void) {
     return g_master_repl_offset;
+}
+
+/* ---- replication session 生命周期（§7/§9） ----
+ * session 的生命周期 = 从"第一个 Slave 建立复制连接"到"最后一个 Slave 断开"。
+ * proxy_cache 只在 session 内有效；session 结束后旧 cache 一律作废，绝不能与
+ * 下一次 REPLSYNC 的 backlog 回放叠加（否则同一段写被应用两次）。 */
+
+/* 首个 Slave 加入：开新 session，返回新 session_id（非 0）。 */
+unsigned long long repl_session_begin(void) {
+    static unsigned long long seq = 0;
+    unsigned long long sid;
+    do {
+        seq++;
+        sid = ((unsigned long long)kvs_now_ms() << 16)
+              ^ ((unsigned long long)getpid() << 8)
+              ^ seq;
+    } while (sid == 0);
+    g_repl_session_id = sid;
+    return sid;
+}
+
+/* 最后一个 Slave 离开：作废 session（proxy 收到 SESSION_VALID=0 后丢弃其 cache）。 */
+void repl_session_end(void) {
+    g_repl_session_id = 0;
+}
+
+unsigned long long repl_session_id(void) {
+    return g_repl_session_id;
+}
+
+int repl_session_valid(void) {
+    return g_repl_session_id != 0;
+}
+
+int repl_backlog_contiguous(void) {
+    return g_repl_backlog_contiguous;
 }
 
 unsigned long long repl_connected_slaves(void) {
@@ -3335,11 +3401,19 @@ int repl_slave_state_save(void) {
     return 0;
 }
 
+/* partial resync 判定（§10）：除 offset 落在 backlog 区间外，还必须保证 backlog 历史
+ * 相对 master_repl_offset 是连续的——否则 backlog 区间内的"可续"是假象：
+ *   Slave 最后 offset=1000，backlog=[500,1200]；Slave 全断，Master 又写到 1500
+ *   （feed 因无 Slave 跳过 → backlog_end 停在 1200）。此时 1000 仍落在 [500,1200]，
+ *   但 1200~1500 已成缺口，必须 FULLRESYNC。 */
 int repl_backlog_can_continue(const char *replid, unsigned long long offset) {
     unsigned long long want_offset;
     ensure_master_replid();
     if (!replid || strcmp(replid, g_master_replid) != 0) return 0;
     if (!g_repl_backlog.buf) return 0;
+    if (!g_repl_backlog_contiguous) return 0;
+    /* backlog 必须覆盖到 master 当前 offset；落后即存在复制历史缺口 */
+    if (g_repl_backlog.end_offset < g_master_repl_offset) return 0;
     want_offset = offset;
     if (want_offset > g_repl_backlog.end_offset) return 0;
     return want_offset >= g_repl_backlog.start_offset;

@@ -1,6 +1,7 @@
 
 #include "kvstore/kvstore.h"
 #include "kvstore/replication/repl_kprobe.h"
+#include "kvstore/replication/client_ctl.h"
 #include <bpf/bpf.h>
 #include <signal.h>
 #include <ctype.h>
@@ -20,6 +21,9 @@ extern void repl_fwd_purge_conn(conn_t *c);
 extern unsigned long long repl_fwd_get_watermark(conn_t *c);
 extern int repl_fwd_is_stalled(conn_t *c);
 extern int repl_backlog_copy_range(unsigned long long offset, unsigned char **out_buf, size_t *out_len);
+
+/* 定义在本文件后部：repl_add_slave/repl_remove_slave 需要在此通知 proxy session 边界 */
+static void repl_notify_ebpf_proxy_session(int valid, unsigned long long sid);
 
 #define KVS_DEFAULT_CONFIG_PATH "kvstore.conf"
 
@@ -498,7 +502,9 @@ static int parse_config_file(const char *path) {
 
 void repl_add_slave(conn_t *c) {
     if (!c) return;  /* safety: slave 端 parse_resp_stream(NULL, ...) 可能误触发 */
+    int first = 0;
     pthread_mutex_lock(&g_repl_lock);
+    first = (g_replicas == NULL);
     for (conn_t *it = g_replicas; it; it = it->next_replica) {
         if (it == c) {
             c->is_replica = 1;
@@ -518,13 +524,25 @@ void repl_add_slave(conn_t *c) {
     c->next_replica = g_replicas;
     g_replicas = c;
     pthread_mutex_unlock(&g_repl_lock);
+
+    /* NO_REPLICA → 有 Slave：开新 replication session，同时打开 eBPF 捕获。
+     * 捕获必须早于快照生成，快照之后的增量才可能被 proxy_cache 接住（§4.1/§5）。 */
+    if (first) {
+        unsigned long long sid = repl_session_begin();
+        repl_notify_ebpf_proxy_session(1, sid);
+        fprintf(stderr, "master: replication session begin id=%llu "
+                        "(capture enabled, slave=%d)\n",
+                sid, c->fd);
+    }
 }
 
 void repl_remove_slave(conn_t *c) {
+    int last = 0;
     pthread_mutex_lock(&g_repl_lock);
     conn_t **pp = &g_replicas;
+    int found = 0;
     while (*pp) {
-        if (*pp == c) { *pp = c->next_replica; break; }
+        if (*pp == c) { *pp = c->next_replica; found = 1; break; }
         pp = &(*pp)->next_replica;
     }
     c->next_replica = NULL;
@@ -533,7 +551,20 @@ void repl_remove_slave(conn_t *c) {
     c->repl_fullsync_pending = 0;
     c->fwd_healthy = 0;
     c->fwd_last_active = 0;
+    /* 只有确实从链表里摘掉了最后一个副本才算 session 结束（RDMA 侧会对不在链表里的
+     * 哨兵 conn 调本函数，误判会凭空作废一个正在服务的 session）。 */
+    last = (found && g_replicas == NULL);
     pthread_mutex_unlock(&g_repl_lock);
+
+    /* 最后一个 Slave 离开：session 失效 → 关捕获、作废旧 proxy_cache（§4.1/§8.2/§9）。
+     * 此后 Master 的写仍会推进 master_repl_offset 但不再进 backlog（feed 因无 Slave
+     * 跳过），repl_backlog_feed 会把历史标记为不连续，下次 REPLSYNC 只能 FULLRESYNC。 */
+    if (last) {
+        fprintf(stderr, "master: replication session end "
+                        "(capture disabled, proxy cache invalidated)\n");
+        repl_session_end();
+        repl_notify_ebpf_proxy_session(0, 0);
+    }
 }
 
 void repl_broadcast(const unsigned char *raw, size_t rawlen) {
@@ -554,8 +585,12 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
             pp = &c->next_replica;
             continue;
         }
+        /* 全量期间只记 backlog（由调用方统一喂入，见下），不实时下送。
+         * IMPORTANT：此处不能再 repl_backlog_feed —— 写命令成功后的统一喂入点
+         * （execute_command 中 repl_backlog_feed + repl_note_broadcast）已经喂过一次，
+         * 全量期间每条 raw 会被喂两遍：backlog_end_offset 跑在 master_repl_offset 前面，
+         * 与 offset 推进语义脱钩（§11）。 */
         if (g_repl_fullsync_in_progress) {
-            repl_backlog_feed(raw, rawlen);
             pp = &c->next_replica;
             continue;
         }
@@ -623,10 +658,10 @@ int repl_send_chunked_ctx(conn_t *c, const unsigned char *buf, size_t len, int s
     return 0;
 }
 
-/* 通知 ebpf-proxy 全量同步状态变化（通过 pinned client_ctl map key=3）。
- * client_ctl map 属于 repl_client_capture.bpf.c，由 ebpf-proxy 进程 pin 到 bpffs。
- * master 进程通过 bpf_obj_get() 打开并写入，ebpf-proxy 在主循环中轮询检测。 */
-static void repl_notify_ebpf_proxy_fullsync(int in_progress) {
+/* 写 pinned client_ctl map 的单个键。client_ctl 属于 repl_client_capture.bpf.c，
+ * 由 ebpf-proxy 进程 pin 到 bpffs；master 通过 bpf_obj_get() 打开并写入，
+ * ebpf-proxy 在主循环中轮询检测。map 不存在（proxy 未启动）时静默跳过。 */
+static void repl_ebpf_client_ctl_set(__u32 key, __u64 val) {
 #if KVS_ENABLE_EBPF
     char path[512];
     int fd;
@@ -637,13 +672,72 @@ static void repl_notify_ebpf_proxy_fullsync(int in_progress) {
         /* ebpf-proxy 可能未启动，静默跳过 */
         return;
     }
-    __u32 key = 3;  /* KVS_EBPF_CLIENT_CTL_FULLSYNC_STATE */
-    __u64 val = in_progress ? 1 : 0;
     bpf_map_update_elem(fd, &key, &val, BPF_ANY);
     close(fd);
 #else
-    (void)in_progress;
+    (void)key; (void)val;
 #endif
+}
+
+static __u64 repl_ebpf_client_ctl_get(__u32 key) {
+#if KVS_ENABLE_EBPF
+    char path[512];
+    int fd;
+    __u64 val = 0;
+    if (!g_cfg.ebpf_pin_path[0]) return 0;
+    snprintf(path, sizeof(path), "%s/client_ctl", g_cfg.ebpf_pin_path);
+    fd = bpf_obj_get(path);
+    if (fd < 0) return 0;
+    if (bpf_map_lookup_elem(fd, &key, &val) != 0) val = 0;
+    close(fd);
+    return val;
+#else
+    (void)key;
+    return 0;
+#endif
+}
+
+/* 通知 ebpf-proxy 全量同步状态变化（client_ctl[3]）。 */
+static void repl_notify_ebpf_proxy_fullsync(int in_progress) {
+    repl_ebpf_client_ctl_set(KVS_CTL_FULLSYNC_STATE, in_progress ? 1 : 0);
+}
+
+/* 通知 ebpf-proxy 复制 session 边界（§4.1/§7/§9）。
+ *   新 session：CAPTURE_ENABLE=1（BPF 开始抓）、SESSION_VALID=1、新 SESSION_ID、
+ *               CACHE_INVALID=0（允许本 session 的 cache 在 REPLDONE 后 flush）。
+ *   session 结束：CAPTURE_ENABLE=0（无 Slave，BPF 零开销）、SESSION_VALID=0、
+ *               SESSION_ID=0、CACHE_INVALID=1（proxy 丢弃旧 cache，禁止跨 session flush）。 */
+static void repl_notify_ebpf_proxy_session(int valid, unsigned long long sid) {
+    if (valid) {
+        /* 先定身份再置有效，最后才开捕获：proxy 按这三次写入的先后顺序观察，
+         * 任何中间态都只是"已缓存但暂不 flush"，不会把数据算到上个 session 账上。 */
+        repl_ebpf_client_ctl_set(KVS_CTL_SESSION_ID, sid);
+        repl_ebpf_client_ctl_set(KVS_CTL_CACHE_INVALID, 0);
+        repl_ebpf_client_ctl_set(KVS_CTL_SESSION_VALID, 1);
+        repl_ebpf_client_ctl_set(KVS_CTL_CAPTURE_ENABLE, 1);
+    } else {
+        /* 先停捕获，再失效 session，最后清身份并置 CACHE_INVALID（proxy 丢弃旧 cache） */
+        repl_ebpf_client_ctl_set(KVS_CTL_CAPTURE_ENABLE, 0);
+        repl_ebpf_client_ctl_set(KVS_CTL_SESSION_VALID, 0);
+        repl_ebpf_client_ctl_set(KVS_CTL_SESSION_ID, 0);
+        repl_ebpf_client_ctl_set(KVS_CTL_CACHE_INVALID, 1);
+    }
+}
+
+/* 等待 ebpf-proxy 确认已切到 BUFFERING（client_ctl[12]=1），最多 wait_ms 毫秒。
+ * 全量边界必须"先停 forwarding 再取快照"：proxy 还在 FORWARDING 时下送的增量
+ * 既在快照里又会被重放（非幂等命令双倍应用）。proxy 未启动/无 eBPF 时立即返回。 */
+static void repl_wait_ebpf_proxy_buffering(int wait_ms) {
+    if (!g_cfg.ebpf_pin_path[0]) return;
+    if (strcasecmp(g_cfg.repl_realtime_transport, "ebpf+tcp") != 0 &&
+        strcasecmp(g_cfg.repl_transport_backend, "ebpf+tcp") != 0) return;
+    long long deadline = kvs_now_ms() + wait_ms;
+    do {
+        if (repl_ebpf_client_ctl_get(KVS_CTL_PROXY_STATE) == 1) return;
+        usleep(2000);
+    } while (kvs_now_ms() < deadline);
+    fprintf(stderr, "master: wait ebpf-proxy BUFFERING timeout (%dms), "
+                    "proceeding with fullsync boundary\n", wait_ms);
 }
 
 static int queue_snapshot(conn_t *c) {
@@ -656,14 +750,26 @@ static int queue_snapshot(conn_t *c) {
     int rdma_ok = 0;
 
     repl_rdma_log("queue_snapshot - begin replid=%s offset=%llu", repl_master_id(), repl_master_offset());
-    /* 记录全量同步启动时的 offset，用于后续回放 gap */
-    unsigned long long snap_base_offset = repl_master_offset();
 
     /* 全量同步期间抑制增量广播，避免 KVSD 数据流被 repl_broadcast 写穿插 */
     g_repl_fullsync_in_progress = 1;
 
-    /* 通知 ebpf-proxy 进入 BUFFERING 状态，增量数据先缓存，等全量完成后再 flush */
+    /* 先让 ebpf-proxy 进入 BUFFERING（§5 步骤 3-5）：proxy 会清掉转发队列里边界前
+     * 尚未下送的增量、并丢弃上一个 session 的 proxy_cache，然后置 PROXY_STATE=1。
+     * 必须等它确认，否则"proxy 还在 forwarding"期间下送的增量会既进快照又被重放。 */
     repl_notify_ebpf_proxy_fullsync(1);
+    repl_wait_ebpf_proxy_buffering(500);
+
+    /* 边界确定后才取 offset：此刻 proxy 已停手，snap_base 之后产生的写才是本次
+     * session 需要经 proxy_cache 补的增量（§4.1/§5）。 */
+    unsigned long long snap_base_offset = repl_master_offset();
+
+    /* backlog 以 snap_base_offset 为基点重建（§6/§10）：快照已经覆盖 base 之前的
+     * 全部状态，旧历史留着只会让 partial resync 误判或与 proxy_cache 双重回放。 */
+    repl_backlog_reset(snap_base_offset);
+    fprintf(stderr, "master: fullsync boundary snap_base_offset=%llu "
+                    "backlog reset (session=%llu)\n",
+            snap_base_offset, repl_session_id());
 
     /* 尝试启动 RDMA */
     if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma")) {
@@ -1418,6 +1524,18 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         unsigned long long applied_offset = argc >= 2 ? (unsigned long long)strtoull(argv[1], NULL, 10) : 0;
         unsigned long long durable_offset = argc >= 3 ? (unsigned long long)strtoull(argv[2], NULL, 10) : applied_offset;
         repl_replica_update_ack(c, applied_offset, durable_offset);
+
+        /* proxy_cache 溢出（client_ctl[10]=1）：proxy 已经无法保证同一 session 内无损，
+         * 此时绝不能让它继续 flush（会形成永久缺数据的错误副本）。断开 replica 链路，
+         * 让 Slave 重新 REPLSYNC —— backlog 已不连续/偏移对不上，会走 FULLRESYNC（§12）。 */
+        if (c && c->repl_transport_kind == KVS_REPL_TRANSPORT_EBPF_TCP
+            && repl_ebpf_client_ctl_get(KVS_CTL_CACHE_INVALID) == 1) {
+            fprintf(stderr, "master: ebpf-proxy cache invalid (overflow) — "
+                            "dropping replica link to force full resync\n");
+            repl_ebpf_client_ctl_set(KVS_CTL_CACHE_INVALID, 0);   /* 重新武装，避免反复触发 */
+            c->repl_draining = 1;
+            return 0;
+        }
         /* 若 slave 落后且 backlog 有数据，推送追赶。经转发线程发送（回放数据深拷贝后入队），
          * 使转发线程成为 c->fd 的唯一写者，避免与转发线程并发写同一 fd（流穿插/破坏）。
          * IMPORTANT 1：追赶起点取 max(applied_offset, watermark)——watermark 是已交给
@@ -1524,9 +1642,11 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         char info[12288];
         char recover[1024] = {0};
         kvs_repl_ebpf_stats_t ebpf_stats;
+        kvs_ebpf_proxy_stats_t proxy_stats;
         kvs_repl_kprobe_stats_t kprobe_stats;
         int recover_n = persist_build_recover_text(recover, sizeof(recover));
         repl_ebpf_get_stats(&ebpf_stats);
+        repl_ebpf_proxy_get_stats(&proxy_stats);
         repl_kprobe_rdma_get_stats(&kprobe_stats);
 
         unsigned long long max_replica_applied = 0;
@@ -1569,6 +1689,17 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             "repl_backlog_histlen:%llu\n"
             "repl_backlog_start_offset:%llu\n"
             "repl_backlog_end_offset:%llu\n"
+            "repl_backlog_contiguous:%d\n"
+            "repl_session_id:%llu\n"
+            "repl_session_valid:%d\n"
+            "ebpf_capture_enabled:%llu\n"
+            "ebpf_capture_off_count:%llu\n"
+            "ebpf_proxy_cache_bytes:%llu\n"
+            "ebpf_proxy_cache_nodes:%llu\n"
+            "ebpf_proxy_cache_dropped:%llu\n"
+            "ebpf_proxy_cache_drop_bytes:%llu\n"
+            "ebpf_proxy_cache_max_bytes:%llu\n"
+            "ebpf_proxy_cache_invalid:%llu\n"
             "slave_master_replid:%s\n"
             "slave_repl_offset:%llu\n"
             "slave_repl_applied_offset:%llu\n"
@@ -1645,6 +1776,17 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             repl_backlog_histlen(),
             repl_backlog_start_offset(),
             repl_backlog_end_offset(),
+            repl_backlog_contiguous(),
+            repl_session_id(),
+            repl_session_valid(),
+            proxy_stats.capture_enabled,
+            proxy_stats.capture_off_count,
+            proxy_stats.cache_bytes,
+            proxy_stats.cache_nodes,
+            proxy_stats.cache_dropped,
+            proxy_stats.cache_drop_bytes,
+            proxy_stats.cache_max_bytes,
+            proxy_stats.cache_invalid,
             repl_slave_master_id(),
             repl_slave_offset(),
             repl_slave_applied_offset(),

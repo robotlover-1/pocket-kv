@@ -23,6 +23,7 @@ enum bpf_link_type;
 
 #include "proxy_cache.h"
 #include "proxy_slave.h"
+#include "kvstore/replication/client_ctl.h"
 
 /* ---- 状态 ---- */
 typedef enum {
@@ -34,6 +35,17 @@ static volatile int g_shutdown = 0;
 static proxy_state_t g_state = STATE_FORWARDING;
 static proxy_slave_ctx_t g_slave;
 static cache_ctx_t g_cache;
+
+/* ---- replication session 身份（§7/§8/§9 ----
+ * 全由 master 通过 pinned client_ctl map 下发：
+ *   client_ctl[8]  SESSION_VALID  当前 session 是否有效
+ *   client_ctl[9]  SESSION_ID     当前 session 身份（cache node 据此打标）
+ *   client_ctl[10] CACHE_INVALID  本 session 的 cache 已作废，禁止 flush
+ * 只有 SESSION_VALID=1 且 cache 未被作废时才允许把 cache 刷给 Slave。控制连接
+ * 断开（master 置 SESSION_VALID=0）后旧 cache 一律丢弃，绝不能跨 session 重放。 */
+static uint64_t g_session_id = 0;
+static int g_session_valid = 0;
+static int g_cache_invalid_remote = 0;   /* client_ctl[10] 的本地影子 */
 
 /* ---- 跨线程安全 ----
  * g_state 用 g_state_lock 保护（主线程 set_state 写、转发线程 proxy_fwd_send_one
@@ -51,18 +63,32 @@ static void set_state(proxy_state_t s) {
     pthread_mutex_unlock(&g_state_lock);
 }
 
-/* 加锁的缓存入队/刷出 */
+/* 加锁的缓存入队/刷出。入队统一打上当前 session 身份，跨 session 的节点刷不出去。 */
 static int cache_enq_wrap(const void *data, size_t len) {
     pthread_mutex_lock(&g_cache_lock);
-    int rc = cache_append(&g_cache, (const unsigned char *)data, len);
+    int rc = cache_append(&g_cache, (const unsigned char *)data, len, g_session_id);
     pthread_mutex_unlock(&g_cache_lock);
     return rc;
 }
 static int cache_flush_wrap(int fd) {
     pthread_mutex_lock(&g_cache_lock);
-    int rc = cache_flush(&g_cache, fd);
+    int rc = cache_flush(&g_cache, fd, g_session_id);
     pthread_mutex_unlock(&g_cache_lock);
     return rc;
+}
+static void cache_clear_wrap(void) {
+    pthread_mutex_lock(&g_cache_lock);
+    cache_clear(&g_cache);
+    pthread_mutex_unlock(&g_cache_lock);
+}
+/* 是否允许把 cache 刷给 Slave（§9）：控制面确认仍是同一个有效 session，
+ * 且本 session 的 cache 未被作废（未触发硬上限、master 未置 CACHE_INVALID）。 */
+static int cache_flush_allowed(void) {
+    int allowed;
+    pthread_mutex_lock(&g_cache_lock);
+    allowed = g_session_valid && !g_cache.invalid;
+    pthread_mutex_unlock(&g_cache_lock);
+    return allowed;
 }
 
 /* ---- 转发队列 + 独立转发线程 ----
@@ -98,15 +124,19 @@ static pthread_t g_pfwd_thread = 0;
  * client_ctl[6] = 转发队列背压：proxy 入队端高水位置位，出队端低水位清除。
  * 拆成两个 key 避免 BPF/入队/出队三方写同一值互相覆盖（ringbuf 恢复但队列仍高时
  * 不能清除，反之亦然）。master 侧读两者取或。 */
-#define CLIENT_CTL_KEY_BACKPRESSURE     4   /* ringbuf 背压 */
-#define CLIENT_CTL_KEY_FWDQ_BACKPRESSURE 6  /* 转发队列背压 */
-#define CLIENT_CTL_KEY_HEARTBEAT         5
+#define CLIENT_CTL_KEY_BACKPRESSURE      KVS_CTL_RINGBUF_BACKPRESSURE
+#define CLIENT_CTL_KEY_FWDQ_BACKPRESSURE KVS_CTL_FWDQ_BACKPRESSURE
+#define CLIENT_CTL_KEY_HEARTBEAT         KVS_CTL_PROXY_HEARTBEAT
+#define CLIENT_CTL_KEY_CACHE_BACKPRESSURE KVS_CTL_CACHE_BACKPRESSURE
+#define CLIENT_CTL_KEY_PROXY_STATE       KVS_CTL_PROXY_STATE
 /* 转发队列高水位 4MB：master 生产远超跨机转发，队列快速填满会阻塞 proxy 主线程、
  * ringbuf 停止排空而溢出。低水位提前触发背压、留足余量（4MB→64MB 有 60MB 余量）。 */
 #define PFWD_BACKPRESSURE_HIGH      (4u * 1024 * 1024)
 #define PFWD_BACKPRESSURE_LOW       (1u * 1024 * 1024)
 static __u64 g_fwdq_bp_state = 0;   /* 最近写入 client_ctl[6] 的值 */
 static int write_client_ctl_u64(__u32 key, __u64 val);   /* 定义在本文件后部 */
+static int g_client_stats_fd;        /* 定义在本文件后部（publish_cache_stats 用） */
+static __u64 g_cache_bp_state = 0;   /* 最近写入 client_ctl[11] 的值 */
 /* ringbuf 占用（m[513] = consumer_pos，用于 proxy 消费端清除 client_ctl[4]） */
 static void *g_rb_meta = MAP_FAILED;
 #define RB_BACKPRESSURE_LOW  (8u * 1024 * 1024)   /* ringbuf 排空到 8MB 以下即清背压 */
@@ -166,6 +196,31 @@ static void fwdq_clear_backpressure_locked(void) {
     if (g_fwdq_bp_state == 1 && fwdq_pending() < PFWD_BACKPRESSURE_LOW) {
         g_fwdq_bp_state = 0;
         write_client_ctl_u64(CLIENT_CTL_KEY_FWDQ_BACKPRESSURE, 0);
+    }
+}
+
+/* 发布 proxy_cache 的占用/丢弃统计到 client_stats map，供 master 的 INFO 读取。
+ * 键位与 BPF 的 client_stats 分开（BPF 只用到 0~8，这里用 16 起的私有区间）。 */
+#define CSTAT_CACHE_BYTES      16
+#define CSTAT_CACHE_NODES      17
+#define CSTAT_CACHE_DROPPED    18
+#define CSTAT_CACHE_DROP_BYTES 19
+#define CSTAT_CACHE_MAX_BYTES  20
+#define CSTAT_CACHE_INVALID    21
+static void publish_cache_stats(void) {
+    if (g_client_stats_fd < 0) return;
+    pthread_mutex_lock(&g_cache_lock);
+    __u64 vals[6];
+    vals[0] = (__u64)g_cache.total_bytes;
+    vals[1] = (__u64)g_cache.node_count;
+    vals[2] = g_cache.dropped;
+    vals[3] = g_cache.drop_bytes;
+    vals[4] = (__u64)g_cache.max_bytes;
+    vals[5] = (__u64)g_cache.invalid;
+    pthread_mutex_unlock(&g_cache_lock);
+    for (__u32 i = 0; i < 6; i++) {
+        __u32 key = CSTAT_CACHE_BYTES + i;
+        bpf_map_update_elem(g_client_stats_fd, &key, &vals[i], BPF_ANY);
     }
 }
 
@@ -281,6 +336,9 @@ static void proxy_fwd_send_batch(proxy_fwd_node_t **batch, int nbatch) {
                 cache_enq_wrap(iov[idx].iov_base, iov[idx].iov_len);
             for (int i = idx + 1; i < nbatch; i++)
                 cache_enq_wrap(batch[i]->buf, batch[i]->len);
+            /* 链接已真失败：摘掉 fd，主循环会重连（§8.1）。数据已回退到 cache，
+             * 重连成功后（同 session）flush 出去，不丢也不重放。 */
+            proxy_slave_mark_down(&g_slave, "writev failed");
             /* 回退的数据必须在下一次发队列新数据前刷出（保持顺序），请求 flush */
             request_cache_flush();
         }
@@ -336,22 +394,25 @@ static void *proxy_fwd_thread_main(void *arg) {
             pthread_mutex_lock(&g_state_lock);
             forwarding = (g_state == STATE_FORWARDING);
             pthread_mutex_unlock(&g_state_lock);
-            if (forwarding && proxy_slave_is_connected(&g_slave)) {
+            /* session 失效（控制连接断开 / cache 被作废）时禁止 flush：缓存的数据
+             * 属于已作废的 session，刷出去会与 backlog 回放叠加造成重复应用（§8.2/§9）。 */
+            if (!cache_flush_allowed()) {
+                cache_clear_wrap();
+            } else if (forwarding && proxy_slave_is_connected(&g_slave)) {
                 int fd = proxy_slave_fd(&g_slave);
                 int sent = cache_flush_wrap(fd);
                 if (sent > 0)
                     fprintf(stderr, "ebpf-proxy: cache flushed (%d items) [fwd]\n", sent);
-                /* 刷不完（fd 故障中断）：非停止态时保留 pending 重试（重连后 main_loop 会再请求）；
-                 * 停止态不再重试，剩余 cache 由 cleanup 的 cache_destroy 释放。 */
+                /* 刷不完（send_full 只在非 EAGAIN 的真错误上失败）：链路已死，
+                 * 摘掉 fd 让主循环重连，剩余 cache 留给重连后的那次 flush。
+                 * 不能在这里直接 request_cache_flush 重试——fd 未变时必然再次失败，
+                 * 形成每秒数百万次的 EPIPE 空转（实测 Slave 重启后 6.8M 次）且永不重连。
+                 * 停止态下不再重试，剩余 cache 由 cleanup 的 cache_destroy 释放。 */
                 pthread_mutex_lock(&g_cache_lock);
                 int leftover = (g_cache.head != NULL);
                 pthread_mutex_unlock(&g_cache_lock);
-                if (leftover) {
-                    pthread_mutex_lock(&g_pfwd_lock);
-                    int stopping = g_pfwd_stop;
-                    pthread_mutex_unlock(&g_pfwd_lock);
-                    if (!stopping) request_cache_flush();
-                }
+                if (leftover)
+                    proxy_slave_mark_down(&g_slave, "cache flush failed");
             }
         }
 
@@ -373,6 +434,9 @@ static void proxy_fwd_drain_to_cache_or_discard(void) {
     proxy_fwd_node_t *n = g_pfwd_head;
     g_pfwd_head = g_pfwd_tail = NULL;
     g_pfwd_bytes = 0;
+    /* 队列被外力清空：入队端背压必须同步解除，否则转发线程因队列已空不会再出队，
+     * 清背压无从触发，master 会永久停在 client_ctl[6]=1 上。 */
+    fwdq_clear_backpressure_locked();
     pthread_mutex_unlock(&g_pfwd_lock);
     while (n) {
         proxy_fwd_node_t *nx = n->next;
@@ -600,8 +664,51 @@ static int ringbuf_callback(void *ctx, void *data, size_t len) {
     return 0;
 }
 
+/* 轮询 master 下发的 replication session 状态（client_ctl[8]/[9]/[10]）。
+ * session 变化 = 一次新的 REPLSYNC 建立（新 id）或旧 session 失效（valid=0）。
+ * 两种情况都必须丢弃旧 cache：前者防跨 session 重放，后者是 NO_REPLICA 清理（§4.1/§7）。 */
+static void poll_session_state(void) {
+    if (g_client_ctl_fd < 0) return;
+    __u64 sid = 0, valid = 0, cinv = 0;
+    __u32 k;
+    k = KVS_CTL_SESSION_ID;
+    if (bpf_map_lookup_elem(g_client_ctl_fd, &k, &sid) != 0) return;
+    k = KVS_CTL_SESSION_VALID;
+    bpf_map_lookup_elem(g_client_ctl_fd, &k, &valid);
+    k = KVS_CTL_CACHE_INVALID;
+    bpf_map_lookup_elem(g_client_ctl_fd, &k, &cinv);
+
+    int sid_changed = ((uint64_t)sid != g_session_id);
+    int valid_changed = ((int)valid != g_session_valid);
+    int cinv_changed = ((int)cinv != g_cache_invalid_remote);
+    if (!sid_changed && !valid_changed && !cinv_changed) return;
+
+    if (sid_changed) {
+        fprintf(stderr, "ebpf-proxy: replication session change %llu -> %llu, "
+                "discarding previous session cache\n",
+                (unsigned long long)g_session_id, (unsigned long long)sid);
+        g_session_id = (uint64_t)sid;
+        cache_clear_wrap();
+        proxy_fwd_drain_to_cache_or_discard();
+    }
+    g_session_valid = (int)valid;
+    g_cache_invalid_remote = (int)cinv;
+    if (!g_session_valid) {
+        /* 控制连接断开：旧 session 作废，cache 一律丢弃，禁止 flush（§8.2） */
+        fprintf(stderr, "ebpf-proxy: session invalidated by master, "
+                        "cache discarded (no flush)\n");
+        cache_clear_wrap();
+        proxy_fwd_drain_to_cache_or_discard();
+    } else if (cinv) {
+        /* master 判定本 session cache 已作废（proxy 溢出后重新武装） */
+        fprintf(stderr, "ebpf-proxy: cache marked invalid by master, discarding\n");
+        cache_clear_wrap();
+    }
+}
+
 /* 主循环 */
 static void main_loop(void) {
+    unsigned int stats_tick = 0;
     while (!g_shutdown) {
         /* capture BPF 用 BPF_RB_NO_WAKEUP（省每 recv 的 self-IPI，占 master CPU2 25-27%）：
          * producer 不发 eventfd 信号，ring_buffer__poll 只当 sleep（超时返回），
@@ -633,6 +740,35 @@ static void main_loop(void) {
         /* 注意：不再调用 batch_flush()。FORWARDING 数据已入转发队列，
          * 由独立转发线程 writev 到 slave。*/
 
+        /* replication session 边界（新 REPLSYNC / 控制连接断开）：作废旧 cache */
+        poll_session_state();
+
+        /* 把 proxy_cache 占用/丢弃统计发布给 master 的 INFO（~0.5s 一次） */
+        if (++stats_tick >= 500) {
+            stats_tick = 0;
+            publish_cache_stats();
+        }
+
+        /* proxy_cache 高水位 → 向上游发背压（client_ctl[11]），让 master 停手等待。
+         * 低水位清除。硬上限的作废由 cache_append 就地处理并经 CACHE_INVALID 上报。 */
+        {
+            int over_high = cache_over_high(&g_cache);
+            if (over_high && g_cache_bp_state == 0) {
+                g_cache_bp_state = 1;
+                write_client_ctl_u64(CLIENT_CTL_KEY_CACHE_BACKPRESSURE, 1);
+                fprintf(stderr, "ebpf-proxy: proxy_cache over high watermark, "
+                                "signalling backpressure\n");
+            } else if (!over_high && g_cache_bp_state == 1) {
+                g_cache_bp_state = 0;
+                write_client_ctl_u64(CLIENT_CTL_KEY_CACHE_BACKPRESSURE, 0);
+            }
+            /* 本地触发硬上限：上报 master（CACHE_INVALID），由 master 断开 replica 链路
+             * 强制重新同步。此处不静默丢数据继续复制（§12）。 */
+            if (cache_is_invalid(&g_cache)) {
+                write_client_ctl_u64(KVS_CTL_CACHE_INVALID, 1);
+            }
+        }
+
         /* 检查 fullsync 状态变化
          * client_ctl[3] 由 master 进程在 queue_snapshot/REPLDONE 时写入:
          *   1 = 全量同步开始 → 切 BUFFERING
@@ -643,13 +779,32 @@ static void main_loop(void) {
                 set_state(STATE_BUFFERING);
                 /* IMPORTANT 2: 清空转发队列剩余增量，防其穿插进全量同步流 */
                 proxy_fwd_drain_to_cache_or_discard();
+                /* §6：同时丢弃上一个 session/边界之前的 proxy_cache —— 快照已经包含
+                 * 这些写，若留着再 flush 就是命令重复执行（INCR/DEL 等非幂等命令致命）。
+                 * 边界后缓存的数据必须带上本次 session 身份，故先把 SESSION_ID 取最新：
+                 * master 写 [9] 一定早于 [3]，此刻读到的必然是本 session 的 id。 */
+                {
+                    __u32 k9 = KVS_CTL_SESSION_ID;
+                    __u64 sid_now = 0;
+                    if (bpf_map_lookup_elem(g_client_ctl_fd, &k9, &sid_now) == 0)
+                        g_session_id = (uint64_t)sid_now;
+                }
+                cache_clear_wrap();
+                write_client_ctl_u64(CLIENT_CTL_KEY_PROXY_STATE, 1);  /* 确认 BUFFERING */
                 fprintf(stderr, "ebpf-proxy: fullsync start (client_ctl[3]=1), "
-                        "state=BUFFERING\n");
+                        "state=BUFFERING, old cache discarded\n");
             } else if (fs_val == 0 && g_state == STATE_BUFFERING) {
-                fprintf(stderr, "ebpf-proxy: fullsync end (client_ctl[3]=0), "
-                        "requesting cache flush...\n");
                 set_state(STATE_FORWARDING);
-                request_cache_flush();   /* fwd 线程（唯一 writer）刷 cache */
+                write_client_ctl_u64(CLIENT_CTL_KEY_PROXY_STATE, 0);
+                if (cache_flush_allowed()) {
+                    fprintf(stderr, "ebpf-proxy: fullsync end (client_ctl[3]=0), "
+                            "requesting cache flush...\n");
+                    request_cache_flush();   /* fwd 线程（唯一 writer）刷 cache */
+                } else {
+                    fprintf(stderr, "ebpf-proxy: fullsync end but session invalid — "
+                            "cache discarded, not flushed\n");
+                    cache_clear_wrap();
+                }
             }
         }
 
@@ -665,7 +820,17 @@ static void main_loop(void) {
                 /* 指数退避 */
                 for (int attempt = 1; !g_shutdown; attempt++) {
                     if (proxy_slave_connect(&g_slave) == 0) {
-                        request_cache_flush();   /* 重连成功：让 fwd 线程刷残留 cache */
+                        /* 数据通道重连成功：只有控制面确认仍是同一个有效 session 时才允许
+                         * 刷残留 cache（§8.1/§9）；否则那是上个 session 的残余，必须丢弃。
+                         * 控制连接也断了（SESSION_BROKEN）时 cache 早已被 poll_session_state
+                         * 清掉，这里再刷等于跨 session 重放（§8.2）。 */
+                        if (cache_flush_allowed()) {
+                            request_cache_flush();   /* fwd 线程（唯一 writer）刷残留 cache */
+                        } else {
+                            fprintf(stderr, "ebpf-proxy: reconnected but session not "
+                                            "flushable — discarding residual cache\n");
+                            cache_clear_wrap();
+                        }
                         break;
                     }
                     unsigned int delay = g_slave.backoff_ms;

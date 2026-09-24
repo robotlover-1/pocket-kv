@@ -798,7 +798,7 @@ void persist_bgrewriteaof(void) {
 flowchart TB
     subgraph Master["Master 节点"]
         MV["存储引擎\n所有数据"]
-        BACKLOG["Replication Backlog\n1MB 环形缓冲区"]
+        BACKLOG["Replication Backlog\n10MB 环形缓冲区"]
         REPL_LIST["Slave 链表\nconn_t *g_replicas"]
         RDMA_LISTENER["RDMA Listener 线程\nrdma_master_listener_thread()"]
     end
@@ -873,7 +873,8 @@ repl_realtime_transport=ebpf+tcp    # 增量同步走 eBPF+tcp（推荐）
 ```c
 void repl_broadcast(const unsigned char *raw, size_t rawlen) {
     repl_note_send_context("broadcast", rawlen, repl_master_offset(), raw);
-    repl_backlog_feed(raw, rawlen);  // 也写入 backlog（供 partial resync）
+    // 注意：backlog 的 feed 由调用方（写命令成功后）统一完成，此处不再二次 feed -- 否则
+    // 全量同步期间同一条 raw 会被喂两遍，backlog_end_offset 跑在 master_repl_offset 前面
     repl_note_broadcast(rawlen);
     pthread_mutex_lock(&g_repl_lock);
 
@@ -908,8 +909,8 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
 
 ```c
 typedef struct repl_backlog_s {
-    unsigned char *buf;       // 1MB 环形缓冲区
-    size_t cap;               // 1024*1024
+    unsigned char *buf;       // 10MB 环形缓冲区（无 Slave 时不分配，省 10MB）
+    size_t cap;               // 10*1024*1024
     size_t histlen;           // 当前已使用的历史长度
     size_t head;              // 写入位置
     unsigned long long start_offset;
@@ -1602,8 +1603,11 @@ else if (!strcmp(cmd, "GET")) {
 }
 else if (!strcmp(cmd, "REPLSYNC")) {
     // 复制同步请求
+    // can_continue 同时要求：replid 匹配 + backlog 历史连续 + backlog 覆盖到当前 offset
+    //                     + offset 落在 backlog 区间内（缺任一即全量）
     int can_continue = repl_backlog_can_continue(req_replid, req_offset);
     repl_add_slave(c);
+    // 首个 Slave 建立 replication session：开 eBPF 捕获 + 通知 ebpf-proxy session id
     if (can_continue) repl_backlog_send_continue(c, req_offset);
     else queue_snapshot(c);
 }

@@ -107,6 +107,26 @@ int proxy_slave_is_connected(proxy_slave_ctx_t *ctx) {
     return slave_locked_fd(ctx) > 0;
 }
 
+/* 发送侧发现数据通道真失败（EPIPE/ECONNRESET 等）时调用：立刻把 fd 摘掉，让主循环的
+ * is_connected 检查转为假、走重连分支（§8.1 DATA_CHANNEL_DOWN，同一 session 内恢复）。
+ * 只靠 writev 返回 -1 是不够的——fd 号仍然 > 0，主循环一直认为"还连着"，于是每次
+ * flush 都失败并无限重试（实测 Slave 重启后 6.8M 次 EPIPE 重试且永不重连）。
+ * 由转发线程调用（它刚做完 writev/send，未持 g_slave_lock），语义同 disconnect。 */
+void proxy_slave_mark_down(proxy_slave_ctx_t *ctx, const char *why) {
+    int fd;
+    if (!ctx) return;
+    pthread_mutex_lock(&g_slave_lock);
+    fd = ctx->fd;
+    ctx->fd = -1;
+    pthread_mutex_unlock(&g_slave_lock);
+    ctx->backoff_ms = PROXY_SLAVE_BACKOFF_INIT_MS;
+    if (fd > 0) {
+        close(fd);
+        fprintf(stderr, "ebpf-proxy: slave data channel down (%s), will reconnect\n",
+                why ? why : "send error");
+    }
+}
+
 int proxy_slave_fd(proxy_slave_ctx_t *ctx) {
     return slave_locked_fd(ctx);
 }

@@ -27,6 +27,10 @@ void proxy_slave_disconnect(proxy_slave_ctx_t *ctx);
 /* 检查是否已连接 */
 int proxy_slave_is_connected(proxy_slave_ctx_t *ctx);
 
+/* 发送失败后由转发线程调用：摘掉 fd 并复位退避，让主循环重新 connect。
+ * fd 号仍 > 0 不代表链路可用，必须显式标记，否则永不重连。 */
+void proxy_slave_mark_down(proxy_slave_ctx_t *ctx, const char *why);
+
 /* 获取 fd（-1 表示未连接） */
 int proxy_slave_fd(proxy_slave_ctx_t *ctx);
 

@@ -190,9 +190,38 @@ sudo  ./kvstore kvstore.conf --role slave
 | INFO 字段                        | 预期            | 含义                                   |
 | -------------------------------- | --------------- | -------------------------------------- |
 | `repl_transport_active`          | `rdma+ebpf-tcp` | 全量 RDMA + 增量 eBPF+tcp 双通道已激活 |
-| `kprobe_initialized`             | 1               | client_capture BPF 已加载并 attach     |
-| `repl_broadcast_bytes`           | > 0             | TCP 增量数据已发送                     |
+| `repl_broadcast_bytes`           | > 0             | master 已记账并广播增量字节            |
 | `repl_transport_fallback_reason` | `none`          | 无降级，传输层正常工作                 |
+
+> **不要用 `kprobe_initialized` 判断 eBPF+tcp**：该模式下用的是 `repl_client_capture.bpf.o`
+> 的 `fexit/tcp_recvmsg`（**不是** `repl_kprobe.bpf.o`），此字段恒为 0。
+> 测试程序 Phase 5.5 已按此修正，只校验 `repl_transport_active` 与 `repl_broadcast_bytes`。
+
+**eBPF+tcp 复制会话与缓冲状态**（改造新增，用于判断「无 Slave 是否还在白干活」、
+「cache 有没有积压/丢数据」、「断线后是否被正确判为不可续」）：
+
+| INFO 字段                       | 预期              | 含义                                                     |
+| ------------------------------- | ----------------- | -------------------------------------------------------- |
+| `repl_session_id`               | 非 0（有 Slave）  | 当前 replication session 身份；每个新会话重新生成           |
+| `repl_session_valid`            | 1                 | 会话有效；0 表示最后一个 Slave 已离开（capture 已关闭）    |
+| `ebpf_capture_enabled`          | 1                 | `client_ctl[7]`：eBPF 正在捕获                              |
+| `ebpf_capture_off_count`        | 无 Slave 时增长、有 Slave 时冻结 | BPF 因 `CAPTURE_ENABLE=0` 直接返回的次数（预期行为，非错误）  |
+| `repl_backlog_contiguous`       | 1                 | backlog 历史相对 `master_repl_offset` 连续（可 partial resync） |
+| `repl_backlog_end_offset`       | == `master_repl_offset` | 稳态不变式；不等即存在复制历史缺口                    |
+| `ebpf_proxy_cache_bytes`        | 0（稳态）         | ebpf-proxy 侧 proxy_cache 当前占用                          |
+| `ebpf_proxy_cache_max_bytes`    | 小                | 峰值占用；全量同步期间应只有边界后的增量（几 KB 量级）      |
+| `ebpf_proxy_cache_dropped`      | 0                 | 被作废丢弃的节点数；**增长说明发生了重新同步**              |
+| `ebpf_proxy_cache_invalid`      | 0                 | 1 表示本 session 的 cache 已作废（硬上限触发）              |
+
+**两种典型自检：**
+
+```bash
+# 无 Slave 时：capture 必须关闭、cache 不增长、backlog 标记为不连续
+redis-cli -p 5160 INFO | grep -E "ebpf_capture_enabled|ebpf_capture_off_count|ebpf_proxy_cache_bytes|repl_session_valid"
+
+# 有 Slave 且全量同步完成后：backlog_end 必须追平 master_offset
+redis-cli -p 5160 INFO | grep -E "repl_backlog_(end_offset|contiguous)|master_repl_offset"
+```
 
 **kprobe+RDMA 验证** (使用 `repl_realtime_transport=kprobe-rdma` 时):
 

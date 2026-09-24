@@ -487,6 +487,36 @@ sequenceDiagram
     N->>C: "on_write() → send()"
 ```
 
+### 复制缓冲的职责边界
+
+eBPF+tcp 增量链路上有四层缓冲，职责互不重叠：
+
+| 组件 | 容量 / 水位 | 定位 |
+| ---- | ----------- | ---- |
+| BPF ringbuf（`client_cache_ringbuf`） | 64MB（高 32MB / 低 8MB） | 内核 → ebpf-proxy 的临时运输队列 |
+| 转发队列（`g_pfwd_*`） | 64MB（高 4MB / 低 1MB） | proxy 主线程 → 转发线程的临时运输队列 |
+| `proxy_cache` | 256MB 硬上限（高水位 192MB） | **同一个 replication session 内** FULLRESYNC / 数据通道短断的临时缓存 |
+| `repl_backlog` | 10MB | Master 带 offset 的权威复制历史，用于**重新 REPLSYNC 后**的 partial resync |
+
+一句话：ringbuf / 转发队列解决「怎么传」，`proxy_cache` 解决「这个 session 暂时传不了」，
+`backlog` 解决「session 断了以后怎么续」。
+
+几条关键不变量（可用 `INFO` 字段自检）：
+
+- **无 Slave 不捕获**：`ebpf_capture_enabled=0`，BPF 在读数据 / 写 ringbuf 之前直接返回，
+  不会因为「没人要」而积压并通过背压拖慢正常客户端请求（`ebpf_capture_off_count` 可观察）。
+- **backlog 只在一个地方喂**：写命令成功后统一 `repl_backlog_feed + repl_note_broadcast`，
+  稳态下 `repl_backlog_end_offset == master_repl_offset`。
+- **无 Slave 期间的写会打断连续性**：`repl_backlog_contiguous=0`，此后 partial resync 一律拒绝，
+  强制 FULLRESYNC —— 否则会误判「backlog 区间内可续」而永久丢掉中间的写。
+- **cache 不跨 session**：节点带 `session_id`；控制连接断开则旧 cache 作废且禁止 flush，
+  避免与 backlog 回放叠加导致同一条命令被应用两次（对 INCR/DEL 等非幂等命令致命）。
+- **不静默丢数据**：`proxy_cache` 到硬上限时标记 session 作废并上报 Master 触发重新同步，
+  而不是丢掉最旧节点继续跑。
+
+详见 [`kvstore/docs/kvstore-data-flow.md`](kvstore/docs/kvstore-data-flow.md) §5.2 / §5.3 / §6.5
+与 [`kvstore/docs/replication-mechanism-qa.md`](kvstore/docs/replication-mechanism-qa.md) Q8 / Q17 / Q18 / Q19。
+
 ## 测试体系
 
 ### 快速验证

@@ -28,6 +28,10 @@
 #define RB_HIGH_WATERMARK         (32u * 1024 * 1024)   /* 置位：可用数据 ≥32MB */
 #define RB_LOW_WATERMARK          (8u * 1024 * 1024)    /* 清除：可用数据 ≤8MB */
 #define RB_WAKE_THRESHOLD         (8u * 1024 * 1024)    /* 自适应唤醒阈值 */
+/* 捕获开关（client_ctl[7]）：无 Slave（无 replication session）时由 master 置 0，
+ * fexit 在读 msghdr / bpf_probe_read_user / ringbuf_output 之前直接返回，避免
+ * 无意义的捕获开销与 ringbuf/cache 积压触发的主业务背压。 */
+#define CTL_CAPTURE_ENABLE_KEY    7
 /* bpf_ringbuf_output/query 标志（linux/bpf.h 未导出这些宏） */
 #ifndef BPF_RB_NO_WAKEUP
 #define BPF_RB_NO_WAKEUP 1
@@ -57,10 +61,16 @@ struct iov_head {
 #define ST_USER_FAIL  5   /* bpf_probe_read_user 读数据失败 */
 #define ST_RB_OK      6   /* ringbuf_output 成功 */
 #define ST_RB_DROP    7   /* ringbuf_output 失败（ringbuf 满，应被主进程背压避免） */
+#define ST_CAP_OFF    8   /* CAPTURE_ENABLE=0 直接返回（无 Slave，零开销路径） */
 
+/* client_ctl 键位约定（BPF / ebpf-proxy / master 三方共用，改键须同步三处）：
+ *   1  MASTER_PID            2  MASTER_PORT         3  FULLSYNC_STATE
+ *   4  RINGBUF_BACKPRESSURE  5  PROXY_HEARTBEAT     6  FWDQ_BACKPRESSURE
+ *   7  CAPTURE_ENABLE        8  SESSION_VALID       9  SESSION_ID
+ *  10  CACHE_INVALID        11  CACHE_BACKPRESSURE  12 PROXY_STATE */
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 8);
+    __uint(max_entries, 16);
     __type(key, __u32);
     __type(value, __u64);
 } client_ctl SEC(".maps");
@@ -72,9 +82,11 @@ struct {
     __type(value, __u64);
 } proxy_cfg SEC(".maps");
 
+/* 键 0~8 由 BPF 自己累加；16~21 留给 ebpf-proxy 发布 proxy_cache 统计
+ * （见 src/ebpf_proxy/main.c 的 publish_cache_stats），master 的 INFO 读同一张 map。 */
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 16);
+    __uint(max_entries, 32);
     __type(key, __u32);
     __type(value, __u64);
 } client_stats SEC(".maps");
@@ -102,6 +114,15 @@ struct {
 SEC("fexit/tcp_recvmsg")
 int fexit_tcp_recvmsg(__u64 *ctx)
 {
+    /* CAPTURE_ENABLE 放在最前：无 replication session 时连 pid 过滤都不做，
+     * 后续 bpf_probe_read_user / ringbuf_output 全部省掉（P1 无 Slave 零开销）。 */
+    __u32 cap_key = CTL_CAPTURE_ENABLE_KEY;
+    __u64 *ctl_cap = bpf_map_lookup_elem(&client_ctl, &cap_key);
+    if (!ctl_cap || !*ctl_cap) {
+        cstat_inc(ST_CAP_OFF);
+        return 0;
+    }
+
     __u64 *ctl_pid = bpf_map_lookup_elem(&client_ctl, &(__u32){1});
     if (!ctl_pid || !*ctl_pid)
         return 0;

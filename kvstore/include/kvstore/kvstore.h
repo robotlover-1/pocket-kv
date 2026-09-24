@@ -534,6 +534,12 @@ unsigned long long repl_rdma_recv_cq_error_count(void);
 void repl_note_fullsync(size_t snapshot_bytes);
 void repl_note_broadcast(size_t bytes);
 int repl_backlog_feed(const unsigned char *buf, size_t len);
+void repl_backlog_reset(unsigned long long base);
+unsigned long long repl_session_begin(void);
+void repl_session_end(void);
+unsigned long long repl_session_id(void);
+int repl_session_valid(void);
+int repl_backlog_contiguous(void);
 int repl_backlog_can_continue(const char *replid, unsigned long long offset);
 int repl_backlog_write_range(conn_t *c, unsigned long long offset);
 int repl_backlog_send_continue(conn_t *c, unsigned long long offset);
@@ -560,6 +566,20 @@ int repl_ebpf_register_forward_fd(int fd);
 int repl_ebpf_unregister_fd(int fd);
 int repl_ebpf_get_stats(kvs_repl_ebpf_stats_t *stats);
 int repl_ebpf_backpressure(void);   /* ebpf+tcp 转发背压：返回 1 表示转发路径落后，应暂停读取 */
+
+/* ebpf-proxy 侧 proxy_cache 的运行时统计（由 proxy 周期性发布到 client_stats map）。
+ * 字段含义见 src/ebpf_proxy/main.c 的 publish_cache_stats()。 */
+typedef struct {
+    unsigned long long cache_bytes;      /* 当前缓存占用 */
+    unsigned long long cache_nodes;      /* 当前节点数 */
+    unsigned long long cache_dropped;    /* 丢弃节点数（跨 session 作废 / 溢出作废） */
+    unsigned long long cache_drop_bytes; /* 丢弃字节数 */
+    unsigned long long cache_max_bytes;  /* 峰值占用 */
+    unsigned long long cache_invalid;    /* 本 session cache 是否已作废 */
+    unsigned long long capture_enabled;  /* client_ctl[7]：eBPF 捕获是否开启 */
+    unsigned long long capture_off_count;/* BPF 因 capture_enabled=0 直接返回的次数 */
+} kvs_ebpf_proxy_stats_t;
+int repl_ebpf_proxy_get_stats(kvs_ebpf_proxy_stats_t *stats);
 
 int persist_init(void);
 void persist_close(void);

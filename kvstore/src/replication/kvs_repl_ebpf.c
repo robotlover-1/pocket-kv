@@ -1,4 +1,5 @@
 #include "kvstore/kvstore.h"
+#include "kvstore/replication/client_ctl.h"
 #include <strings.h>
 
 #if KVS_ENABLE_EBPF
@@ -30,6 +31,7 @@ static int g_repl_ebpf_control_map_fd = -1;
 static int g_repl_ebpf_uses_pinned_maps = 0;
 static int g_repl_ebpf_print_initialized = 0;
 static int g_repl_ebpf_backpressure_fd = -1;
+static int g_repl_ebpf_client_stats_fd = -1;   /* proxy 的 client_stats（cache 统计） */
 static int g_repl_ebpf_backpressure_enabled = -1;   /* -1=未初始化, 0=off, 1=on */
 static __u64 g_repl_ebpf_last_hb = 0;
 static long long g_repl_ebpf_last_hb_ms = 0;
@@ -398,11 +400,18 @@ int repl_ebpf_backpressure(void) {
         if (fd < 0) { g_repl_ebpf_bp_cached = 0; return 0; }   /* ebpf-proxy 未启动：无捕获，无需背压 */
         g_repl_ebpf_backpressure_fd = fd;
     }
-    __u32 key = 4;   /* KVS_EBPF_CLIENT_CTL_BACKPRESSURE */
-    __u64 val = 0;
-    if (bpf_map_lookup_elem(g_repl_ebpf_backpressure_fd, &key, &val) != 0) {
-        g_repl_ebpf_bp_cached = 0;
-        return 0;
+    /* 三个背压源取或：ringbuf 水位(4)、转发队列水位(6)、proxy_cache 高水位(11)。
+     * 任何一个高了都说明下游消化不掉，master 必须停手等（否则 ringbuf 溢出即静默丢
+     * 数据，proxy_cache 溢出即 session 作废）。 */
+    __u64 val = 0, v = 0;
+    const __u32 bp_keys[3] = { KVS_CTL_RINGBUF_BACKPRESSURE, KVS_CTL_FWDQ_BACKPRESSURE,
+                               KVS_CTL_CACHE_BACKPRESSURE };
+    for (int i = 0; i < 3; i++) {
+        v = 0;
+        if (bpf_map_lookup_elem(g_repl_ebpf_backpressure_fd, &bp_keys[i], &v) == 0 && v) {
+            val = 1;
+            break;
+        }
     }
     if (val == 0) {
         g_repl_ebpf_bp_cached = 0;
@@ -437,6 +446,60 @@ int repl_ebpf_backpressure(void) {
 #else
     return 0;
 #endif
+}
+
+/* 读 ebpf-proxy 发布的 proxy_cache 统计 + BPF 捕获开关状态。
+ * client_stats map 的键位：BPF 用 0~8，proxy 用 16~21（见 publish_cache_stats）。 */
+#define KVS_CSTAT_CACHE_BYTES      16
+#define KVS_CSTAT_CACHE_NODES      17
+#define KVS_CSTAT_CACHE_DROPPED    18
+#define KVS_CSTAT_CACHE_DROP_BYTES 19
+#define KVS_CSTAT_CACHE_MAX_BYTES  20
+#define KVS_CSTAT_CACHE_INVALID    21
+#define KVS_CSTAT_CAPTURE_OFF      8   /* BPF ST_CAP_OFF */
+
+int repl_ebpf_proxy_get_stats(kvs_ebpf_proxy_stats_t *stats) {
+    if (!stats) return -1;
+    memset(stats, 0, sizeof(*stats));
+#if KVS_ENABLE_EBPF
+    /* 懒打开两个 pinned map（ebpf-proxy 未启动时保持 -1，静默返回全 0） */
+    if (g_repl_ebpf_backpressure_fd < 0) {
+        char path[512];
+        if (!g_cfg.ebpf_pin_path[0]) return -1;
+        snprintf(path, sizeof(path), "%s/client_ctl", g_cfg.ebpf_pin_path);
+        g_repl_ebpf_backpressure_fd = bpf_obj_get(path);
+    }
+    if (g_repl_ebpf_stats_map_fd < 0) {
+        char path[512];
+        if (!g_cfg.ebpf_pin_path[0]) return -1;
+        snprintf(path, sizeof(path), "%s/client_stats", g_cfg.ebpf_pin_path);
+        g_repl_ebpf_client_stats_fd = bpf_obj_get(path);
+    }
+    if (g_repl_ebpf_backpressure_fd >= 0) {
+        __u32 k7 = KVS_CTL_CAPTURE_ENABLE;
+        __u64 v = 0;
+        if (bpf_map_lookup_elem(g_repl_ebpf_backpressure_fd, &k7, &v) == 0)
+            stats->capture_enabled = v;
+    }
+    if (g_repl_ebpf_client_stats_fd >= 0) {
+        const __u32 keys[6] = { KVS_CSTAT_CACHE_BYTES, KVS_CSTAT_CACHE_NODES,
+                                KVS_CSTAT_CACHE_DROPPED, KVS_CSTAT_CACHE_DROP_BYTES,
+                                KVS_CSTAT_CACHE_MAX_BYTES, KVS_CSTAT_CACHE_INVALID };
+        unsigned long long *out[6] = { &stats->cache_bytes, &stats->cache_nodes,
+                                       &stats->cache_dropped, &stats->cache_drop_bytes,
+                                       &stats->cache_max_bytes, &stats->cache_invalid };
+        for (int i = 0; i < 6; i++) {
+            __u64 v = 0;
+            if (bpf_map_lookup_elem(g_repl_ebpf_client_stats_fd, &keys[i], &v) == 0)
+                *out[i] = v;
+        }
+        __u32 koff = KVS_CSTAT_CAPTURE_OFF;
+        __u64 v = 0;
+        if (bpf_map_lookup_elem(g_repl_ebpf_client_stats_fd, &koff, &v) == 0)
+            stats->capture_off_count = v;
+    }
+#endif
+    return 0;
 }
 
 int repl_ebpf_get_stats(kvs_repl_ebpf_stats_t *stats) {

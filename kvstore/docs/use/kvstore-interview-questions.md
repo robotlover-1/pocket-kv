@@ -329,9 +329,16 @@
 
 **答题要点**：
 1. Slave 发 REPLSYNC 带 replid + offset
-2. Master 检查 `repl_backlog_can_continue(replid, offset)`：
-   - replid 匹配且 offset 在 backlog 范围 → **部分同步** (CONTINUE + backlog 数据)
-   - 否则 → **全量同步** (FULLRESYNC + 快照数据)
+2. Master 检查 `repl_backlog_can_continue(replid, offset)`，必须**全部**满足才部分同步：
+   - replid 匹配
+   - `backlog_contiguous == true`（无 Slave 期间的写不进 backlog，会打断连续性）
+   - `backlog.end_offset >= master_repl_offset`（backlog 必须覆盖到 Master 当前 offset）
+   - offset 落在 `[backlog.start_offset, backlog.end_offset]`
+   - 满足 → **部分同步** (CONTINUE + backlog 数据)；否则 → **全量同步** (FULLRESYNC + 快照数据)
+
+   > 后两条是容易被忽略的坑：只看「offset 在 backlog 区间内」会误判。例如 Slave 断在
+   > offset=1000、backlog=[500,1200]，Slave 全断后 Master 又写到 1500（backlog 因无 Slave
+   > 不增长，仍停在 1200），此时 1000 依然落在区间内，但 1200~1500 已是无法补齐的历史缺口。
 3. TCP 保底：任何时候 RDMA/eBPF/kprobe-rdma 路径失败，`repl_transport_trigger_fallback()` 自动降级到 TCP
    - **例外（当前默认）**：`ebpf+tcp` 下转发由独立的 `ebpf-proxy` 进程全权负责，这条 kprobe 健康检查 / fallback 路径会被跳过（`src/replication/kvs_repl_kprobe.c:1141,1159` 对 `KVS_REPL_TRANSPORT_EBPF_TCP` 直接 `continue`），不存在"降级"动作
 
