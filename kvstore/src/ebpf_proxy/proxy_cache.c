@@ -82,6 +82,18 @@ void cache_clear(cache_ctx_t *ctx) {
     ctx->total_bytes = 0;
     ctx->node_count = 0;
     ctx->over_high = 0;
+    /* 故意不动 ctx->invalid：数据丢了不等于 session 恢复了 */
+}
+
+/* 新 session：清数据 + 解除 invalid。只在确认建立了新的 replication session 时调用，
+ * 否则 invalid 一旦置位就再也没机会复位，之后所有 cache_append 都会被拒。 */
+void cache_reset_for_new_session(cache_ctx_t *ctx) {
+    if (!ctx) return;
+    int was_invalid = ctx->invalid;
+    cache_clear(ctx);
+    ctx->invalid = 0;
+    if (was_invalid)
+        fprintf(stderr, "ebpf-proxy: proxy_cache invalid flag cleared for new session\n");
 }
 
 static int send_full(int fd, const void *buf, size_t len) {

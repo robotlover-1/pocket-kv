@@ -513,6 +513,10 @@ eBPF+tcp 增量链路上有四层缓冲，职责互不重叠：
   避免与 backlog 回放叠加导致同一条命令被应用两次（对 INCR/DEL 等非幂等命令致命）。
 - **不静默丢数据**：`proxy_cache` 到硬上限时标记 session 作废并上报 Master 触发重新同步，
   而不是丢掉最旧节点继续跑。
+- **补数据前先立屏障**：FULLRESYNC 快照与 partial resync 的 backlog replay 都走控制连接，
+  而 eBPF 实时转发走另一条 TCP 连接，两者之间没有顺序保证。因此补数据前先让 proxy 进
+  BUFFERING（`client_ctl[3]`/`[12]` 握手），补完并由 Slave 确认后再放行 flush cache；
+  屏障握手失败则 fail-closed 拒绝本次 resync（`repl_proxy_barrier` 可观察）。
 
 详见 [`kvstore/docs/kvstore-data-flow.md`](kvstore/docs/kvstore-data-flow.md) §5.2 / §5.3 / §6.5
 与 [`kvstore/docs/replication-mechanism-qa.md`](kvstore/docs/replication-mechanism-qa.md) Q8 / Q17 / Q18 / Q19。

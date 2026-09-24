@@ -3472,6 +3472,48 @@ out:
     return rc;
 }
 
+/* repl_backlog_write_range 的有界版本：只发 [offset, end) 而不是 [offset, backlog_end)。
+ * partial resync 的 barrier 要求 replay 上界固定在 catchup_end（屏障时刻的 master_offset），
+ * 屏障期间产生的新写交给 proxy_cache，两段严格不重叠。 */
+int repl_backlog_write_range_upto(conn_t *c, unsigned long long offset, unsigned long long end) {
+    size_t delta, first;
+    if (!c || !g_repl_backlog.buf) return -1;
+    if (offset < g_repl_backlog.start_offset || offset > g_repl_backlog.end_offset) return -1;
+    if (end > g_repl_backlog.end_offset) end = g_repl_backlog.end_offset;
+    if (end <= offset) { c->repl_offset_sent = end; return 0; }
+    delta = (size_t)(offset - g_repl_backlog.start_offset);
+    first = (size_t)(end - offset);
+    size_t start_index = (g_repl_backlog.head + delta) % g_repl_backlog.cap;
+    if (start_index + first <= g_repl_backlog.cap) {
+        if (repl_send_chunked(c, g_repl_backlog.buf + start_index, first) != 0) return -1;
+    } else {
+        size_t part1 = g_repl_backlog.cap - start_index;
+        size_t part2 = first - part1;
+        if (repl_send_chunked(c, g_repl_backlog.buf + start_index, part1) != 0) return -1;
+        if (repl_send_chunked(c, g_repl_backlog.buf, part2) != 0) return -1;
+    }
+    c->repl_offset_sent = end;
+    c->repl_last_send_ms = kvs_now_ms();
+    return 0;
+}
+
+/* partial resync：+CONTINUE 头（end 用 catchup_end）+ 有界 replay。
+ * 与 repl_backlog_send_continue 的区别只在"发多少"：这里只发到 catchup_end。 */
+int repl_backlog_send_continue_upto(conn_t *c, unsigned long long offset,
+                                    unsigned long long end) {
+    char hdr[128];
+    int hn;
+    if (!c || !g_repl_backlog.buf) return -1;
+    if (offset < g_repl_backlog.start_offset || offset > g_repl_backlog.end_offset) return -1;
+    if (end > g_repl_backlog.end_offset) end = g_repl_backlog.end_offset;
+    if (end < offset) end = offset;
+    hn = snprintf(hdr, sizeof(hdr), "+CONTINUE %s %llu\r\n", repl_master_id(), end);
+    repl_note_send_context("continue-header", (size_t)hn, offset, (unsigned char *)hdr);
+    if (repl_send_chunked(c, (unsigned char *)hdr, (size_t)hn) != 0) return -1;
+    repl_note_send_context("continue-backlog", (size_t)(end - offset), offset, g_repl_backlog.buf);
+    return repl_backlog_write_range_upto(c, offset, end);
+}
+
 int repl_backlog_send_continue(conn_t *c, unsigned long long offset) {
     char hdr[128];
     int hn;

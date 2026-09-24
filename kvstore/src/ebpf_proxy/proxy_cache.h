@@ -49,8 +49,14 @@ int cache_append(cache_ctx_t *ctx, const unsigned char *data, size_t len,
  * 直接释放并计入 dropped，永不跨 session 重放。返回发送条数，-1 表示参数错误。 */
 int cache_flush(cache_ctx_t *ctx, int fd, uint64_t session_id);
 
-/* 丢弃全部节点（session 结束 / 全量同步建立新边界时用） */
+/* 丢弃全部节点（session 结束 / 全量同步建立新边界时用）。
+ * 注意：不清 ctx->invalid —— "当前 session 已经坏了"这件事不能靠丢弃数据来解除。 */
 void cache_clear(cache_ctx_t *ctx);
+
+/* 新的 replication session 建立时调用：丢弃旧节点 **并** 清除 invalid。
+ * 必须与 cache_clear() 分开：只有"确认进入新 session"才允许解除作废状态，
+ * 否则一次 256MB 溢出会让整个 ebpf-proxy 生命周期都无法再正常 cache/flush。 */
+void cache_reset_for_new_session(cache_ctx_t *ctx);
 
 /* 是否超高水位（用于决定是否向上游发背压） */
 int cache_over_high(cache_ctx_t *ctx);

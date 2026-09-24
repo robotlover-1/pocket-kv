@@ -46,6 +46,8 @@ static cache_ctx_t g_cache;
 static uint64_t g_session_id = 0;
 static int g_session_valid = 0;
 static int g_cache_invalid_remote = 0;   /* client_ctl[10] 的本地影子 */
+/* 上一次处理过的 client_ctl[3] 值：屏障按边沿应答，避免重复清 cache / 漏应答 */
+static __u64 g_fs_req_seen = 0;
 
 /* ---- 跨线程安全 ----
  * g_state 用 g_state_lock 保护（主线程 set_state 写、转发线程 proxy_fwd_send_one
@@ -79,6 +81,12 @@ static int cache_flush_wrap(int fd) {
 static void cache_clear_wrap(void) {
     pthread_mutex_lock(&g_cache_lock);
     cache_clear(&g_cache);
+    pthread_mutex_unlock(&g_cache_lock);
+}
+/* 新 session 建立：清数据并且解除 invalid（否则一次溢出后终身不可用） */
+static void cache_reset_for_new_session_wrap(void) {
+    pthread_mutex_lock(&g_cache_lock);
+    cache_reset_for_new_session(&g_cache);
     pthread_mutex_unlock(&g_cache_lock);
 }
 /* 是否允许把 cache 刷给 Slave（§9）：控制面确认仍是同一个有效 session，
@@ -688,7 +696,12 @@ static void poll_session_state(void) {
                 "discarding previous session cache\n",
                 (unsigned long long)g_session_id, (unsigned long long)sid);
         g_session_id = (uint64_t)sid;
-        cache_clear_wrap();
+        /* 新 session：清数据 **并且** 解除 invalid。用 cache_clear_wrap 会留下
+         * invalid=1，导致一次 256MB 溢出之后整个进程再也不能 cache/flush（P0）。 */
+        if (sid != 0)
+            cache_reset_for_new_session_wrap();
+        else
+            cache_clear_wrap();
         proxy_fwd_drain_to_cache_or_discard();
     }
     g_session_valid = (int)valid;
@@ -773,35 +786,37 @@ static void main_loop(void) {
          * client_ctl[3] 由 master 进程在 queue_snapshot/REPLDONE 时写入:
          *   1 = 全量同步开始 → 切 BUFFERING
          *   0 = 全量同步结束 → flush 缓存 → 切 FORWARDING */
+        /* client_ctl[3] 是 master 的"屏障请求"，全量同步和 partial resync 都用它。
+         * 按**边沿**处理（而不是按 g_state 变化）：
+         *   - 升沿 0→1：切 BUFFERING、丢弃边界前数据、置 [12]=1 应答 master
+         *   - 降沿 1→0：切 FORWARDING、置 [12]=0、flush 本 session 的 cache
+         * 必须按边沿而不是"状态不等"来应答 —— master 每次都先把 [12] 清零再拉 [3]，
+         * 若这里只在自己"没在 BUFFERING"时才应答，第二次屏障就会永远等不到确认。 */
         __u64 fs_val = 0;
-        if (read_client_ctl_u64(3, &fs_val) == 0) {
-            if (fs_val == 1 && g_state == STATE_FORWARDING) {
+        if (read_client_ctl_u64(KVS_CTL_FULLSYNC_STATE, &fs_val) == 0) {
+            fs_val = (fs_val != 0) ? 1 : 0;
+            if (fs_val == 1 && g_fs_req_seen == 0) {
+                g_fs_req_seen = 1;
                 set_state(STATE_BUFFERING);
-                /* IMPORTANT 2: 清空转发队列剩余增量，防其穿插进全量同步流 */
+                /* 清空转发队列剩余增量，防其穿插进全量/追赶数据流 */
                 proxy_fwd_drain_to_cache_or_discard();
-                /* §6：同时丢弃上一个 session/边界之前的 proxy_cache —— 快照已经包含
-                 * 这些写，若留着再 flush 就是命令重复执行（INCR/DEL 等非幂等命令致命）。
-                 * 边界后缓存的数据必须带上本次 session 身份，故先把 SESSION_ID 取最新：
-                 * master 写 [9] 一定早于 [3]，此刻读到的必然是本 session 的 id。 */
-                {
-                    __u32 k9 = KVS_CTL_SESSION_ID;
-                    __u64 sid_now = 0;
-                    if (bpf_map_lookup_elem(g_client_ctl_fd, &k9, &sid_now) == 0)
-                        g_session_id = (uint64_t)sid_now;
-                }
-                cache_clear_wrap();
-                write_client_ctl_u64(CLIENT_CTL_KEY_PROXY_STATE, 1);  /* 确认 BUFFERING */
-                fprintf(stderr, "ebpf-proxy: fullsync start (client_ctl[3]=1), "
+                /* 边界前缓存的数据已由快照或 backlog replay 覆盖，留着再 flush 就是重复执行
+                 * （INCR/DEL 等非幂等命令致命）。同时解除 invalid：屏障本身就意味着
+                 * "catchup_end 之前的缺口会被补齐"，cache 从此可以重新开始累积。 */
+                cache_reset_for_new_session_wrap();
+                write_client_ctl_u64(CLIENT_CTL_KEY_PROXY_STATE, 1);  /* 应答：已 BUFFERING */
+                fprintf(stderr, "ebpf-proxy: barrier up (client_ctl[3]=1), "
                         "state=BUFFERING, old cache discarded\n");
-            } else if (fs_val == 0 && g_state == STATE_BUFFERING) {
+            } else if (fs_val == 0 && g_fs_req_seen == 1) {
+                g_fs_req_seen = 0;
                 set_state(STATE_FORWARDING);
                 write_client_ctl_u64(CLIENT_CTL_KEY_PROXY_STATE, 0);
                 if (cache_flush_allowed()) {
-                    fprintf(stderr, "ebpf-proxy: fullsync end (client_ctl[3]=0), "
+                    fprintf(stderr, "ebpf-proxy: barrier down (client_ctl[3]=0), "
                             "requesting cache flush...\n");
                     request_cache_flush();   /* fwd 线程（唯一 writer）刷 cache */
                 } else {
-                    fprintf(stderr, "ebpf-proxy: fullsync end but session invalid — "
+                    fprintf(stderr, "ebpf-proxy: barrier down but session invalid — "
                             "cache discarded, not flushed\n");
                     cache_clear_wrap();
                 }

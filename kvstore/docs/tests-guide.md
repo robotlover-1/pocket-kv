@@ -204,6 +204,7 @@ sudo  ./kvstore kvstore.conf --role slave
 | ------------------------------- | ----------------- | -------------------------------------------------------- |
 | `repl_session_id`               | 非 0（有 Slave）  | 当前 replication session 身份；每个新会话重新生成           |
 | `repl_session_valid`            | 1                 | 会话有效；0 表示最后一个 Slave 已离开（capture 已关闭）    |
+| `repl_proxy_barrier`            | 0（稳态）         | 1 表示正立着屏障：proxy 在 BUFFERING，此时不应有实时转发    |
 | `ebpf_capture_enabled`          | 1                 | `client_ctl[7]`：eBPF 正在捕获                              |
 | `ebpf_capture_off_count`        | 无 Slave 时增长、有 Slave 时冻结 | BPF 因 `CAPTURE_ENABLE=0` 直接返回的次数（预期行为，非错误）  |
 | `repl_backlog_contiguous`       | 1                 | backlog 历史相对 `master_repl_offset` 连续（可 partial resync） |

@@ -501,6 +501,14 @@ void repl_add_slave(conn_t *c);
 void repl_remove_slave(conn_t *c);
 int repl_handle_replica_send_failure(conn_t *c, conn_t **linkp);
 void repl_broadcast(const unsigned char *raw, size_t rawlen);
+/* ebpf-proxy 屏障（定义在 src/main/kvstore.c）：保证"绕过 proxy 直接补数据"的动作
+ * （FULLRESYNC 快照 / partial resync replay）与 proxy 的实时转发不会跨两条 TCP 连接重排。
+ *  - repl_barrier_pending(): 屏障是否仍立着
+ *  - repl_barrier_tick():    周期兜底放行，由 reactor 的定时块调用
+ *  - repl_barrier_note_applied(): Slave 的 REPLACK 反馈，追上 catchup_end 即放行 */
+int repl_barrier_pending(void);
+void repl_barrier_tick(void);
+void repl_barrier_note_applied(unsigned long long applied_offset);
 void repl_note_send_context(const char *stage, size_t len, unsigned long long offset, const unsigned char *buf);
 void repl_get_last_send_context(char *stage, size_t stage_cap, unsigned long long *len, unsigned long long *offset, char *preview, size_t preview_cap);
 int start_slave_thread(void);
@@ -535,6 +543,9 @@ void repl_note_fullsync(size_t snapshot_bytes);
 void repl_note_broadcast(size_t bytes);
 int repl_backlog_feed(const unsigned char *buf, size_t len);
 void repl_backlog_reset(unsigned long long base);
+/* partial resync 的有界 replay：只发 [offset, end)，end 取屏障时刻的 catchup_end */
+int repl_backlog_write_range_upto(conn_t *c, unsigned long long offset, unsigned long long end);
+int repl_backlog_send_continue_upto(conn_t *c, unsigned long long offset, unsigned long long end);
 unsigned long long repl_session_begin(void);
 void repl_session_end(void);
 unsigned long long repl_session_id(void);

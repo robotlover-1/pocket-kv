@@ -330,6 +330,9 @@ int reactor_start(void) {
             extern void repl_kprobe_fwd_health_check(void);
             repl_kprobe_fwd_health_check();
 #endif
+            /* ebpf-proxy 屏障兜底：Slave 长时间不 ack 时强制放行，避免增量永久停在
+             * BUFFERING（正常路径由 REPLACK 的 repl_barrier_note_applied 放行）。 */
+            repl_barrier_tick();
             g_last_expire = now;
         }
 

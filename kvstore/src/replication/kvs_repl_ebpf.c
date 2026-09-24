@@ -285,6 +285,10 @@ void repl_ebpf_cleanup(void) {
         close(g_repl_ebpf_backpressure_fd);
         g_repl_ebpf_backpressure_fd = -1;
     }
+    if (g_repl_ebpf_client_stats_fd >= 0) {
+        close(g_repl_ebpf_client_stats_fd);
+        g_repl_ebpf_client_stats_fd = -1;
+    }
     repl_ebpf_clear_fds();
 #endif
     g_repl_ebpf_initialized = 0;
@@ -469,7 +473,9 @@ int repl_ebpf_proxy_get_stats(kvs_ebpf_proxy_stats_t *stats) {
         snprintf(path, sizeof(path), "%s/client_ctl", g_cfg.ebpf_pin_path);
         g_repl_ebpf_backpressure_fd = bpf_obj_get(path);
     }
-    if (g_repl_ebpf_stats_map_fd < 0) {
+    /* 注意判断的是 client_stats 自己的 fd，不是 sockmap 的 stats fd ——
+     * 后者在 ebpf_enabled=0（默认）时恒为 -1，会让这里每次调用都重复 bpf_obj_get()。 */
+    if (g_repl_ebpf_client_stats_fd < 0) {
         char path[512];
         if (!g_cfg.ebpf_pin_path[0]) return -1;
         snprintf(path, sizeof(path), "%s/client_stats", g_cfg.ebpf_pin_path);

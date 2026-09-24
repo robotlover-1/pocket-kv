@@ -602,6 +602,40 @@ Master 检查（repl_backlog_can_continue）:
     → 发送 +FULLRESYNC → 全量同步
 ```
 
+**partial resync 也有 barrier（与 FULLRESYNC 同一套机制）：**
+
+backlog replay 走 master→slave 的**控制连接**，而 eBPF 实时转发走 proxy 的**另一条** TCP
+连接（slave 的 port+1）—— 两条连接之间没有顺序保证。不设屏障时：
+
+```text
+Slave 缺 [1000,1200)，master 正在 replay 旧命令 INCR a
+同时新客户端执行 DEL a，经 proxy 实时通道直达 Slave
+Slave 可能先收到 DEL a 再收到 INCR a → 最终状态错误
+```
+
+因此 partial resync 与 FULLRESYNC 共用 `repl_barrier_*`（client_ctl[3]/[12] 握手）：
+
+```text
+REPLSYNC offset=1000
+  → ① repl_barrier_begin(): 先让 proxy 进 BUFFERING 并等它确认
+  → ② repl_add_slave(): 此时才 CAPTURE_ENABLE=1（屏障必须早于开捕获，
+       否则屏障生效前捕获的写会被实时转发，与随后的 replay 重叠）
+  → ③ catchup_end = master_offset；replay [1000, catchup_end)
+  → ④ 等 Slave 的 REPLACK 报告 applied >= catchup_end 才放行（repl_barrier_release）
+       —— 保证 proxy flush cache 一定发生在 replay 数据被应用之后
+  → ⑤ proxy 切回 FORWARDING，flush proxy_cache，恢复实时转发
+```
+
+> ⚠️ **FULLRESYNC 的放行条件不同**：必须由 REPLDONE 触发，**不能**用
+> "applied >= catchup_end"。Slave 一收到 `+FULLRESYNC` 就把 applied 设成快照基准 offset，
+> 此时它还在往临时文件里写快照；若据此提前放行，proxy 会立刻 flush cache，而 Slave 正处于
+> `loading_fullsync` 状态——它会把收到的任何非控制行**当成 KVSD 字节写进快照文件**，
+> 直接损坏全量数据（实测报 `replay_dump_file: invalid engine_id 64 at pos 8`）。
+> 只有 REPLDONE 才代表"快照已加载完成"。
+>
+> 屏障握手失败（proxy 未确认 BUFFERING）一律 **fail-closed**：拒绝本次 resync 并
+> shutdown 写方向让 Slave 重连重试，绝不在无屏障的情况下让两条连接并行。
+
 **为什么必须查「连续性」：** `repl_backlog_feed()` 在无 Slave 时直接返回（不分配 / 不写入），
 但 `repl_note_broadcast()` 仍会推进 `master_repl_offset`。于是：
 
