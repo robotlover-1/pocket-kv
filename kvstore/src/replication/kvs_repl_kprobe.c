@@ -1120,6 +1120,11 @@ void repl_kprobe_fullsync_done(void) {
 void repl_kprobe_fwd_health_check(void) {
     time_t now = time(NULL);
 
+    /* 该检查只服务于 kprobe-rdma 实时转发。其他传输（tcp/rdma/ebpf+tcp）下
+     * kprobe 转发并不存在，若无条件把副本标记 fwd_healthy=1，repl_broadcast
+     * 会跳过正常 TCP 发送，增量复制直接静默中断。 */
+    if (strcasecmp(repl_realtime_transport_name(), "kprobe-rdma") != 0) return;
+
     /* 0. 增量传输日志: 定期写入 kvstore_transport.log */
     extern long long g_fwd_log_count;
     static long long last_logged = 0;

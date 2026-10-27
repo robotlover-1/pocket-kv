@@ -1351,7 +1351,10 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
          * req_durable may lag behind req_offset due to lazy AOF fsync,
          * but that doesn't prevent partial resync since the master
          * can replay from req_offset onward. */
-        int can_continue = (argc >= 3 && repl_backlog_can_continue(req_replid, req_offset));
+        /* backlog 必须覆盖到当前 master offset，否则 partial sync 会留下
+         * [backlog_end, master_offset) 的静默缺口；不满足时强制 full resync。 */
+        int can_continue = (argc >= 3 && repl_backlog_can_continue(req_replid, req_offset)
+                            && repl_backlog_end_offset() >= repl_master_offset());
         repl_rdma_log("master_replsync - req_replid=%s req_offset=%llu req_durable=%llu backlog_start=%llu backlog_end=%llu can_continue=%d",
             req_replid, req_offset, req_durable, repl_backlog_start_offset(), repl_backlog_end_offset(), can_continue ? 1 : 0);
         if (c && (!strcasecmp(g_cfg.repl_realtime_transport, "ebpf") || !strcasecmp(g_cfg.repl_realtime_transport, "sockmap")
@@ -1395,19 +1398,74 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
                 close(proxy_cfg_fd);
             }
         }
+        /* eBPF 增量依赖 proxy 捕获客户端请求；proxy 不健康时无法保证增量完整，
+         * 拒绝本次 REPLSYNC，让 slave 退避后重试（fail-closed）。 */
+        if (c && c->repl_transport_kind == KVS_REPL_TRANSPORT_EBPF_TCP
+            && !repl_ebpf_proxy_healthy()) {
+            fprintf(stderr, "repl: REPLSYNC rejected — ebpf-proxy unhealthy, slave will retry\n");
+            c->repl_draining = 1;
+            shutdown(c->fd, SHUT_RDWR);
+            return 0;
+        }
+
+        /* eBPF 副本恢复状态：先置位再入列，避免 health tick 在窗口期打开 capture */
+        if (c && c->repl_transport_kind == KVS_REPL_TRANSPORT_EBPF_TCP) {
+            c->repl_recovery_mode = can_continue ? 2 : 1;
+            c->repl_recovery_deadline_ms = kvs_now_ms() + (can_continue ? 10000 : 60000);
+            c->repl_capture_resume_offset = 0;
+        }
+
         repl_add_slave(c);
         repl_replica_update_ack(c, req_offset, req_durable);
         c->repl_fullsync_pending = can_continue ? 0 : 1;
 
         if (can_continue) {
             repl_note_partialsync_result(1);
-            repl_backlog_send_continue(c, req_offset);
+            int is_ebpf = (c->repl_transport_kind == KVS_REPL_TRANSPORT_EBPF_TCP);
+            if (is_ebpf) {
+                /* 先停捕获并让 proxy 进入 BUFFERING，再把 backlog 同步发完；
+                 * 随后才打开捕获（新写 > 当前 offset），由 proxy 缓存到追平后 flush。 */
+                repl_ebpf_set_capture_disable(1);
+                repl_notify_ebpf_proxy_fullsync(1);
+            }
+            if (repl_backlog_send_continue(c, req_offset) != 0) {
+                repl_rdma_log("master_replsync - continue backlog send failed");
+                repl_session_invalidate(REPL_INVALID_BARRIER_TIMEOUT);
+                c->repl_draining = 1;
+                return 0;
+            }
+            if (is_ebpf) {
+                if (!repl_ebpf_proxy_wait_buffering(100)) {
+                    fprintf(stderr, "repl: proxy did not enter BUFFERING, fail-closed\n");
+                    repl_session_invalidate(REPL_INVALID_BARRIER_TIMEOUT);
+                    c->repl_draining = 1;
+                    return 0;
+                }
+                c->repl_recovery_mode = 2;
+                c->repl_capture_resume_offset = repl_master_offset();
+                c->repl_recovery_deadline_ms = kvs_now_ms() + 10000;
+                repl_ebpf_set_capture_disable(0);
+            }
         } else {
             repl_note_partialsync_result(argc >= 3 ? 0 : 1);
             if (queue_snapshot(c) != 0) {
                 repl_rdma_log("master_replsync - queue_snapshot failed");
                 c->repl_draining = 1;
                 c->repl_fullsync_pending = 0;
+                if (c->repl_transport_kind == KVS_REPL_TRANSPORT_EBPF_TCP)
+                    repl_session_invalidate(REPL_INVALID_BARRIER_TIMEOUT);
+            } else if (c->repl_transport_kind == KVS_REPL_TRANSPORT_EBPF_TCP) {
+                /* 快照发送期间 reactor 阻塞、无新写；发送完成后确认 proxy 已 BUFFERING，
+                 * 再从当前 offset 起捕获（REPLDONE 时 flush）。 */
+                if (!repl_ebpf_proxy_wait_buffering(100)) {
+                    fprintf(stderr, "repl: proxy did not enter BUFFERING after snapshot, fail-closed\n");
+                    repl_session_invalidate(REPL_INVALID_BARRIER_TIMEOUT);
+                    c->repl_draining = 1;
+                    return 0;
+                }
+                c->repl_capture_resume_offset = repl_master_offset();
+                c->repl_recovery_deadline_ms = kvs_now_ms() + 60000;
+                repl_ebpf_set_capture_disable(0);
             }
         }
         return 0;
@@ -1442,6 +1500,21 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
                 }
             }
         }
+        /* eBPF 副本部分重同步：backlog 已在 REPLSYNC 时同步发完，等 slave 追平
+         * 到 capture 打开前的 offset，再让 proxy flush 缓存的增量。 */
+        if (c && c->repl_transport_kind == KVS_REPL_TRANSPORT_EBPF_TCP
+            && c->repl_recovery_mode == 2) {
+            if (applied_offset >= c->repl_capture_resume_offset) {
+                c->repl_recovery_mode = 0;
+                c->repl_recovery_deadline_ms = 0;
+                if (!repl_capture_gate_blocked())
+                    repl_notify_ebpf_proxy_fullsync(0);
+                fprintf(stderr, "repl: ebpf replica caught up at %llu, capture resumed\n",
+                        applied_offset);
+            } else {
+                c->repl_recovery_deadline_ms = kvs_now_ms() + 10000;
+            }
+        }
         return 0;
     }
     if (!strcmp(cmd, "REPLDONE")) {
@@ -1449,6 +1522,15 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         if (g_cfg.role == ROLE_MASTER && c && c->is_replica) {
             c->repl_fullsync_pending = 0;
             g_repl_fullsync_in_progress = 0;
+
+            /* eBPF 副本：快照发送完成后才开启捕获，缓存增量全部 > snap_base，
+             * REPLDONE 时 flush 顺序正确（快照 → 缓存增量）。 */
+            if (c->repl_transport_kind == KVS_REPL_TRANSPORT_EBPF_TCP) {
+                c->repl_recovery_mode = 0;
+                c->repl_recovery_deadline_ms = 0;
+                if (c->repl_capture_resume_offset < repl_master_offset())
+                    c->repl_capture_resume_offset = repl_master_offset();
+            }
 
             /* 通知 ebpf-proxy 全量同步结束，flush 缓存 → 恢复 FORWARDING */
             repl_notify_ebpf_proxy_fullsync(0);
@@ -1525,9 +1607,11 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         char recover[1024] = {0};
         kvs_repl_ebpf_stats_t ebpf_stats;
         kvs_repl_kprobe_stats_t kprobe_stats;
+        kvs_repl_proxy_stats_t px_stats;
         int recover_n = persist_build_recover_text(recover, sizeof(recover));
         repl_ebpf_get_stats(&ebpf_stats);
         repl_kprobe_rdma_get_stats(&kprobe_stats);
+        repl_ebpf_proxy_get_stats(&px_stats);
 
         unsigned long long max_replica_applied = 0;
         unsigned long long max_replica_durable = 0;
@@ -1565,6 +1649,19 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             "repl_partialsync_err_count:%llu\n"
             "repl_broadcast_bytes:%llu\n"
             "repl_snapshot_bytes:%llu\n"
+            "repl_capture_active:%d\n"
+            "repl_proxy_healthy:%d\n"
+            "repl_proxy_restart_count:%llu\n"
+            "repl_session_invalid_count:%llu\n"
+            "repl_last_invalid_reason:%s\n"
+            "repl_capture_events:%llu\n"
+            "repl_capture_bytes:%llu\n"
+            "repl_capture_truncated:%llu\n"
+            "repl_forwarded_bytes:%llu\n"
+            "repl_proxy_pending_bytes:%llu\n"
+            "repl_proxy_cache_bytes:%llu\n"
+            "repl_proxy_dropped_bytes:%llu\n"
+            "repl_proxy_reconnects:%llu\n"
             "repl_backlog_size:%llu\n"
             "repl_backlog_histlen:%llu\n"
             "repl_backlog_start_offset:%llu\n"
@@ -1643,6 +1740,19 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             repl_partialsync_err_count(),
             repl_broadcast_bytes(),
             repl_snapshot_bytes(),
+            repl_ebpf_capture_active(),
+            repl_ebpf_proxy_healthy(),
+            repl_ebpf_proxy_restart_count(),
+            repl_session_invalid_count(),
+            repl_last_invalid_reason_name(),
+            px_stats.capture_events,
+            px_stats.capture_bytes,
+            px_stats.capture_truncated,
+            px_stats.forwarded_bytes,
+            px_stats.pending_bytes,
+            px_stats.cache_bytes,
+            px_stats.dropped_bytes,
+            px_stats.proxy_reconnects,
             repl_backlog_size(),
             repl_backlog_histlen(),
             repl_backlog_start_offset(),
@@ -2898,35 +3008,6 @@ int kvs_dump_to_fd(int fd, unsigned long long aof_offset) {
     return 0;
 }
 
-/* master 启动时 spawn 独立的 ebpf-proxy 进程（仍单独进程，但无需手动启动）。
- * 若 proxy_cfg map 已 pin（proxy 已由外部手动启动），不重复 spawn。
- * ebpf-proxy 需 root 加载 BPF，由 master（sudo 启动）fork 出的子进程继承 root 权限。 */
-static int spawn_ebpf_proxy(void) {
-    if (!g_cfg.ebpf_proxy_bin[0] || !g_cfg.ebpf_client_capture_obj[0]) return 0;
-
-    char cfg_path[512];
-    snprintf(cfg_path, sizeof(cfg_path), "%s/proxy_cfg", g_cfg.ebpf_pin_path);
-    int fd = bpf_obj_get(cfg_path);
-    if (fd >= 0) { close(fd); return 0; }   /* ebpf-proxy 已在跑 */
-
-    pid_t pid;
-    char *argv[] = {
-        (char *)g_cfg.ebpf_proxy_bin,
-        "--pin-path", (char *)g_cfg.ebpf_pin_path,
-        "--obj-path", (char *)g_cfg.ebpf_client_capture_obj,
-        NULL,
-    };
-    int rc = posix_spawn(&pid, g_cfg.ebpf_proxy_bin, NULL, NULL, argv, environ);
-    if (rc != 0) {
-        fprintf(stderr, "master: spawn ebpf-proxy failed (%s) — eBPF+tcp 增量将不可用，"
-                        "可手动启动 %s\n", strerror(rc), g_cfg.ebpf_proxy_bin);
-        return -1;
-    }
-    fprintf(stderr, "master: spawned ebpf-proxy pid=%d (bin=%s pin=%s obj=%s)\n",
-            (int)pid, g_cfg.ebpf_proxy_bin, g_cfg.ebpf_pin_path, g_cfg.ebpf_client_capture_obj);
-    return 0;
-}
-
 static void *ebpf_proxy_init_bg(void *arg) {
     (void)arg;
     int proxy_cfg_fd = -1;
@@ -3028,8 +3109,9 @@ int main(int argc, char **argv) {
     /* eBPF+tcp 增量：master 启动时自动拉起独立的 ebpf-proxy 进程（无需手动启动），
      * 随后后台线程向 proxy_cfg map 写入 master 配置。 */
     if (g_cfg.role == ROLE_MASTER) {
-        if (strstr(g_cfg.repl_realtime_transport, "ebpf"))
-            spawn_ebpf_proxy();
+        /* spawn + 健康监控：proxy 崩溃/心跳过期/截断时自动失效会话并重启 */
+        repl_ebpf_proxy_start();
+        repl_ebpf_health_start();
         pthread_t tid;
         pthread_create(&tid, NULL, ebpf_proxy_init_bg, NULL);
         pthread_detach(tid);

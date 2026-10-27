@@ -28,6 +28,11 @@
 #define RB_HIGH_WATERMARK         (32u * 1024 * 1024)   /* 置位：可用数据 ≥32MB */
 #define RB_LOW_WATERMARK          (8u * 1024 * 1024)    /* 清除：可用数据 ≤8MB */
 #define RB_WAKE_THRESHOLD         (8u * 1024 * 1024)    /* 自适应唤醒阈值 */
+/* capture gate（client_ctl）：
+ *   7 = capture_disable：1 表示 Master/proxy 故障恢复期间停止捕获（0=允许）
+ *   8 = capture_fault：  1 表示检测到截断/不可信捕获，需要 fail-closed 重同步 */
+#define CTL_KEY_CAPTURE_DISABLE   7
+#define CTL_KEY_CAPTURE_FAULT     8
 /* bpf_ringbuf_output/query 标志（linux/bpf.h 未导出这些宏） */
 #ifndef BPF_RB_NO_WAKEUP
 #define BPF_RB_NO_WAKEUP 1
@@ -57,10 +62,12 @@ struct iov_head {
 #define ST_USER_FAIL  5   /* bpf_probe_read_user 读数据失败 */
 #define ST_RB_OK      6   /* ringbuf_output 成功 */
 #define ST_RB_DROP    7   /* ringbuf_output 失败（ringbuf 满，应被主进程背压避免） */
+#define ST_TRUNCATED  8   /* retval > CLIENT_ENTRY_MAX_LEN，记录被丢弃并置 fault */
+#define ST_BYTES      9   /* 成功写入 ringbuf 的 payload 字节数 */
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 8);
+    __uint(max_entries, 16);
     __type(key, __u32);
     __type(value, __u64);
 } client_ctl SEC(".maps");
@@ -83,6 +90,20 @@ static __always_inline void cstat_inc(__u32 k) {
     __u64 *v = bpf_map_lookup_elem(&client_stats, &k);
     if (v) __sync_fetch_and_add(v, 1);
 }
+
+static __always_inline void cstat_add(__u32 k, __u64 n) {
+    __u64 *v = bpf_map_lookup_elem(&client_stats, &k);
+    if (v) __sync_fetch_and_add(v, n);
+}
+
+/* ebpf-proxy 侧统计（用户态写、Master 读 INFO 用）。
+ * 键定义与 src/ebpf_proxy/main.c 的 PST_* 保持一致。 */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 16);
+    __type(key, __u32);
+    __type(value, __u64);
+} proxy_stats SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -110,6 +131,17 @@ int fexit_tcp_recvmsg(__u64 *ctx)
     if (pid != (__u32)(*ctl_pid))
         return 0;
 
+    /* capture gate：故障恢复期间或已检测到不可信截断时停止捕获，
+     * 由 Master 触发 REPLSYNC 从可信边界重建，不做截断续传。 */
+    __u32 gate_key = CTL_KEY_CAPTURE_DISABLE;
+    __u64 *gate = bpf_map_lookup_elem(&client_ctl, &gate_key);
+    if (gate && *gate)
+        return 0;
+    __u32 fault_key = CTL_KEY_CAPTURE_FAULT;
+    __u64 *fault = bpf_map_lookup_elem(&client_ctl, &fault_key);
+    if (fault && *fault)
+        return 0;
+
     cstat_inc(ST_HIT);
 
     /* tcp_recvmsg 5 参数（sk,msg,len,flags,addr_len），BPF trampoline 把返回值放 ctx[5]。
@@ -119,8 +151,14 @@ int fexit_tcp_recvmsg(__u64 *ctx)
         cstat_inc(ST_RETVAL_LE0);
         return 0;
     }
-    if (retval > CLIENT_ENTRY_MAX_LEN)
-        retval = CLIENT_ENTRY_MAX_LEN;
+    /* fail-closed：超过单 record 上限时不截断输出（截断会让 slave 收到残缺命令/丢字节），
+     * 记录 stats 并置 fault，由 Master 使当前复制会话失效并重同步。 */
+    if (retval > CLIENT_ENTRY_MAX_LEN) {
+        cstat_inc(ST_TRUNCATED);
+        __u64 one = 1;
+        bpf_map_update_elem(&client_ctl, &fault_key, &one, BPF_ANY);
+        return 0;
+    }
 
     unsigned long msg_ptr = (unsigned long)ctx[1];
     if (!msg_ptr)
@@ -198,6 +236,7 @@ int fexit_tcp_recvmsg(__u64 *ctx)
         cstat_inc(ST_RB_DROP);
     } else {
         cstat_inc(ST_RB_OK);
+        cstat_add(ST_BYTES, (__u64)data_len);
     }
     return 0;
 }

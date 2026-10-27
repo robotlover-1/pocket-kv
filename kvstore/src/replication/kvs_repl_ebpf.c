@@ -1,10 +1,15 @@
 #include "kvstore/kvstore.h"
 #include <strings.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <signal.h>
 
 #if KVS_ENABLE_EBPF
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #endif
+
+extern char **environ;
 
 static int g_repl_ebpf_initialized = 0;
 static unsigned long long g_repl_ebpf_register_attempts = 0;
@@ -39,6 +44,28 @@ int repl_ebpf_capture_active(void) {
 void repl_ebpf_set_capture_active(int on) {
     g_repl_ebpf_capture_active_init = 1;
     g_repl_ebpf_capture_active = on ? 1 : 0;
+}
+
+/* 同步写 BPF capture gate（client_ctl[7]）并更新进程内状态。
+ * REPLSYNC/失效路径需要立即生效，不能等 100ms 健康线程。 */
+void repl_ebpf_set_capture_disable(int disable) {
+    unsigned int key = 7;   /* CTL_KEY_CAPTURE_DISABLE */
+    unsigned long long val = disable ? 1 : 0;
+    int fd = -1;
+#if KVS_ENABLE_EBPF
+    if (g_cfg.ebpf_pin_path[0]) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/client_ctl", g_cfg.ebpf_pin_path);
+        fd = bpf_obj_get(path);
+        if (fd >= 0) {
+            bpf_map_update_elem(fd, &key, &val, BPF_ANY);
+            close(fd);
+        }
+    }
+#else
+    (void)key; (void)val; (void)fd;
+#endif
+    repl_ebpf_set_capture_active(disable ? 0 : 1);
 }
 
 #if KVS_ENABLE_EBPF
@@ -457,6 +484,358 @@ int repl_ebpf_backpressure(void) {
 #else
     return 0;
 #endif
+}
+
+/* ============================================================
+ * ebpf-proxy 生命周期与健康检查（阶段2）
+ *
+ * client_ctl 键（与 repl_client_capture.bpf.c 一致）：
+ *   1=master pid  2=master port  3=fullsync  4=ringbuf 背压  5=heartbeat
+ *   6=转发队列背压  7=capture_disable  8=capture_fault
+ * capture_disable=1 时 BPF 停止捕获；proxy 观察同一键后丢弃已捕获数据。
+ * 心跳每 100ms 推进一次，2s 不推进即判定 proxy 失活。
+ * ============================================================ */
+#define EBPF_CTL_KEY_MASTER_PID        1
+#define EBPF_CTL_KEY_MASTER_PORT       2
+#define EBPF_CTL_KEY_HEARTBEAT         5
+#define EBPF_CTL_KEY_CAPTURE_DISABLE   7
+#define EBPF_CTL_KEY_CAPTURE_FAULT     8
+#define EBPF_CLIENT_STATS_EVENTS       6   /* ST_RB_OK */
+#define EBPF_CLIENT_STATS_BYTES        9   /* ST_BYTES */
+#define EBPF_CLIENT_STATS_TRUNCATED    8   /* ST_TRUNCATED */
+#define PROXY_HEARTBEAT_STALE_MS       2000
+#define PROXY_RESPAWN_COOLDOWN_MS      5000
+
+static pid_t g_ebpf_proxy_pid = -1;
+static long long g_ebpf_proxy_last_spawn_ms = 0;
+static unsigned long long g_ebpf_proxy_restart_count = 0;
+static unsigned long long g_ebpf_hb_last = 0;
+static long long g_ebpf_hb_last_ms = 0;
+static int g_ebpf_proxy_healthy = 0;
+static int g_ebpf_proxy_ever_healthy = 0;
+static int g_ebpf_failure_handled = 0;
+static volatile int g_ebpf_health_stop = 0;
+
+static int repl_ebpf_is_capture_transport(void) {
+    return g_cfg.role == ROLE_MASTER &&
+           strstr(g_cfg.repl_realtime_transport, "ebpf") != NULL;
+}
+
+static int ebpf_ctl_open(void) {
+#if KVS_ENABLE_EBPF
+    char path[512];
+    if (!g_cfg.ebpf_pin_path[0]) return -1;
+    snprintf(path, sizeof(path), "%s/client_ctl", g_cfg.ebpf_pin_path);
+    return bpf_obj_get(path);
+#else
+    return -1;
+#endif
+}
+
+static int ebpf_ctl_read(unsigned int key, unsigned long long *out) {
+#if KVS_ENABLE_EBPF
+    int fd = ebpf_ctl_open();
+    if (fd < 0) return -1;
+    int rc = bpf_map_lookup_elem(fd, &key, out);
+    close(fd);
+    return rc;
+#else
+    (void)key; (void)out;
+    return -1;
+#endif
+}
+
+static int ebpf_ctl_write(unsigned int key, unsigned long long val) {
+#if KVS_ENABLE_EBPF
+    int fd = ebpf_ctl_open();
+    if (fd < 0) return -1;
+    int rc = bpf_map_update_elem(fd, &key, &val, BPF_ANY);
+    close(fd);
+    return rc;
+#else
+    (void)key; (void)val;
+    return -1;
+#endif
+}
+
+static void repl_ebpf_reset_backpressure_cache(void) {
+    if (g_repl_ebpf_backpressure_fd >= 0) {
+        close(g_repl_ebpf_backpressure_fd);
+        g_repl_ebpf_backpressure_fd = -1;
+    }
+    g_repl_ebpf_backpressure_enabled = -1;
+    g_repl_ebpf_last_hb = 0;
+    g_repl_ebpf_last_hb_ms = 0;
+    g_repl_ebpf_bp_check_ms = 0;
+    g_repl_ebpf_bp_cached = 0;
+}
+
+static void ebpf_proxy_pidfile_path(char *out, size_t cap) {
+    const char *base = g_cfg.dump_path[0] ? g_cfg.dump_path : "/tmp/kvstore";
+    snprintf(out, cap, "%s.ebpfproxy.pid", base);
+}
+
+static pid_t ebpf_proxy_read_pidfile(void) {
+    char path[512];
+    FILE *fp;
+    int pid = -1;
+    ebpf_proxy_pidfile_path(path, sizeof(path));
+    fp = fopen(path, "r");
+    if (!fp) return -1;
+    if (fscanf(fp, "%d", &pid) != 1) pid = -1;
+    fclose(fp);
+    return (pid_t)pid;
+}
+
+/* 回收自己 spawn 的子进程；返回 1 表示仍存活。 */
+static int ebpf_proxy_child_alive(void) {
+    int status = 0;
+    pid_t r;
+    if (g_ebpf_proxy_pid <= 0) return 0;
+    r = waitpid(g_ebpf_proxy_pid, &status, WNOHANG);
+    if (r == g_ebpf_proxy_pid) {
+        g_ebpf_proxy_pid = -1;
+        return 0;
+    }
+    if (r == 0) return 1;
+    if (r < 0 && errno == ECHILD) return kill(g_ebpf_proxy_pid, 0) == 0;
+    return 0;
+}
+
+/* 已有活 proxy 检测（手动启动/上一次 master 退出后残留）：心跳在 200ms 内推进。 */
+static int ebpf_proxy_heartbeat_live(void) {
+    unsigned long long h1 = 0, h2 = 0;
+    if (ebpf_ctl_read(EBPF_CTL_KEY_HEARTBEAT, &h1) != 0) return 0;
+    usleep(200000);
+    if (ebpf_ctl_read(EBPF_CTL_KEY_HEARTBEAT, &h2) != 0) return 0;
+    return h2 != h1;
+}
+
+static void ebpf_proxy_kill(void) {
+    pid_t pid = g_ebpf_proxy_pid;
+    if (pid <= 0) pid = ebpf_proxy_read_pidfile();
+    if (pid <= 0) return;
+    if (kill(pid, 0) != 0) {
+        if (pid == g_ebpf_proxy_pid) g_ebpf_proxy_pid = -1;
+        return;
+    }
+    fprintf(stderr, "repl: killing stale ebpf-proxy pid=%d\n", (int)pid);
+    kill(pid, SIGKILL);
+    if (pid == g_ebpf_proxy_pid) {
+        waitpid(pid, NULL, 0);
+        g_ebpf_proxy_pid = -1;
+    } else {
+        for (int i = 0; i < 50; ++i) {
+            if (kill(pid, 0) != 0) break;
+            usleep(20000);
+        }
+    }
+}
+
+static void ebpf_proxy_spawn(void) {
+    char pidfile[512], portbuf[32], masterbuf[32];
+    pid_t pid = -1;
+    int rc;
+    long long now;
+
+    if (!g_cfg.ebpf_proxy_bin[0] || !g_cfg.ebpf_client_capture_obj[0]) return;
+    if (ebpf_proxy_child_alive()) return;            /* 自己的子进程还活着 */
+    if (ebpf_proxy_heartbeat_live()) {               /* 外部启动的 proxy 活着，避免双 attach */
+        fprintf(stderr, "repl: ebpf-proxy already running (external), skip spawn\n");
+        return;
+    }
+    now = kvs_now_ms();
+    if (now - g_ebpf_proxy_last_spawn_ms < PROXY_RESPAWN_COOLDOWN_MS) return;
+
+    ebpf_proxy_pidfile_path(pidfile, sizeof(pidfile));
+    snprintf(masterbuf, sizeof(masterbuf), "%d", (int)getpid());
+    snprintf(portbuf, sizeof(portbuf), "%d", g_cfg.port);
+
+    char *argv[] = {
+        (char *)g_cfg.ebpf_proxy_bin,
+        (char *)"--pin-path", (char *)g_cfg.ebpf_pin_path,
+        (char *)"--obj-path", (char *)g_cfg.ebpf_client_capture_obj,
+        (char *)"--master-pid", masterbuf,
+        (char *)"--master-port", portbuf,
+        (char *)"--pid-file", pidfile,
+        NULL
+    };
+    rc = posix_spawn(&pid, g_cfg.ebpf_proxy_bin, NULL, NULL, argv, environ);
+    g_ebpf_proxy_last_spawn_ms = now;
+    if (rc != 0) {
+        fprintf(stderr, "repl: spawn ebpf-proxy failed (%s) — eBPF+tcp 增量不可用\n",
+                strerror(rc));
+        return;
+    }
+    g_ebpf_proxy_pid = pid;
+    g_ebpf_proxy_restart_count++;
+    g_ebpf_proxy_healthy = 0;
+    g_ebpf_failure_handled = 0;
+    repl_ebpf_reset_backpressure_cache();
+    fprintf(stderr, "repl: spawned ebpf-proxy pid=%d (restarts=%llu)\n",
+            (int)pid, g_ebpf_proxy_restart_count);
+}
+
+int repl_ebpf_proxy_healthy(void) {
+    if (!repl_ebpf_is_capture_transport()) return 1;
+    return g_ebpf_proxy_healthy;
+}
+
+unsigned long long repl_ebpf_proxy_restart_count(void) {
+    return g_ebpf_proxy_restart_count;
+}
+
+/* REPLSYNC 在 backlog/snapshot 发送完成后调用：等 proxy 真正切到 BUFFERING，
+ * 之后才允许重新打开 capture，保证新捕获的增量一定进入 cache 而不是直接下送。 */
+int repl_ebpf_proxy_wait_buffering(int timeout_ms) {
+    unsigned long long st = 0;
+    int waited = 0;
+    if (!repl_ebpf_is_capture_transport()) return 1;
+    if (timeout_ms < 0) timeout_ms = 0;
+    while (waited <= timeout_ms) {
+        if (ebpf_ctl_read(9 /* CLIENT_CTL_KEY_PROXY_STATE */, &st) == 0 && st == 1)
+            return 1;
+        usleep(2000);
+        waited += 2;
+    }
+    return 0;
+}
+
+static void repl_ebpf_health_tick(void) {
+    long long now;
+    unsigned long long hb = 0, fault = 0;
+    int hb_ok;
+
+    if (!repl_ebpf_is_capture_transport()) return;
+    now = kvs_now_ms();
+
+    /* 子进程回收 + 心跳新鲜度（外部 proxy 也以心跳为准） */
+    (void)ebpf_proxy_child_alive();
+    hb_ok = (ebpf_ctl_read(EBPF_CTL_KEY_HEARTBEAT, &hb) == 0);
+    if (hb_ok) {
+        if (hb != g_ebpf_hb_last) {
+            g_ebpf_hb_last = hb;
+            g_ebpf_hb_last_ms = now;
+        }
+        g_ebpf_proxy_healthy = (now - g_ebpf_hb_last_ms) <= PROXY_HEARTBEAT_STALE_MS;
+    } else {
+        g_ebpf_proxy_healthy = 0;
+    }
+    if (g_ebpf_proxy_healthy) {
+        g_ebpf_proxy_ever_healthy = 1;
+        g_ebpf_failure_handled = 0;
+    }
+
+    /* 恢复超时（fullsync/追赶卡住）→ 再次失效 */
+    repl_recovery_tick();
+
+    /* BPF 截断 fail-closed */
+    if (g_ebpf_proxy_healthy && ebpf_ctl_read(EBPF_CTL_KEY_CAPTURE_FAULT, &fault) == 0 && fault) {
+        ebpf_ctl_write(EBPF_CTL_KEY_CAPTURE_DISABLE, 1);
+        repl_ebpf_set_capture_active(0);
+        repl_session_invalidate(REPL_INVALID_CAPTURE_TRUNCATED);
+        ebpf_ctl_write(EBPF_CTL_KEY_CAPTURE_FAULT, 0);   /* 已 fail-closed，proxy 靠 disable 丢弃 */
+        g_ebpf_failure_handled = 1;
+        fprintf(stderr, "repl: capture truncated → replication session invalidated\n");
+    }
+
+    if (!g_ebpf_proxy_healthy) {
+        /* proxy 失活：关 capture → 失效副本会话 → 冷却后重启 proxy */
+        ebpf_ctl_write(EBPF_CTL_KEY_CAPTURE_DISABLE, 1);
+        repl_ebpf_set_capture_active(0);
+        if ((g_ebpf_proxy_ever_healthy || repl_capture_gate_has_replica()) &&
+            !g_ebpf_failure_handled) {
+            repl_session_invalidate(REPL_INVALID_PROXY_HEARTBEAT_STALE);
+            g_ebpf_failure_handled = 1;
+        }
+        if (now - g_ebpf_proxy_last_spawn_ms >= PROXY_RESPAWN_COOLDOWN_MS) {
+            ebpf_proxy_kill();
+            ebpf_proxy_spawn();
+        }
+        return;
+    }
+
+    /* proxy 健康：非恢复期由健康线程统一开关 capture；恢复期（REPLSYNC 追赶）
+     * 由 REPLSYNC 在确认 proxy 已 BUFFERING 后自行打开，这里不能覆盖。 */
+    if (!repl_capture_gate_blocked()) {
+        int gate = repl_capture_gate_has_replica();
+        ebpf_ctl_write(EBPF_CTL_KEY_CAPTURE_DISABLE, gate ? 0 : 1);
+        repl_ebpf_set_capture_active(gate);
+        if (gate) ebpf_ctl_write(EBPF_CTL_KEY_CAPTURE_FAULT, 0);
+    }
+}
+
+static void *repl_ebpf_health_thread(void *arg) {
+    (void)arg;
+    while (!g_ebpf_health_stop) {
+        repl_ebpf_health_tick();
+        usleep(100000);
+    }
+    return NULL;
+}
+
+void repl_ebpf_proxy_start(void) {
+    if (!repl_ebpf_is_capture_transport()) return;
+    ebpf_proxy_spawn();
+    /* master 重启后 proxy 可能还活着：刷新它使用的 pid/port（BPF pid 过滤键）。 */
+    ebpf_ctl_write(EBPF_CTL_KEY_MASTER_PID, (unsigned long long)getpid());
+    ebpf_ctl_write(EBPF_CTL_KEY_MASTER_PORT, (unsigned long long)g_cfg.port);
+}
+
+void repl_ebpf_health_start(void) {
+    pthread_t tid;
+    if (!repl_ebpf_is_capture_transport()) return;
+    if (pthread_create(&tid, NULL, repl_ebpf_health_thread, NULL) != 0) {
+        fprintf(stderr, "repl: failed to start ebpf-proxy health thread\n");
+        return;
+    }
+    pthread_detach(tid);
+    fprintf(stderr, "repl: ebpf-proxy health monitor started\n");
+}
+
+/* INFO：读取 pinned client_stats / proxy_stats（INFO 低频，直接开/关 map）。 */
+int repl_ebpf_proxy_get_stats(kvs_repl_proxy_stats_t *out) {
+    if (!out) return -1;
+    memset(out, 0, sizeof(*out));
+#if KVS_ENABLE_EBPF
+    if (g_cfg.ebpf_pin_path[0]) {
+        char path[512];
+        unsigned int k;
+        unsigned long long v = 0;
+
+        snprintf(path, sizeof(path), "%s/client_stats", g_cfg.ebpf_pin_path);
+        int fd = bpf_obj_get(path);
+        if (fd >= 0) {
+            k = EBPF_CLIENT_STATS_EVENTS;
+            if (bpf_map_lookup_elem(fd, &k, &v) == 0) out->capture_events = v;
+            k = EBPF_CLIENT_STATS_BYTES;
+            if (bpf_map_lookup_elem(fd, &k, &v) == 0) out->capture_bytes = v;
+            k = EBPF_CLIENT_STATS_TRUNCATED;
+            if (bpf_map_lookup_elem(fd, &k, &v) == 0) out->capture_truncated = v;
+            close(fd);
+        }
+        snprintf(path, sizeof(path), "%s/proxy_stats", g_cfg.ebpf_pin_path);
+        fd = bpf_obj_get(path);
+        if (fd >= 0) {
+            k = 0;
+            if (bpf_map_lookup_elem(fd, &k, &v) == 0) out->forwarded_bytes = v;
+            k = 1;
+            if (bpf_map_lookup_elem(fd, &k, &v) == 0) out->enqueued_bytes = v;
+            k = 2;
+            if (bpf_map_lookup_elem(fd, &k, &v) == 0) out->pending_bytes = v;
+            k = 3;
+            if (bpf_map_lookup_elem(fd, &k, &v) == 0) out->cache_bytes = v;
+            k = 4;
+            if (bpf_map_lookup_elem(fd, &k, &v) == 0) out->dropped_bytes = v;
+            k = 5;
+            if (bpf_map_lookup_elem(fd, &k, &v) == 0) out->proxy_reconnects = v;
+            k = 6;
+            if (bpf_map_lookup_elem(fd, &k, &v) == 0) out->capture_drop = (int)v;
+            close(fd);
+        }
+    }
+#endif
+    return 0;
 }
 
 int repl_ebpf_get_stats(kvs_repl_ebpf_stats_t *stats) {

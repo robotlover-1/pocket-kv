@@ -2355,8 +2355,11 @@ static int ensure_repl_backlog(void) {
 int repl_backlog_feed(const unsigned char *buf, size_t len) {
     pthread_mutex_lock(&g_backlog_lock);
     if (!buf || len == 0) { pthread_mutex_unlock(&g_backlog_lock); return 0; }
-    /* 无 slave 连接时不分配 backlog，节省 10 MB */
-    if (!g_replicas) { pthread_mutex_unlock(&g_backlog_lock); return 0; }
+    /* 无 slave 且从未建立过 backlog 时不分配（独立 master 省 10MB）。
+     * 一旦 backlog 已存在就必须继续 feed：slave 断开期间 master 仍在写入，
+     * 若此时停止 feed，重连 partial sync 只能补到旧的 end_offset，断开期间的
+     * 写入会静默丢失（backlog_end < master_offset 的缺口无法被 REPLSYNC 覆盖）。 */
+    if (!g_replicas && !g_repl_backlog.buf) { pthread_mutex_unlock(&g_backlog_lock); return 0; }
     if (ensure_repl_backlog() != 0) { pthread_mutex_unlock(&g_backlog_lock); return -1; }
     if (len >= g_repl_backlog.cap) {
         buf += len - g_repl_backlog.cap;
@@ -3348,6 +3351,98 @@ unsigned long long repl_slave_recovered_frontier(void) {
 
 unsigned long long repl_slave_resume_offset(void) {
     return g_slave_resume_offset;
+}
+
+/* ---- eBPF 会话失效 / recovery gate（阶段2） ---- */
+static unsigned long long g_repl_session_invalid_count = 0;
+static int g_repl_last_invalid_reason = REPL_INVALID_NONE;
+
+const char *repl_invalid_reason_name(repl_invalid_reason_t reason) {
+    switch (reason) {
+    case REPL_INVALID_PROXY_HEARTBEAT_STALE: return "PROXY_HEARTBEAT_STALE";
+    case REPL_INVALID_CAPTURE_TRUNCATED:     return "CAPTURE_TRUNCATED";
+    case REPL_INVALID_COMMIT_TIMEOUT:        return "COMMIT_TIMEOUT";
+    case REPL_INVALID_PROXY_CACHE_FULL:      return "PROXY_CACHE_FULL";
+    case REPL_INVALID_BARRIER_TIMEOUT:       return "BARRIER_TIMEOUT";
+    case REPL_INVALID_NONE:                  break;
+    }
+    return "NONE";
+}
+
+const char *repl_last_invalid_reason_name(void) {
+    return repl_invalid_reason_name((repl_invalid_reason_t)g_repl_last_invalid_reason);
+}
+
+unsigned long long repl_session_invalid_count(void) {
+    return __atomic_load_n(&g_repl_session_invalid_count, __ATOMIC_RELAXED);
+}
+
+void repl_session_invalidate(repl_invalid_reason_t reason) {
+    if (reason != REPL_INVALID_NONE) {
+        __atomic_add_fetch(&g_repl_session_invalid_count, 1, __ATOMIC_RELAXED);
+        g_repl_last_invalid_reason = (int)reason;
+        fprintf(stderr, "repl: session invalidated reason=%s\n",
+                repl_invalid_reason_name(reason));
+    }
+    /* 捕获数据已不可信：先停 capture，避免失效窗口继续产生新数据 */
+    repl_ebpf_set_capture_disable(1);
+
+    /* 只影响 eBPF 增量副本；shutdown 唤醒 reactor 的 recv 并走正常关闭路径。
+     * slave 侧控制连接断开后会自动重连并 REPLSYNC。 */
+    pthread_mutex_lock(&g_repl_lock);
+    for (conn_t *c = g_replicas; c; c = c->next_replica) {
+        if (c->repl_transport_kind != KVS_REPL_TRANSPORT_EBPF_TCP) continue;
+        c->repl_draining = 1;
+        c->repl_recovery_mode = 0;
+        if (c->fd >= 0) shutdown(c->fd, SHUT_RDWR);
+    }
+    pthread_mutex_unlock(&g_repl_lock);
+}
+
+int repl_capture_gate_has_replica(void) {
+    int n = 0;
+    pthread_mutex_lock(&g_repl_lock);
+    for (conn_t *c = g_replicas; c; c = c->next_replica) {
+        if (c->repl_transport_kind == KVS_REPL_TRANSPORT_EBPF_TCP) { n = 1; break; }
+    }
+    pthread_mutex_unlock(&g_repl_lock);
+    return n;
+}
+
+/* 仍有副本处于恢复流程（fullsync/追赶）→ proxy 应保持 BUFFERING，暂缓 flush。
+ * 注意：capture 本身可以打开（新数据由 proxy 缓存），否则恢复窗口会丢写。 */
+int repl_capture_gate_blocked(void) {
+    int blocked = 0;
+    pthread_mutex_lock(&g_repl_lock);
+    for (conn_t *c = g_replicas; c; c = c->next_replica) {
+        if (c->repl_transport_kind != KVS_REPL_TRANSPORT_EBPF_TCP) continue;
+        if (c->repl_recovery_mode != 0) { blocked = 1; break; }
+    }
+    pthread_mutex_unlock(&g_repl_lock);
+    return blocked;
+}
+
+int repl_capture_gate_should_open(void) {
+    /* 只要有 eBPF 副本就可以捕获；恢复期由 proxy BUFFERING 保证顺序 */
+    return repl_capture_gate_has_replica();
+}
+
+/* 恢复超时检查：fullsync/追赶长期不完成 → 再次失效，避免 capture 永久关闭。 */
+void repl_recovery_tick(void) {
+    long long now = kvs_now_ms();
+    int timeout = 0;
+    pthread_mutex_lock(&g_repl_lock);
+    for (conn_t *c = g_replicas; c; c = c->next_replica) {
+        if (c->repl_transport_kind != KVS_REPL_TRANSPORT_EBPF_TCP) continue;
+        if (c->repl_recovery_mode != 0 &&
+            c->repl_recovery_deadline_ms > 0 &&
+            now > c->repl_recovery_deadline_ms) {
+            timeout = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_repl_lock);
+    if (timeout) repl_session_invalidate(REPL_INVALID_BARRIER_TIMEOUT);
 }
 
 int repl_slave_state_save(void) {

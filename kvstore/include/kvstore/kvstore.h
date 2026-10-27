@@ -282,6 +282,11 @@ typedef struct conn_s {
     int repl_draining;
     int repl_fullsync_pending;
     int repl_transport_kind;
+    /* eBPF 副本故障恢复：0=正常；1=fullsync 期间（capture 关闭）；
+     * 2=backlog 追赶期（capture 已开，但 proxy 处于 BUFFERING，追平后 flush） */
+    int repl_recovery_mode;
+    unsigned long long repl_capture_resume_offset;  /* 追平目标（ACK >= 该值后解除） */
+    long long repl_recovery_deadline_ms;
     unsigned long long repl_offset_sent;
     unsigned long long repl_applied_offset_ack;
     unsigned long long repl_durable_offset_ack;
@@ -557,6 +562,27 @@ int repl_slave_state_save(void);
 unsigned long long repl_slave_recovered_frontier(void);
 unsigned long long repl_slave_resume_offset(void);
 
+/* 复制会话失效原因（INFO repl_last_invalid_reason） */
+typedef enum {
+    REPL_INVALID_NONE = 0,
+    REPL_INVALID_PROXY_HEARTBEAT_STALE,
+    REPL_INVALID_CAPTURE_TRUNCATED,
+    REPL_INVALID_COMMIT_TIMEOUT,
+    REPL_INVALID_PROXY_CACHE_FULL,
+    REPL_INVALID_BARRIER_TIMEOUT,
+} repl_invalid_reason_t;
+
+void repl_session_invalidate(repl_invalid_reason_t reason);
+const char *repl_invalid_reason_name(repl_invalid_reason_t reason);
+const char *repl_last_invalid_reason_name(void);
+unsigned long long repl_session_invalid_count(void);
+/* capture gate：有 eBPF 副本即可捕获；blocked 表示仍有副本处于恢复流程，
+ * 此时 proxy 保持 BUFFERING，不应 flush 缓存。 */
+int repl_capture_gate_has_replica(void);
+int repl_capture_gate_blocked(void);
+int repl_capture_gate_should_open(void);
+void repl_recovery_tick(void);
+
 int repl_ebpf_init(void);
 void repl_ebpf_cleanup(void);
 int repl_ebpf_supported(void);
@@ -564,6 +590,30 @@ int repl_ebpf_supported(void);
  * 各网络后端据此把单次 recv 限制到 KVS_EBPF_CAPTURE_MAX_RECV。 */
 int repl_ebpf_capture_active(void);
 void repl_ebpf_set_capture_active(int on);
+void repl_ebpf_set_capture_disable(int disable);   /* 同步写 client_ctl[7] */
+
+/* ebpf-proxy 生命周期（master）：启动时 spawn + 健康检查线程；故障时重启。 */
+void repl_ebpf_proxy_start(void);
+void repl_ebpf_health_start(void);
+int repl_ebpf_proxy_healthy(void);
+unsigned long long repl_ebpf_proxy_restart_count(void);
+/* 等待 proxy 确认进入 BUFFERING（client_ctl[9]），用于 REPLSYNC 后安全地重开 capture */
+int repl_ebpf_proxy_wait_buffering(int timeout_ms);
+
+/* capture / proxy 统计（INFO 用；读取 pinned client_stats + proxy_stats） */
+typedef struct {
+    unsigned long long capture_events;
+    unsigned long long capture_bytes;
+    unsigned long long capture_truncated;
+    unsigned long long forwarded_bytes;
+    unsigned long long enqueued_bytes;
+    unsigned long long pending_bytes;
+    unsigned long long cache_bytes;
+    unsigned long long dropped_bytes;
+    unsigned long long proxy_reconnects;
+    int capture_drop;
+} kvs_repl_proxy_stats_t;
+int repl_ebpf_proxy_get_stats(kvs_repl_proxy_stats_t *out);
 int repl_ebpf_register_fd(int fd, int is_master_side);
 int repl_ebpf_register_forward_fd(int fd);
 int repl_ebpf_unregister_fd(int fd);
