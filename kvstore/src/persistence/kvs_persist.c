@@ -225,18 +225,32 @@ static int persist_uring_init_once(void) {
     if (g_persist_uring_ready) return 0;
 
     struct io_uring_params p;
-    memset(&p, 0, sizeof(p));
-    p.flags = IORING_SETUP_SINGLE_ISSUER
-            | IORING_SETUP_COOP_TASKRUN
-            | IORING_SETUP_SQPOLL;
-    p.sq_thread_idle = 2000;
-
-    if (io_uring_queue_init_params(1024, &g_persist_uring, &p) != 0) {
+    /* 不同内核支持度不同：COOP_TASKRUN 需 5.19+，SINGLE_ISSUER 需 5.16+，
+     * SQPOLL 依赖 CAP_SYS_ADMIN/内核配置。固定 flags 会让旧内核（如 5.15
+     * 的 Slave 虚拟机）初始化失败 → AOF 线程直接退出 → 持久化静默失效。
+     * 逐级降级到最保守的 plain 模式。 */
+    static const unsigned int flags_try[] = {
+        IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN | IORING_SETUP_SQPOLL,
+        IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN,
+        IORING_SETUP_SINGLE_ISSUER,
+        0,
+    };
+    int rc = -1;
+    size_t chosen = 0;
+    for (size_t i = 0; i < sizeof(flags_try) / sizeof(flags_try[0]); ++i) {
         memset(&p, 0, sizeof(p));
-        p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN;
-        if (io_uring_queue_init_params(1024, &g_persist_uring, &p) != 0)
-            return -1;
+        p.flags = flags_try[i];
+        if (flags_try[i] & IORING_SETUP_SQPOLL) p.sq_thread_idle = 2000;
+        rc = io_uring_queue_init_params(1024, &g_persist_uring, &p);
+        if (rc == 0) { chosen = i; break; }
     }
+    if (rc != 0) {
+        fprintf(stderr, "persist: io_uring init failed (all flag fallbacks)\n");
+        return -1;
+    }
+    if (chosen > 0)
+        fprintf(stderr, "persist: io_uring fallback flags=0x%x (older kernel or missing privileges)\n",
+                flags_try[chosen]);
 
     g_persist_eventfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (g_persist_eventfd < 0) {
