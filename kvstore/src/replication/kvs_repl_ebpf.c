@@ -21,6 +21,26 @@ static void repl_ebpf_clear_error(void) {
     repl_ebpf_set_error("none", 0);
 }
 
+/* capture 数据面开关（进程内缓存）：master + ebpf transport 时默认开启；
+ * proxy 故障/截断/重同步期间由健康检查/会话失效路径调用 setter 关掉。 */
+static volatile int g_repl_ebpf_capture_active = 0;
+static volatile int g_repl_ebpf_capture_active_init = 0;
+
+int repl_ebpf_capture_active(void) {
+    if (!g_repl_ebpf_capture_active_init) {
+        g_repl_ebpf_capture_active =
+            (g_cfg.role == ROLE_MASTER &&
+             strstr(g_cfg.repl_realtime_transport, "ebpf") != NULL) ? 1 : 0;
+        g_repl_ebpf_capture_active_init = 1;
+    }
+    return g_repl_ebpf_capture_active;
+}
+
+void repl_ebpf_set_capture_active(int on) {
+    g_repl_ebpf_capture_active_init = 1;
+    g_repl_ebpf_capture_active = on ? 1 : 0;
+}
+
 #if KVS_ENABLE_EBPF
 static struct bpf_object *g_repl_ebpf_obj = NULL;
 static int g_repl_ebpf_sock_map_fd = -1;

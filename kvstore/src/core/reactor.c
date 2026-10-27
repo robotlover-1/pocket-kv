@@ -7,10 +7,9 @@
 extern void repl_fwd_purge_conn(conn_t *c);
 
 #define MAX_READS_PER_EVENT 16
-/* 单次 recv 上限：对齐捕获 BPF 的 CLIENT_ENTRY_MAX_LEN=32764。若一次 recv 超过 32KB，
- * eBPF 捕获会截断尾部静默丢数据（增量复制丢失）。限制读大小后 BPF 永远捕获完整 recv；
+/* 单次 recv 上限：capture 生效时对齐 BPF 的 CLIENT_ENTRY_MAX_LEN（32764）。若一次 recv
+ * 超过该值，eBPF 捕获会丢数据（增量复制缺口）。限制读大小后 BPF 永远捕获完整 recv；
  * 大 value/大批量仍由多次 recv + parse_resp_stream 跨片拼接处理。 */
-#define MAX_RECV_BYTES 32764
 
 int g_epfd = -1;
 static conn_t *fdmap[65536];
@@ -169,7 +168,8 @@ static void on_read(conn_t *c) {
         }
 
         size_t want = INBUF_CAP - c->in_len;
-        if (want > MAX_RECV_BYTES) want = MAX_RECV_BYTES;   /* 防捕获 BPF 32KB 截断 */
+        if (repl_ebpf_capture_active() && want > KVS_EBPF_CAPTURE_MAX_RECV)
+            want = KVS_EBPF_CAPTURE_MAX_RECV;   /* 防捕获 BPF 32KB 截断 */
         ssize_t n = recv(c->fd, c->inbuf + c->in_len, want, 0);
         if (likely(n > 0)) {
             c->in_len += (size_t)n;

@@ -48,7 +48,10 @@ static void server_reader(void *arg) {
             return;
         }
 
-        ssize_t n = recv(c->fd, c->inbuf + c->in_len, INBUF_CAP - c->in_len, 0);
+        size_t want = INBUF_CAP - c->in_len;
+        if (repl_ebpf_capture_active() && want > KVS_EBPF_CAPTURE_MAX_RECV)
+            want = KVS_EBPF_CAPTURE_MAX_RECV;   /* 防捕获 BPF 32KB 截断 */
+        ssize_t n = recv(c->fd, c->inbuf + c->in_len, want, 0);
         if (n < 0) {
             if (errno == EINTR) continue;
             close_conn_nty(c);

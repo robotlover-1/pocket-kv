@@ -47,6 +47,10 @@
 
 #define BUFFER_CAP 65536
 #define INBUF_CAP (1024 * 1024)  /* 接收缓冲（支持 1MB 级大 value 命令；独立于 BUFFER_CAP，避免栈数组爆栈） */
+/* eBPF fexit 捕获的单个 record 上限（CLIENT_ENTRY_MAX_LEN=32764）。
+ * capture 生效时 Reactor/Proactor/NtyCo 必须统一把单次 recv 限制在该值以内，
+ * 超过部分会被 BPF 丢弃（fail-closed），不能依赖后端各自处理。 */
+#define KVS_EBPF_CAPTURE_MAX_RECV 32764
 #define MAX_EVENTS 1024
 #define LISTEN_BACKLOG 128
 
@@ -556,6 +560,10 @@ unsigned long long repl_slave_resume_offset(void);
 int repl_ebpf_init(void);
 void repl_ebpf_cleanup(void);
 int repl_ebpf_supported(void);
+/* capture 数据面是否生效（master + ebpf transport 且未被故障门限关闭）：
+ * 各网络后端据此把单次 recv 限制到 KVS_EBPF_CAPTURE_MAX_RECV。 */
+int repl_ebpf_capture_active(void);
+void repl_ebpf_set_capture_active(int on);
 int repl_ebpf_register_fd(int fd, int is_master_side);
 int repl_ebpf_register_forward_fd(int fd);
 int repl_ebpf_unregister_fd(int fd);

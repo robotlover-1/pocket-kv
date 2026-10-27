@@ -85,7 +85,10 @@ static int submit_read(struct io_uring *ring, conn_t *c) {
         return -1;
     }
 
-    io_uring_prep_recv(sqe, c->fd, c->inbuf + c->in_len, INBUF_CAP - c->in_len, 0);
+    size_t want = INBUF_CAP - c->in_len;
+    if (repl_ebpf_capture_active() && want > KVS_EBPF_CAPTURE_MAX_RECV)
+        want = KVS_EBPF_CAPTURE_MAX_RECV;   /* 防捕获 BPF 32KB 截断 */
+    io_uring_prep_recv(sqe, c->fd, c->inbuf + c->in_len, want, 0);
     io_uring_sqe_set_data(sqe, req);
     return 0;
 }
