@@ -162,6 +162,18 @@ $(TEST_VSEARCH_BIN): $(TEST_VSEARCH_SRC) src/storage/kvs_vector.c src/storage/kv
 test_vsearch: $(TEST_VSEARCH_BIN)
 	./$(TEST_VSEARCH_BIN)
 
+# ---- hash value ownership 泄漏回归测试 ----
+TEST_HASH_OWNERSHIP_SRC=tests/test_hash_ownership.c
+TEST_HASH_OWNERSHIP_BIN=tests/test_hash_ownership
+
+$(TEST_HASH_OWNERSHIP_BIN): $(TEST_HASH_OWNERSHIP_SRC) src/storage/kvs_hash.c src/memory/kvs_mem.c include/kvstore/kvstore.h
+	$(CC) $(CFLAGS) -I./include -o $@ $(TEST_HASH_OWNERSHIP_SRC) src/storage/kvs_hash.c src/memory/kvs_mem.c -lm -ldl
+
+test_hash_ownership: $(TEST_HASH_OWNERSHIP_BIN)
+	./$(TEST_HASH_OWNERSHIP_BIN)
+
+check-hash-ownership: test_hash_ownership
+
 # ---- 5w+5w 主从同步测试 ----
 TEST_REPL_5W5W_SRC=tests/test_repl_5w5w.c
 TEST_REPL_5W5W_BIN=tests/test_repl_5w5w

@@ -21,20 +21,27 @@ static int _hash_idx(uint32_t hv, int size) {
     return (int)(hv % (uint32_t)size);
 }
 
-/* single-allocation: node + key + value in one block */
+/* node + key 单块分配；value 独立分配，便于扩容时替换且无混合 ownership。 */
 static hashnode_t *_create_node_len(uint32_t hv, char *key, size_t klen,
                                     char *value, size_t vlen) {
-    size_t total = sizeof(hashnode_t) + klen + 1 + vlen + 1;
+    size_t total = sizeof(hashnode_t) + klen + 1;
     hashnode_t *node = (hashnode_t*)kvs_malloc(total);
     if (!node) return NULL;
     memset(node, 0, sizeof(*node));
     node->hv = hv;
+    node->klen = (uint32_t)klen;
     node->key = (char *)(node + 1);
-    node->value = node->key + klen + 1;
-    memcpy(node->key, key, klen + 1);
-    memcpy(node->value, value, vlen);
+    memcpy(node->key, key, klen);
+    node->key[klen] = '\0';
+    node->value = (char *)kvs_malloc(vlen + 1);
+    if (!node->value) {
+        kvs_free(node);
+        return NULL;
+    }
+    if (vlen > 0) memcpy(node->value, value, vlen);
     node->value[vlen] = '\0';
     node->vlen = vlen;
+    node->vcap = vlen + 1;
     return node;
 }
 
@@ -42,22 +49,32 @@ static hashnode_t *_create_node(uint32_t hv, char *key, char *value) {
     return _create_node_len(hv, key, strlen(key), value, strlen(value));
 }
 
-/* 覆盖节点 value（长度感知）：新 value 能就地装下则就地写，否则重分配
- * （旧 value 与 node 同块分配，无法 free，保留旧行为直接泄漏）。 */
+/* 覆盖节点 value（长度感知）：容量足够就地写；否则分配新块、拷贝后释放旧值。 */
 static int _overwrite_value(hashnode_t *n, char *value, size_t vlen) {
-    if (vlen <= n->vlen) {
-        memcpy(n->value, value, vlen);
+    if (vlen + 1 <= n->vcap) {
+        if (vlen > 0) memcpy(n->value, value, vlen);
         n->value[vlen] = '\0';
         n->vlen = vlen;
         return 0;
     }
-    char *nv = (char *)kvs_malloc(vlen + 1);
+    size_t new_cap = n->vcap ? n->vcap * 2 : 64;
+    if (new_cap < vlen + 1) new_cap = vlen + 1;
+    char *nv = (char *)kvs_malloc(new_cap);
     if (!nv) return -2;
-    memcpy(nv, value, vlen);
+    if (vlen > 0) memcpy(nv, value, vlen);
     nv[vlen] = '\0';
+    kvs_free(n->value);
     n->value = nv;
     n->vlen = vlen;
+    n->vcap = new_cap;
     return 0;
+}
+
+/* 释放节点：value 独立分配，key 内联在 node 之后，无需单独 free。 */
+static void _free_node(hashnode_t *n) {
+    if (!n) return;
+    kvs_free(n->value);
+    kvs_free(n);
 }
 
 int kvs_hash_create(kvs_hash_t *hash) {
@@ -81,7 +98,7 @@ void kvs_hash_destory(kvs_hash_t *hash) {
             while (node) {
                 hashnode_t *tmp = node;
                 node = node->next;
-                kvs_free(tmp);   /* single alloc: node+key+value contiguous */
+                _free_node(tmp);
             }
         }
         kvs_free(hash->ht[t].nodes);
@@ -286,7 +303,7 @@ int kvs_hash_del(kvs_hash_t *hash, char *key) {
             if (strcmp(cur->key, key) == 0) {
                 if (prev) prev->next = cur->next;
                 else hash->ht[0].nodes[idx] = cur->next;
-                kvs_free(cur);  /* single alloc */
+                _free_node(cur);
                 if (hash->ht[0].count > 0) hash->ht[0].count--;
                 _maybe_shrink(hash);
                 return 0;
@@ -303,7 +320,7 @@ int kvs_hash_del(kvs_hash_t *hash, char *key) {
             if (strcmp(cur->key, key) == 0) {
                 if (prev) prev->next = cur->next;
                 else hash->ht[1].nodes[idx] = cur->next;
-                kvs_free(cur);  /* single alloc */
+                _free_node(cur);
                 if (hash->ht[1].count > 0) hash->ht[1].count--;
                 _maybe_shrink(hash);
                 return 0;

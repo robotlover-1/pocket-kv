@@ -155,14 +155,11 @@ int kvs_rbtree_exist(kvs_rbtree_t *inst, char *key);
 #if ENABLE_HASH
 typedef struct hashnode_s {
     uint32_t hv;              // cached FNV-1a hash (32-bit, not modulo-reduced)
-#if ENABLE_KEY_POINTER
-    char *key;
-    char *value;
-#else
-    char key[128];
-    char value[512];
-#endif
+    uint32_t klen;            /* key 字节长度（不含结尾 '\0'） */
     size_t vlen;              /* value 字节长度（支持含 '\0' 的二进制 value） */
+    size_t vcap;              /* value 分配容量（字节，含结尾 '\0'） */
+    char *key;                /* 指向 node 之后的内联 key 区 */
+    char *value;              /* 独立分配、可扩容；删除节点时必须释放 */
     struct hashnode_s *next;
 } hashnode_t;
 
