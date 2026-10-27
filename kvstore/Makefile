@@ -142,6 +142,10 @@ $(TEST_KVSTORE_BIN): $(TEST_KVSTORE_SRC) $(INC_DIR)/kvstore.h
 check-kvstore: $(TEST_KVSTORE_BIN)
 	python3 ./tools/tests/run_with_kvstore.py --bin ./kvstore --host $(TEST_HOST) --port $(TEST_PORT) -- ./$(TEST_KVSTORE_BIN) {HOST} {PORT}
 
+# ---- Slave kill -9 重启恢复（recovery frontier / backlog 缺口，非 root）----
+check-slave-crash-recovery: kvstore
+	./tools/tests/test_slave_crash_recovery.sh ./kvstore
+
 # ---- 全量同步传输无关协议单元测试 ----
 TEST_FULLSYNC_SRC=tests/test_fullsync_protocol.c
 TEST_FULLSYNC_BIN=tests/test_fullsync_protocol
@@ -440,4 +444,4 @@ check-10w:
 
 check: check-resp check-ttl check-persist check-doc
 
-.PHONY: all clean build_dir check-kvstore check-repl-5w5w test_persist_dump_demo test_persist_aof_demo test_vsearch check check-resp check-ttl check-persist check-doc check-bulk-1w check-all check-all-quick check-mass-ttl check-uring-persist check-mmap-recover check-repl check-repl-metrics check-repl-profile check-repl-ebpf check-repl-ebpf-env check-repl-ebpf-sync check-repl-ebpf-sync-required check-repl-ebpf-redirect check-repl-rdma-unsupported check-repl-rdma-smoke check-repl-rdma-stress check-repl-rdma-soak check-repl-rdma-soak-skip check-rdma-standalone-probe check-rdma-pingpong-smoke check-demo-full-dump check-demo-incr-aof check-demo-repl-sync test_uring_persist test_mmap_recover test_repl_basic check-uring-persist-c check-mmap-recover-c check-repl-basic check-persist-purge check-persist-save-frontier tools/ebpf/repl_ebpf_daemon ebpf-proxy client_capture_bpf
+.PHONY: all clean build_dir check-kvstore check-slave-crash-recovery check-repl-5w5w test_persist_dump_demo test_persist_aof_demo test_vsearch check check-resp check-ttl check-persist check-doc check-bulk-1w check-all check-all-quick check-mass-ttl check-uring-persist check-mmap-recover check-repl check-repl-metrics check-repl-profile check-repl-ebpf check-repl-ebpf-env check-repl-ebpf-sync check-repl-ebpf-sync-required check-repl-ebpf-redirect check-repl-rdma-unsupported check-repl-rdma-smoke check-repl-rdma-stress check-repl-rdma-soak check-repl-rdma-soak-skip check-rdma-standalone-probe check-rdma-pingpong-smoke check-demo-full-dump check-demo-incr-aof check-demo-repl-sync test_uring_persist test_mmap_recover test_repl_basic check-uring-persist-c check-mmap-recover-c check-repl-basic check-persist-purge check-persist-save-frontier tools/ebpf/repl_ebpf_daemon ebpf-proxy client_capture_bpf

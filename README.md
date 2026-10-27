@@ -288,6 +288,11 @@ kvstore/
 | `SLAVEOF NO ONE`    | 提升为主节点 |
 | `ROLE`              | 查看复制状态 |
 
+eBPF 增量复制（`repl_realtime_transport=ebpf+tcp`）的 capture gate、proxy
+健康检查/自动重启、会话失效与 REPLSYNC 恢复时序，见
+[docs/ebpf-replication-hardening.md](kvstore/docs/ebpf-replication-hardening.md)。
+Slave 崩溃恢复可用 `make check-slave-crash-recovery` 验证。
+
 ### 监控
 
 
