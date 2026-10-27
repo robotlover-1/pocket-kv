@@ -227,6 +227,39 @@ sudo kill -9 $(cat <dump_path>.ebpfproxy.pid)
 
 半包/多连接、大 payload、Proxy crash 等矩阵见方案 §28。
 
+### 8.3 跨机实测记录（Master 6.1.176 / Slave 5.15.0）
+
+拓扑：Master `192.168.233.128:5260`，Slave `192.168.233.129:5260`
+（proxy 数据口 5261），`repl_fullsync_transport=rdma`（siw0）+
+`repl_realtime_transport=ebpf+tcp`。
+
+| 场景 | 结果 |
+|---|---|
+| `test_repl_5w5w`（全量 5w + 增量 5w） | **PASS 24 / FAIL 0**；Phase 5.5 确认 `rdma+ebpf-tcp`；10w 条数据逐条校验一致 |
+| kill -9 Slave → 写 1w 条(458KB) → 重启 | partial 追平 `applied == master_offset`；10,001 条按序应用；`capture` 恢复后新增量继续；`truncated=0`、`session_invalid_count=0` |
+| kill -9 ebpf-proxy | 心跳 2s 过期 → 会话失效 → proxy 自动重启 → Slave REPLSYNC 恢复 |
+| Master 重启 | AOF 恢复数据；replid 变化 → Slave full resync；之后增量正常 |
+| Slave 重启恢复边界 | `resume = min(saved_durable, recovered_frontier)`；AOF/durable 正常推进 |
+
+跨机验证额外发现并修复：
+
+1. **大 backlog partial sync**：`repl_backlog_send_continue` 走 reactor 的
+   256KB 输出环，>256KB 必然失败。eBPF 副本改用转发队列（`..._queued`），
+   +CONTINUE 头改为同步 `send` 后再入队，保证 header 先于 backlog。
+2. **转发状态复用**：`repl_fwd_purge_conn` 只标 `dropped` 不移除链表，
+   `conn_t` 地址复用后新连接会命中旧 state，数据永不发送；命中 stale state
+   时重置。
+3. **watermark 缺失**：同步发送 backlog 后未推进转发线程 watermark，
+   REPLACK 追赶会重复补发；补 `repl_fwd_set_watermark`。
+4. **backlog 惰性分配窗口**：副本连接后未写入即断开时，断开期写入不在
+   backlog；REPLSYNC 时提前分配。
+5. **proxy 重连阻塞控制面**：连不上 slave 时退避循环最长 5s 不读控制 map，
+   导致 REPLSYNC 等待 BUFFERING 超时；退避循环中同样处理控制面。
+6. **capture 使能顺序**：先置本地 recv clamp 再写 `capture_disable=0`
+   （关闭时反之），消除大 recv 触发 `CAPTURE_TRUNCATED` 的竞态。
+7. **io_uring 兼容性**：Slave 5.15 不支持 `COOP_TASKRUN/SINGLE_ISSUER`，
+   原固定 flags 使 AOF 线程启动即退出；改为逐级降级到 plain 模式。
+
 ---
 
 ## 9. 已知限制与后续
@@ -238,3 +271,6 @@ sudo kill -9 $(cat <dump_path>.ebpfproxy.pid)
 - **proxy cache**：仍是单阈值 256MB 淘汰；方案 §20 的 192/128MB 高低水位未做。
 - **eBPF 截断 fail-closed** 依赖 `repl_capture_active` 的三后端 recv 限流；
   若绕过网络后端直接 recv（未来新路径），仍需自行限制到 32764。
+- **partial sync 仍会尝试 RDMA**：Slave 混合分支在 REPLSYNC 后无条件后台连 RDMA，
+  而 Master 对 partial 不会启动 RDMA listener，因此会打印连接失败/超时日志
+  （不影响恢复，TCP 数据仍然正确）。后续可按 `+CONTINUE` 响应跳过 RDMA 尝试。

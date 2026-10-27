@@ -134,3 +134,5 @@ tests/test_fullsync_protocol
 !/kvstore/artifacts/.gitkeep
 /kvstore/tests/test_vsearch_runtime
 /kvstore/tests/test_hash_ownership
+/kvstore/test_kvstore
+/kvstore/test_uring_persist
