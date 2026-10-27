@@ -543,6 +543,10 @@ int repl_backlog_feed(const unsigned char *buf, size_t len);
 int repl_backlog_can_continue(const char *replid, unsigned long long offset);
 int repl_backlog_write_range(conn_t *c, unsigned long long offset);
 int repl_backlog_send_continue(conn_t *c, unsigned long long offset);
+/* eBPF 副本 partial sync：+CONTINUE 走控制连接，backlog 经转发队列发送（支持 >256KB） */
+int repl_backlog_send_continue_queued(conn_t *c, unsigned long long offset);
+/* 第一个 REPLSYNC 时提前分配 backlog（覆盖副本断开期间的写入） */
+int repl_backlog_init(void);
 void repl_note_partialsync_result(int ok);
 void repl_slave_set_sync_state(const char *replid, unsigned long long applied_offset, unsigned long long durable_offset, int fullsync_loading, unsigned long long fullsync_target_bytes);
 void repl_slave_finish_fullsync(void);

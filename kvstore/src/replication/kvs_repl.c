@@ -85,7 +85,21 @@ static repl_fwd_send_state_t *repl_fwd_find_state(conn_t *c) {
 
 static repl_fwd_send_state_t *repl_fwd_get_or_create(conn_t *c) {
     repl_fwd_send_state_t *st = repl_fwd_find_state(c);
-    if (st) return st;
+    if (st) {
+        /* conn_t 地址复用：旧连接 close 时 purge 只把 state 标 dropped（防转发线程
+         * 并发 UAF），不会从链表移除。若命中的是旧 state，必须重置后给新连接，
+         * 否则新会话的 backlog/增量永远不会被发送。 */
+        if (st->dropped) {
+            if (st->buf) { kvs_free(st->buf); st->buf = NULL; }
+            st->cap = 0;
+            st->len = 0;
+            st->watermark = 0;
+            st->stalled = 0;
+            st->armed_epollout = 0;
+            st->dropped = 0;
+        }
+        return st;
+    }
     /* 惰性建立：从 g_replicas 找对应 conn（转发线程未见到前可能已建好） */
     st = (repl_fwd_send_state_t *)kvs_malloc(sizeof(*st));
     if (!st) return NULL;
@@ -2352,6 +2366,16 @@ static int ensure_repl_backlog(void) {
     return 0;
 }
 
+/* Master 收到第一个 REPLSYNC 时调用：提前分配 backlog，保证副本断开期间的新写
+ * 也能进入 backlog（否则惰性分配窗口内的写入在重连时只能 full resync）。 */
+int repl_backlog_init(void) {
+    int rc;
+    pthread_mutex_lock(&g_backlog_lock);
+    rc = ensure_repl_backlog();
+    pthread_mutex_unlock(&g_backlog_lock);
+    return rc;
+}
+
 int repl_backlog_feed(const unsigned char *buf, size_t len) {
     pthread_mutex_lock(&g_backlog_lock);
     if (!buf || len == 0) { pthread_mutex_unlock(&g_backlog_lock); return 0; }
@@ -3521,6 +3545,16 @@ out:
     return rc;
 }
 
+/* 同步发送 backlog 后同步推进转发线程的 watermark：否则 REPLACK 追赶/refill 会
+ * 认为该区段尚未交给转发线程，从 applied 重新深拷贝发送 → 命令双倍应用。 */
+static void repl_fwd_set_watermark(conn_t *c, unsigned long long offset) {
+    if (!c) return;
+    pthread_mutex_lock(&g_fwd_lock);
+    repl_fwd_send_state_t *st = repl_fwd_get_or_create(c);
+    if (st && !st->dropped && offset > st->watermark) st->watermark = offset;
+    pthread_mutex_unlock(&g_fwd_lock);
+}
+
 int repl_backlog_send_continue(conn_t *c, unsigned long long offset) {
     char hdr[128];
     int hn;
@@ -3532,7 +3566,61 @@ int repl_backlog_send_continue(conn_t *c, unsigned long long offset) {
     repl_note_send_context("continue-header", (size_t)hn, offset, (unsigned char *)hdr);
     if (repl_send_chunked(c, (unsigned char *)hdr, (size_t)hn) != 0) return -1;
     repl_note_send_context("continue-backlog", (size_t)(g_repl_backlog.end_offset - offset), offset, g_repl_backlog.buf);
-    return repl_backlog_write_range(c, offset);
+    int rc = repl_backlog_write_range(c, offset);
+    if (rc == 0) repl_fwd_set_watermark(c, continue_offset);
+    return rc;
+}
+
+/* eBPF 副本专用：+CONTINUE 头走控制连接，backlog 深拷贝后交给转发线程。
+ * repl_backlog_send_continue 直接 queue_bytes 到 reactor 的 256KB 输出环，
+ * backlog > 256KB 时必然失败；转发队列可按任意大小异步发送，且 proxy 处于
+ * BUFFERING，slave ACK 追平后才 flush，顺序仍由 resume_offset 保证。 */
+int repl_backlog_send_continue_queued(conn_t *c, unsigned long long offset) {
+    char hdr[128];
+    int hn;
+    unsigned long long end;
+    unsigned char *cbuf = NULL;
+    size_t clen = 0;
+
+    if (!c || !g_repl_backlog.buf) return -1;
+    if (offset < g_repl_backlog.start_offset || offset > g_repl_backlog.end_offset) return -1;
+    end = g_repl_backlog.end_offset;
+
+    hn = snprintf(hdr, sizeof(hdr), "+CONTINUE %s %llu\r\n", repl_master_id(), end);
+    repl_note_send_context("continue-header", (size_t)hn, offset, (unsigned char *)hdr);
+    /* 必须先把 header 真正写进 socket，再让转发线程写 backlog：
+     * queue_bytes 只是进 reactor 输出环（defer_epollout 时本轮不 flush），
+     * 而转发线程是独立写者，可能抢先写出 backlog → slave 先收到半包数据，
+     * RESP 解析错位。header 很小，直接同步 send 即可。 */
+    {
+        size_t hoff = 0;
+        while (hoff < (size_t)hn) {
+            ssize_t w = send(c->fd, hdr + hoff, (size_t)hn - hoff,
+                             MSG_NOSIGNAL | MSG_DONTWAIT);
+            if (w > 0) { hoff += (size_t)w; continue; }
+            if (w < 0 && errno == EINTR) continue;
+            if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                struct pollfd pfd = { .fd = c->fd, .events = POLLOUT };
+                if (poll(&pfd, 1, 1000) > 0) continue;
+            }
+            return -1;
+        }
+    }
+
+    if (offset < end) {
+        if (repl_backlog_copy_range(offset, &cbuf, &clen) != 0) return -1;
+        if (clen > 0) {
+            repl_note_send_context("continue-backlog", clen, offset, cbuf);
+            if (repl_fwd_enqueue(c, cbuf, clen, offset + clen) != 0) {
+                kvs_free(cbuf);
+                return -1;
+            }
+        }
+        kvs_free(cbuf);
+    }
+    c->repl_offset_sent = end;
+    c->repl_last_send_ms = kvs_now_ms();
+    return 0;
 }
 
 static int snapshot_slave_conf(char *host, size_t cap, int *port, int *gen, int *role) {

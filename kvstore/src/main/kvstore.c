@@ -1351,6 +1351,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
          * req_durable may lag behind req_offset due to lazy AOF fsync,
          * but that doesn't prevent partial resync since the master
          * can replay from req_offset onward. */
+        /* 提前分配 backlog：保证副本连接期间（含断开窗口）的写入可被 partial sync 覆盖 */
+        if (g_cfg.role == ROLE_MASTER) repl_backlog_init();
         /* backlog 必须覆盖到当前 master offset，否则 partial sync 会留下
          * [backlog_end, master_offset) 的静默缺口；不满足时强制 full resync。 */
         int can_continue = (argc >= 3 && repl_backlog_can_continue(req_replid, req_offset)
@@ -1428,7 +1430,10 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
                 repl_ebpf_set_capture_disable(1);
                 repl_notify_ebpf_proxy_fullsync(1);
             }
-            if (repl_backlog_send_continue(c, req_offset) != 0) {
+            int send_rc = is_ebpf
+                ? repl_backlog_send_continue_queued(c, req_offset)
+                : repl_backlog_send_continue(c, req_offset);
+            if (send_rc != 0) {
                 repl_rdma_log("master_replsync - continue backlog send failed");
                 repl_session_invalidate(REPL_INVALID_BARRIER_TIMEOUT);
                 c->repl_draining = 1;
@@ -1481,7 +1486,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
          * IMPORTANT 1：追赶起点取 max(applied_offset, watermark)——watermark 是已交给
          * 转发线程（可能仍留在 st->buf 未刷）的最高 offset；slave 的 applied 常滞后于它，
          * 若仍从 applied 重发，会把 st->buf 里未刷的字节重复下送（非幂等命令双倍应用）。 */
-        if (c && c->repl_transport_kind != KVS_REPL_TRANSPORT_EBPF_TCP
+        if (c && (c->repl_transport_kind != KVS_REPL_TRANSPORT_EBPF_TCP
+                  || c->repl_recovery_mode == 2)
             && repl_master_offset() > applied_offset
             && applied_offset >= repl_backlog_start_offset()
             && applied_offset <= repl_backlog_end_offset()) {
