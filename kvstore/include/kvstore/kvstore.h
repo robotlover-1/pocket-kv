@@ -546,8 +546,12 @@ unsigned long long repl_slave_offset(void);
 unsigned long long repl_slave_applied_offset(void);
 unsigned long long repl_slave_durable_offset(void);
 int repl_slave_loading_fullsync(void);
-int repl_slave_state_load(void);
+/* recovered_frontier: 本次进程启动从 dump/AOF 实际恢复到的复制边界。
+ * applied/durable 会被钳制到不超过该值；传 0 表示无任何持久化恢复（从 0 开始）。 */
+int repl_slave_state_load(unsigned long long recovered_frontier);
 int repl_slave_state_save(void);
+unsigned long long repl_slave_recovered_frontier(void);
+unsigned long long repl_slave_resume_offset(void);
 
 int repl_ebpf_init(void);
 void repl_ebpf_cleanup(void);
@@ -580,6 +584,8 @@ int persist_fsync_fd(int fd);
 int persist_save_dump(void);
 int persist_recover(void);
 int persist_recover_in_progress(void);
+/* 进程启动恢复完成后，内存状态对应的复制边界（dump 头 AOF offset + AOF 回放字节） */
+unsigned long long persist_recovered_frontier(void);
 int kvs_snapshot_to_fp(FILE *fp);
 int kvs_snapshot_to_fd(int fd);
 int kvs_dump_to_fd(int fd, unsigned long long aof_offset);

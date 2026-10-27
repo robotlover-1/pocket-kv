@@ -28,6 +28,11 @@ static unsigned long long g_recover_mmap_fallbacks = 0;
 static unsigned long long g_recover_last_mmap_bytes = 0;
 static unsigned long long g_recover_last_fread_bytes = 0;
 static unsigned long long g_recover_last_tail_bytes = 0;
+/* 恢复边界：dump 头里的 AOF offset + AOF 实际回放字节数。
+ * slave 进程重启后用它钳制 .replstate 里可能超前的 applied/durable。 */
+static unsigned long long g_recover_dump_frontier = 0;
+static unsigned long long g_recover_aof_bytes = 0;
+static unsigned long long g_recover_frontier = 0;
 
 static int g_bgsave_status = 0;
 static unsigned long long g_bgsave_base_dirty = 0;
@@ -505,7 +510,8 @@ int persist_fsync_fd(int fd) {
 
 /* ---- recovery (mmap / fread) ---- */
 
-static int replay_file_fread(const char *path, unsigned long long skip_bytes) {
+/* 返回实际被 RESP 解析消费的字节数（已读长度 - 尾部不完整命令）。 */
+static unsigned long long replay_file_fread(const char *path, unsigned long long skip_bytes) {
     FILE *fp = fopen(path, "rb");
     if (!fp) return 0;
     if (skip_bytes > 0 && fseeko(fp, (off_t)skip_bytes, SEEK_SET) != 0) {
@@ -522,10 +528,10 @@ static int replay_file_fread(const char *path, unsigned long long skip_bytes) {
     }
     g_recover_last_fread_bytes += total;
     fclose(fp);
-    return 0;
+    return total >= (unsigned long long)len ? total - (unsigned long long)len : 0;
 }
 
-static int replay_file_mmap(const char *path, unsigned long long skip_bytes) {
+static unsigned long long replay_file_mmap(const char *path, unsigned long long skip_bytes) {
     int fd;
     struct stat st;
     unsigned char *mapped;
@@ -556,15 +562,16 @@ static int replay_file_mmap(const char *path, unsigned long long skip_bytes) {
     g_recover_last_mmap_bytes += (unsigned long long)st.st_size - skip_bytes;
 
     len = (size_t)st.st_size - (size_t)skip_bytes;
+    size_t orig_len = len;
     parse_resp_stream(NULL, mapped + skip_bytes, &len, 1);
     g_recover_last_tail_bytes += (unsigned long long)len;
 
     munmap(mapped, (size_t)st.st_size);
     close(fd);
-    return 0;
+    return (unsigned long long)(orig_len - len);
 }
 
-static int replay_file(const char *path, unsigned long long skip_bytes) {
+static unsigned long long replay_file(const char *path, unsigned long long skip_bytes) {
     return replay_file_mmap(path, skip_bytes);
 }
 
@@ -1123,6 +1130,10 @@ int persist_recover_in_progress(void) {
     return g_persist_recovering;
 }
 
+unsigned long long persist_recovered_frontier(void) {
+    return g_recover_frontier;
+}
+
 int persist_recover(void) {
     long long begin_ms = kvs_now_ms();
     long long dump_begin_ms;
@@ -1138,16 +1149,24 @@ int persist_recover(void) {
     g_recover_last_mmap_bytes = 0;
     g_recover_last_fread_bytes = 0;
     g_recover_last_tail_bytes = 0;
+    g_recover_dump_frontier = 0;
+    g_recover_aof_bytes = 0;
+    g_recover_frontier = 0;
 
     dump_begin_ms = kvs_now_ms();
     unsigned long long aof_offset = replay_dump_file(g_cfg.dump_path);
+    g_recover_dump_frontier = aof_offset;
     g_recover_last_dump_ms = kvs_now_ms() - dump_begin_ms;
 
     aof_begin_ms = kvs_now_ms();
     if (!g_aof_disabled) {
-        replay_file(g_cfg.aof_path, aof_offset);
+        g_recover_aof_bytes = replay_file(g_cfg.aof_path, aof_offset);
     }
     g_recover_last_aof_ms = kvs_now_ms() - aof_begin_ms;
+
+    /* 内存状态实际恢复到 = dump 快照对应的 AOF offset + AOF 中成功回放的字节。
+     * 无 dump 时 aof_offset=0，即只按 AOF 回放量计算；两者都没有则为 0（空状态）。 */
+    g_recover_frontier = g_recover_dump_frontier + g_recover_aof_bytes;
 
     g_recover_last_total_ms = kvs_now_ms() - begin_ms;
     g_dirty_counter = 0;
@@ -1388,7 +1407,10 @@ int persist_build_recover_text(char *buf, size_t cap) {
         "recover_mmap_fallbacks=%llu\n"
         "recover_mmap_bytes=%llu\n"
         "recover_fread_bytes=%llu\n"
-        "recover_tail_bytes=%llu\n",
+        "recover_tail_bytes=%llu\n"
+        "recover_dump_frontier=%llu\n"
+        "recover_aof_bytes=%llu\n"
+        "recover_frontier=%llu\n",
         g_recover_last_total_ms,
         g_recover_last_dump_ms,
         g_recover_last_aof_ms,
@@ -1397,7 +1419,10 @@ int persist_build_recover_text(char *buf, size_t cap) {
         g_recover_mmap_fallbacks,
         g_recover_last_mmap_bytes,
         g_recover_last_fread_bytes,
-        g_recover_last_tail_bytes);
+        g_recover_last_tail_bytes,
+        g_recover_dump_frontier,
+        g_recover_aof_bytes,
+        g_recover_frontier);
     if (n < 0 || (size_t)n >= cap) return -1;
     return n;
 }

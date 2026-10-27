@@ -454,6 +454,9 @@ static char g_slave_master_replid[41] = "?";
 static unsigned long long g_slave_repl_offset = 0;
 static unsigned long long g_slave_repl_applied_offset = 0;
 static unsigned long long g_slave_repl_durable_offset = 0;
+/* 进程启动恢复边界与本次实际采用的续传点（用于 INFO/诊断） */
+static unsigned long long g_slave_recovered_frontier = 0;
+static unsigned long long g_slave_resume_offset = 0;
 int g_slave_loading_fullsync = 0;
 unsigned long long g_slave_fullsync_target_bytes = 0;
 unsigned long long g_slave_fullsync_loaded_bytes = 0;
@@ -3296,30 +3299,55 @@ int repl_slave_loading_fullsync(void) {
     return g_slave_loading_fullsync;
 }
 
-int repl_slave_state_load(void) {
+int repl_slave_state_load(unsigned long long recovered_frontier) {
     FILE *fp;
     char replid[41] = {0};
     unsigned long long applied_offset = 0;
     unsigned long long durable_offset = 0;
+    int loaded = 0;
+
+    g_slave_recovered_frontier = recovered_frontier;
+
     build_slave_state_path();
     fp = fopen(g_slave_state_path, "r");
-    if (!fp) return 0;
-    if (fscanf(fp, "%40s %llu %llu", replid, &applied_offset, &durable_offset) == 3) {
-        snprintf(g_slave_master_replid, sizeof(g_slave_master_replid), "%s", replid);
-        g_slave_repl_applied_offset = applied_offset;
-        g_slave_repl_durable_offset = durable_offset;
-        g_slave_repl_offset = applied_offset;
-    } else {
-        rewind(fp);
-        if (fscanf(fp, "%40s %llu", replid, &applied_offset) == 2) {
-            snprintf(g_slave_master_replid, sizeof(g_slave_master_replid), "%s", replid);
-            g_slave_repl_applied_offset = applied_offset;
-            g_slave_repl_durable_offset = applied_offset;
-            g_slave_repl_offset = applied_offset;
+    if (fp) {
+        if (fscanf(fp, "%40s %llu %llu", replid, &applied_offset, &durable_offset) == 3) {
+            loaded = 1;
+        } else {
+            rewind(fp);
+            if (fscanf(fp, "%40s %llu", replid, &applied_offset) == 2) {
+                durable_offset = applied_offset;
+                loaded = 1;
+            }
         }
+        fclose(fp);
     }
-    fclose(fp);
+
+    /* 进程重启后内存状态只恢复到 recovered_frontier。旧 .replstate 的 applied
+     * 可能超前（AOF 未 fsync / 状态文件比 AOF 新），必须以真实恢复边界为上限；
+     * 网络断线但进程未退出的场景不经过本函数，仍从 applied 续传。 */
+    unsigned long long resume = loaded ? durable_offset : 0;
+    if (resume > recovered_frontier) resume = recovered_frontier;
+    if (applied_offset < resume) resume = applied_offset;
+
+    snprintf(g_slave_master_replid, sizeof(g_slave_master_replid), "%s",
+             loaded ? replid : "?");
+
+    g_slave_repl_applied_offset = resume;
+    g_slave_repl_durable_offset = resume;
+    g_slave_repl_offset = resume;
+    g_slave_resume_offset = resume;
+
+    if (loaded || recovered_frontier > 0) repl_slave_state_save();
     return 0;
+}
+
+unsigned long long repl_slave_recovered_frontier(void) {
+    return g_slave_recovered_frontier;
+}
+
+unsigned long long repl_slave_resume_offset(void) {
+    return g_slave_resume_offset;
 }
 
 int repl_slave_state_save(void) {

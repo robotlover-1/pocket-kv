@@ -1573,6 +1573,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             "slave_repl_offset:%llu\n"
             "slave_repl_applied_offset:%llu\n"
             "slave_repl_durable_offset:%llu\n"
+            "slave_recovered_frontier:%llu\n"
+            "slave_resume_offset:%llu\n"
             "slave_fullsync_loading:%d\n"
             "replica_max_applied_offset_ack:%llu\n"
             "replica_max_durable_offset_ack:%llu\n"
@@ -1649,6 +1651,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             repl_slave_offset(),
             repl_slave_applied_offset(),
             repl_slave_durable_offset(),
+            repl_slave_recovered_frontier(),
+            repl_slave_resume_offset(),
             repl_slave_loading_fullsync(),
             max_replica_applied,
             max_replica_durable,
@@ -3019,7 +3023,8 @@ int main(int argc, char **argv) {
     }
     if (persist_init() != 0) { perror("persist_init"); return 1; }
     persist_recover();
-    if (g_cfg.role == ROLE_SLAVE) repl_slave_state_load();
+    /* slave 进程重启：续传点不得超过本次从 dump/AOF 实际恢复出的边界 */
+    if (g_cfg.role == ROLE_SLAVE) repl_slave_state_load(persist_recovered_frontier());
     /* eBPF+tcp 增量：master 启动时自动拉起独立的 ebpf-proxy 进程（无需手动启动），
      * 随后后台线程向 proxy_cfg map 写入 master 配置。 */
     if (g_cfg.role == ROLE_MASTER) {
