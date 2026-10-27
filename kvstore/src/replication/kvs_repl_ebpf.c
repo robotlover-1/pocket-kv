@@ -559,6 +559,7 @@ static int ebpf_ctl_write(unsigned int key, unsigned long long val) {
 }
 
 static void repl_ebpf_reset_backpressure_cache(void) {
+#if KVS_ENABLE_EBPF
     if (g_repl_ebpf_backpressure_fd >= 0) {
         close(g_repl_ebpf_backpressure_fd);
         g_repl_ebpf_backpressure_fd = -1;
@@ -568,6 +569,7 @@ static void repl_ebpf_reset_backpressure_cache(void) {
     g_repl_ebpf_last_hb_ms = 0;
     g_repl_ebpf_bp_check_ms = 0;
     g_repl_ebpf_bp_cached = 0;
+#endif
 }
 
 static void ebpf_proxy_pidfile_path(char *out, size_t cap) {
