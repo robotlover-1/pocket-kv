@@ -52,6 +52,10 @@ void repl_ebpf_set_capture_disable(int disable) {
     unsigned int key = 7;   /* CTL_KEY_CAPTURE_DISABLE */
     unsigned long long val = disable ? 1 : 0;
     int fd = -1;
+    /* 顺序必须保证 recv clamp 先于 BPF 打开捕获生效（关闭时晚于 BPF 停止）：
+     * 否则 map 写 0 到本地 active=1 之间的窗口内，BPF 可能已捕获一次
+     * >32764 的 recv，触发 CAPTURE_TRUNCATED fail-closed。 */
+    if (!disable) repl_ebpf_set_capture_active(1);
 #if KVS_ENABLE_EBPF
     if (g_cfg.ebpf_pin_path[0]) {
         char path[512];
@@ -65,7 +69,7 @@ void repl_ebpf_set_capture_disable(int disable) {
 #else
     (void)key; (void)val; (void)fd;
 #endif
-    repl_ebpf_set_capture_active(disable ? 0 : 1);
+    if (disable) repl_ebpf_set_capture_active(0);
 }
 
 #if KVS_ENABLE_EBPF
@@ -761,9 +765,15 @@ static void repl_ebpf_health_tick(void) {
      * 由 REPLSYNC 在确认 proxy 已 BUFFERING 后自行打开，这里不能覆盖。 */
     if (!repl_capture_gate_blocked()) {
         int gate = repl_capture_gate_has_replica();
-        ebpf_ctl_write(EBPF_CTL_KEY_CAPTURE_DISABLE, gate ? 0 : 1);
-        repl_ebpf_set_capture_active(gate);
-        if (gate) ebpf_ctl_write(EBPF_CTL_KEY_CAPTURE_FAULT, 0);
+        if (gate) {
+            /* 先置本地 clamp，再允许 BPF 捕获（避免大 recv 竞态） */
+            repl_ebpf_set_capture_active(1);
+            ebpf_ctl_write(EBPF_CTL_KEY_CAPTURE_DISABLE, 0);
+            ebpf_ctl_write(EBPF_CTL_KEY_CAPTURE_FAULT, 0);
+        } else {
+            ebpf_ctl_write(EBPF_CTL_KEY_CAPTURE_DISABLE, 1);
+            repl_ebpf_set_capture_active(0);
+        }
     }
 }
 

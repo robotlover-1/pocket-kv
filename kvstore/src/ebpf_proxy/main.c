@@ -657,8 +657,9 @@ static void proxy_capture_drop_pending(void) {
 
 static void proxy_capture_resume(void) {
     g_capture_drop = 0;
-    set_state(STATE_FORWARDING);
-    fprintf(stderr, "ebpf-proxy: capture gate reopened, forwarding resumed\n");
+    /* 不在这里置 FORWARDING：恢复期 client_ctl[3] 仍为 1（BUFFERING），
+     * 必须继续缓存增量，等 Master 在 ACK 追平/REPLDONE 后写 3=0 再 flush。 */
+    fprintf(stderr, "ebpf-proxy: capture gate reopened\n");
 }
 
 /* ---- ringbuf 回调 ---- */
@@ -701,6 +702,44 @@ static int ringbuf_callback(void *ctx, void *data, size_t len) {
     return 0;
 }
 
+/* 处理 Master 控制面（fullsync 状态 / capture gate）。
+ * 主循环和 slave 重连退避循环都会调用：proxy 连不上 slave 时也要及时回执
+ * BUFFERING（client_ctl[9]），否则 Master REPLSYNC 会因等待超时而反复失效。 */
+static void proxy_handle_control_maps(void) {
+    /* 先处理 fullsync 状态：保证 BUFFERING 先于 capture gate 重新打开 */
+    __u64 fs_val = 0;
+    if (read_client_ctl_u64(3, &fs_val) == 0) {
+        pthread_mutex_lock(&g_state_lock);
+        proxy_state_t st = g_state;
+        pthread_mutex_unlock(&g_state_lock);
+        if (fs_val == 1 && st == STATE_FORWARDING) {
+            set_state(STATE_BUFFERING);
+            /* IMPORTANT 2: 清空转发队列剩余增量，防其穿插进全量同步流 */
+            proxy_fwd_drain_to_cache_or_discard();
+            fprintf(stderr, "ebpf-proxy: fullsync start (client_ctl[3]=1), "
+                    "state=BUFFERING\n");
+        } else if (fs_val == 0 && st == STATE_BUFFERING && !g_capture_drop) {
+            fprintf(stderr, "ebpf-proxy: fullsync end (client_ctl[3]=0), "
+                    "requesting cache flush...\n");
+            set_state(STATE_FORWARDING);
+            request_cache_flush();   /* fwd 线程（唯一 writer）刷 cache */
+        }
+    }
+
+    /* capture gate：Master 在 proxy 故障恢复/BPF 截断/REPLSYNC 追赶期间关闭捕获。
+     * 关闭时丢弃未发送增量并断开 slave 数据连接；重新打开时只清 drop 标记，
+     * 转发状态由 client_ctl[3] 决定。 */
+    __u64 gate_dis = 0, gate_fault = 0;
+    read_client_ctl_u64(CLIENT_CTL_KEY_CAPTURE_DISABLE, &gate_dis);
+    read_client_ctl_u64(CLIENT_CTL_KEY_CAPTURE_FAULT, &gate_fault);
+    int want_drop = (gate_dis != 0 || gate_fault != 0);
+    if (want_drop && !g_capture_drop) {
+        proxy_capture_drop_pending();
+    } else if (!want_drop && g_capture_drop) {
+        proxy_capture_resume();
+    }
+}
+
 /* 主循环 */
 static void main_loop(void) {
     while (!g_shutdown) {
@@ -734,37 +773,8 @@ static void main_loop(void) {
         /* 注意：不再调用 batch_flush()。FORWARDING 数据已入转发队列，
          * 由独立转发线程 writev 到 slave。*/
 
-        /* capture gate：Master 在 proxy 故障恢复/BPF 截断/REPLSYNC 追赶期间关闭捕获。
-         * 关闭时丢弃所有已捕获增量并断开 slave 数据连接，等 Master 重发 backlog 后再恢复。 */
-        __u64 gate_dis = 0, gate_fault = 0;
-        read_client_ctl_u64(CLIENT_CTL_KEY_CAPTURE_DISABLE, &gate_dis);
-        read_client_ctl_u64(CLIENT_CTL_KEY_CAPTURE_FAULT, &gate_fault);
-        int want_drop = (gate_dis != 0 || gate_fault != 0);
-        if (want_drop && !g_capture_drop) {
-            proxy_capture_drop_pending();
-        } else if (!want_drop && g_capture_drop) {
-            proxy_capture_resume();
-        }
-
-        /* 检查 fullsync 状态变化
-         * client_ctl[3] 由 master 进程在 queue_snapshot/REPLDONE 时写入:
-         *   1 = 全量同步开始 → 切 BUFFERING
-         *   0 = 全量同步结束 → flush 缓存 → 切 FORWARDING */
-        __u64 fs_val = 0;
-        if (read_client_ctl_u64(3, &fs_val) == 0) {
-            if (fs_val == 1 && g_state == STATE_FORWARDING) {
-                set_state(STATE_BUFFERING);
-                /* IMPORTANT 2: 清空转发队列剩余增量，防其穿插进全量同步流 */
-                proxy_fwd_drain_to_cache_or_discard();
-                fprintf(stderr, "ebpf-proxy: fullsync start (client_ctl[3]=1), "
-                        "state=BUFFERING\n");
-            } else if (fs_val == 0 && g_state == STATE_BUFFERING) {
-                fprintf(stderr, "ebpf-proxy: fullsync end (client_ctl[3]=0), "
-                        "requesting cache flush...\n");
-                set_state(STATE_FORWARDING);
-                request_cache_flush();   /* fwd 线程（唯一 writer）刷 cache */
-            }
-        }
+        /* fullsync 状态 + capture gate（与重连退避共享同一实现） */
+        proxy_handle_control_maps();
 
         /* 检查 slave 连接 */
         if (!proxy_slave_is_connected(&g_slave)) {
@@ -788,10 +798,13 @@ static void main_loop(void) {
                     if (delay > 5000) delay = 5000;
                     fprintf(stderr, "ebpf-proxy: reconnect attempt %d, "
                             "sleeping %ums\n", attempt, delay);
-                    /* 在退避期间继续 poll ringbuf，防止 ringbuf 满丢数据 */
+                    /* 在退避期间继续 poll ringbuf，并处理 Master 控制面：
+                     * 否则 REPLSYNC 期间 proxy 连不上 slave 会阻塞数秒，
+                     * 无法回执 BUFFERING，Master 会超时失效会话。 */
                     int poll_iters = (int)(delay / 5);
                     for (int i = 0; i < poll_iters && !g_shutdown; i++) {
                         ring_buffer__poll(g_rb, 5);
+                        proxy_handle_control_maps();
                     }
                     g_slave.backoff_ms *= 2;
                     if (g_slave.backoff_ms > g_slave.backoff_max_ms)
