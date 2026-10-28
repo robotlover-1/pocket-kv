@@ -783,6 +783,7 @@ static int g_barrier_active = 0;
 static int g_barrier_ack_gated = 0;
 static unsigned long long g_barrier_end_offset = 0;   /* catchup_end = 立屏障时的 master_offset */
 static unsigned long long g_barrier_resume_global = 0;/* 屏障边界对应的最后一个 global_seq（RESUME marker） */
+static int g_barrier_resume_valid = 0;                /* marker 是否有效（0 也是合法 marker） */
 static long long g_barrier_deadline_ms = 0;           /* 等 Slave ack 的兜底期限，0=不设 */
 #define REPL_BARRIER_WAIT_MS      3000    /* 等 proxy 应答 BUFFERING */
 #define REPL_BARRIER_HOLD_MAX_MS 15000    /* 等 Slave 追上（兜底，防永久 BUFFERING） */
@@ -815,6 +816,9 @@ static int repl_barrier_begin(unsigned long long *catchup_end) {
      * 本函数在 owner 线程执行且阻塞等待 proxy 应答，期间不会再提交新写，
      * 因此这里取的 global_seq 与 catchup_end 一致。 */
     g_barrier_resume_global = repl_commit_global_seq();
+    /* marker=0 合法（屏障建立前本进程尚无提交）：必须用一个独立标志表示
+     * "需要发送 RESUME"，否则 0 会被误判为未设置而漏发。 */
+    g_barrier_resume_valid = 1;
 
     long long deadline = kvs_now_ms() + REPL_BARRIER_WAIT_MS;
     int ok = 0;
@@ -850,10 +854,11 @@ static void repl_barrier_release(void) {
         repl_ebpf_client_ctl_set(KVS_CTL_FULLSYNC_STATE, 0);
         /* 先放行屏障，再发 RESUME：proxy 收到后丢弃 <= marker 的 recovery 提交，
          * 其余按 global_seq 放行，随后才会 flush cache。 */
-        if (repl_commit_active_mode() && g_barrier_resume_global != 0)
+        if (repl_commit_active_mode() && g_barrier_resume_valid)
             repl_commit_resume(g_barrier_resume_global);
     }
     g_barrier_resume_global = 0;
+    g_barrier_resume_valid = 0;
 }
 
 int repl_barrier_pending(void) { return g_barrier_active; }
@@ -1893,6 +1898,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             "repl_commit_writes:%llu\n"
             "repl_commit_skips:%llu\n"
             "repl_commit_pending:%llu\n"
+            "repl_commit_recovery_bytes:%llu\n"
             "repl_commit_timeout:%llu\n"
             "repl_commit_desync:%llu\n"
             "repl_commit_gap:%llu\n"
@@ -2003,6 +2009,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             repl_commit_write_count(),
             repl_commit_skip_count(),
             proxy_stats.commit_pending,
+            proxy_stats.commit_recovery_bytes,
             repl_commit_timeout_count(),
             repl_commit_desync_count(),
             repl_commit_gap_count(),

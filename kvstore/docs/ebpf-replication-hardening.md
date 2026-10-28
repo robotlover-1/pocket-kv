@@ -324,6 +324,14 @@ RESUME{marker}               恢复期结束：丢弃 global_seq<=marker，其�
   backlog/快照覆盖而丢弃，`>marker` 的按序转发。
 - `RESUME` 幂等：重复或更旧的 marker 不会重放已释放记录，也不会丢弃 `>marker`
   的新写（单元测试 `test_commit_gate` 覆盖）。
+- **marker=0 合法**：若屏障建立前本进程尚无提交（新进程 + 刚断线的 Slave），
+  marker 就是 0。Master 用独立 `g_barrier_resume_valid` 标志决定是否发送，
+  不能把 0 当成"未设置"而漏发（否则 proxy 的 recovery 缓冲等 2s 后
+  `COMMIT_TIMEOUT`，实测跨机复现并已修复）。
+- **同进程多次 fullsync**：`repl_slave_finish_fullsync()` 的"只执行一次"保护
+  改为按 FULLRESYNC 复位（`g_slave_fullsync_finish_done`）。原 `static already_done`
+  会让 Slave 进程存续期间的第二次 fullsync 只收数据不加载（实测：kill proxy 后
+  Slave 重连 fullsync，offset 显示追平但 key 全部缺失）。
 - proxy 崩溃/重启后：Master 关闭 capture，等待所有 client 到达命令边界
   （5s 超时则关闭半包连接），发 BASELINE 后再打开 capture；旧 proxy 的
   framing 状态不参与新会话。
@@ -350,7 +358,11 @@ vsearch_queries/candidates/returned/total_us/max_us/topk_sum/dim_*
 |---|---|
 | 混合读写 + inline + 半包 + 100 条 pipeline（本地 root eBPF） | HSET/SET/GET 全部正确；`writes=105`、`skips=5`、`global_seq=105`；`gap/desync/timeout/truncated=0`；Slave `applied == master_offset` |
 | kill -9 ebpf-proxy | 1 次会话失效（`COMMIT_CHANNEL`）；proxy 自动重启；Slave REPLSYNC 追平，0 timeout/gap |
-| 单元测试 `test_commit_gate` | RESP/inline/控制行/空行/畸形/半包；CRC/seq/recv_seq 缺口；全局序；BASELINE 重定基；RESUME 丢弃/放行；pending 超时 — 全部 PASS |
+| 跨机 6.1→5.15（eBPF+tcp，60 条分片 pipeline） | `writes=60`、`skips=61`、`gap/desync/timeout=0`；slave applied == master offset；抽样 GET 一致 |
+| 跨机 kill -9 proxy + 继续写 | `COMMIT_CHANNEL` 失效 1 次；proxy 自动重启；第二次 fullsync 正常加载（修复 `already_done` 后）；40 条断线写入全部一致 |
+| 跨机 kill -9 slave + 写 | partial 追平；`slave_repl_applied_offset == master_repl_offset`；断线期间写入一致 |
+| 跨机 Slave 重同步期间持续写（RESUME 竞态） | 连续 8 轮：`RESUME marker=... emitted 6~7 条`；`timeout/desync/gap=0`、`session_invalid=0`；150 条 race key 双端 SHA256 一致 |
+| 单元测试 `test_commit_gate` | RESP/inline/控制行/空行/畸形/半包；CRC/seq/recv_seq 缺口；全局序；BASELINE 重定基；RESUME 丢弃/放行/重复/旧 marker；pending 超时 — 全部 PASS |
 
 ### 10.6 部署注意
 

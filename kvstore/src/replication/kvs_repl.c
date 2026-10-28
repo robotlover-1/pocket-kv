@@ -467,6 +467,9 @@ static unsigned long long g_slave_repl_applied_offset = 0;
 static unsigned long long g_slave_repl_durable_offset = 0;
 int g_slave_loading_fullsync = 0;
 unsigned long long g_slave_fullsync_target_bytes = 0;
+/* 防止同一次 fullsync 被 RDMA IMM / TCP FULLSYNCEND / 字节计数重复 finalize；
+ * 新的 FULLRESYNC 建立时在 repl_slave_set_sync_state() 里复位。 */
+static int g_slave_fullsync_finish_done = 0;
 unsigned long long g_slave_fullsync_loaded_bytes = 0;
 int g_slave_fullsync_tmp_fd = -1;   /* temp file fd for receiving KVSD full sync data */
 static char g_slave_state_path[512] = {0};
@@ -3181,6 +3184,8 @@ void repl_slave_set_sync_state(const char *replid, unsigned long long applied_of
     g_slave_loading_fullsync = fullsync_loading;
     g_slave_fullsync_target_bytes = fullsync_loading ? fullsync_target_bytes : 0;
     g_slave_fullsync_loaded_bytes = 0;
+    /* 新一次 fullsync（同进程内多次重连）：允许再次 finalize。 */
+    if (fullsync_loading) g_slave_fullsync_finish_done = 0;
 #if KVS_ENABLE_RDMA
     if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma") || !strcasecmp(g_cfg.repl_transport_backend, "rdma"))
         fprintf(stderr, "repl rdma: slave_sync_state - replid=%s applied_offset=%llu durable_offset=%llu fullsync_loading=%d target_bytes=%llu\n",
@@ -3210,9 +3215,8 @@ void repl_slave_set_sync_state(const char *replid, unsigned long long applied_of
 static int repl_slave_send_repldone(void);
 
 void repl_slave_finish_fullsync(void) {
-    static int already_done = 0;
-    if (already_done) return;
-    already_done = 1;
+    if (g_slave_fullsync_finish_done) return;
+    g_slave_fullsync_finish_done = 1;
     g_slave_loading_fullsync = 0;
     g_slave_fullsync_target_bytes = 0;
     g_slave_fullsync_loaded_bytes = 0;

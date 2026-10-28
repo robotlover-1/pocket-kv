@@ -117,6 +117,30 @@ static void pc_fault(int reason) {
     else if (reason == 2) g_st_desync++;
     else if (reason == 3) g_st_gap++;
     else if (reason == 4) g_st_channel++;
+    if (reason == 1) {
+        long long now = pc_now_ms();
+        fprintf(stderr, "[commit] timeout detail: buffering=%d wait_resume=%d(age=%lldms) "
+                        "rec_bytes=%zu pending_bytes=%llu pending_cmds=%lld ctxs=%d "
+                        "ready_global=%llu next_global=%llu\n",
+                g_buffering, g_wait_resume,
+                g_wait_resume ? now - g_wait_resume_ms : 0,
+                g_rec_bytes, g_pending_bytes, g_pending_cmd_count, g_ctx_count,
+                g_ready_head ? (unsigned long long)g_ready_head->global_seq : 0,
+                (unsigned long long)g_next_global);
+        for (int i = 0; i < PC_MAX_COOKIES; ++i) {
+            for (pc_ctx_t *c = g_buckets[i]; c; c = c->next) {
+                if (!c->cmd_head && !c->desc_head) continue;
+                fprintf(stderr, "[commit] ctx cookie=%llu baseline=%d next_seq=%llu "
+                                "cmd=%llu(age=%lld) desc=%llu(age=%lld)\n",
+                        (unsigned long long)c->cookie, c->baseline_set,
+                        (unsigned long long)c->next_seq,
+                        c->cmd_head ? (unsigned long long)c->cmd_head->seq : 0,
+                        c->cmd_head ? now - c->cmd_head->created_ms : 0,
+                        c->desc_head ? (unsigned long long)c->desc_head->seq : 0,
+                        c->desc_head ? now - c->desc_head->created_ms : 0);
+            }
+        }
+    }
     fprintf(stderr, "ebpf-proxy: commit gate fault reason=%d\n", reason);
     if (g_fault) g_fault(reason);
 }
@@ -501,12 +525,18 @@ static void pc_on_baseline(uint64_t cookie, uint64_t next_seq) {
 
 static void pc_on_resume(uint64_t marker) {
     /* 丢弃 <= marker（已被 backlog/快照覆盖），其余按序交出 */
+    unsigned long long dropped_bytes = 0, emitted_bytes = 0;
+    int dropped = 0, emitted = 0;
     pc_rec_t *r = g_rec_head;
     while (r) {
         pc_rec_t *nx = r->next;
         if (r->global_seq <= marker) {
+            dropped++;
+            dropped_bytes += r->len;
             if (g_rec_bytes >= r->len) g_rec_bytes -= r->len;
         } else {
+            emitted++;
+            emitted_bytes += r->len;
             if (g_emit) { g_emit(r->data, r->len); g_st_emitted += r->len; }
             if (g_rec_bytes >= r->len) g_rec_bytes -= r->len;
         }
@@ -517,6 +547,10 @@ static void pc_on_resume(uint64_t marker) {
     g_wait_resume = 0;
     g_wait_resume_ms = 0;
     g_resume_event = 1;
+    fprintf(stderr, "ebpf-proxy: RESUME marker=%llu: emitted %d/%llu bytes, "
+                    "dropped %d/%llu bytes (<=marker)\n",
+            (unsigned long long)marker, emitted, emitted_bytes,
+            dropped, dropped_bytes);
 }
 
 static void pc_process_msg(const unsigned char *buf, size_t len) {
