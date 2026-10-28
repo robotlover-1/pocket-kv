@@ -98,6 +98,7 @@ SRCS=$(SRC_DIR)/main/kvstore.c \
      $(SRC_DIR)/replication/kvs_repl_ebpf.c \
      $(SRC_DIR)/replication/kvs_repl_kprobe.c \
      $(SRC_DIR)/replication/kvs_sentinel.c \
+     $(SRC_DIR)/replication/kvs_commit.c \
      $(SRC_DIR)/utils/hash.c
 
 OBJS=$(patsubst $(SRC_DIR)/%.c, build/%.o, $(SRCS))
@@ -178,6 +179,16 @@ test_hash_ownership: $(TEST_HASH_OWNERSHIP_BIN)
 
 check-hash-ownership: test_hash_ownership
 
+# ---- Commit Gate framing/状态机单元测试（非 root）----
+TEST_COMMIT_GATE_SRC=tests/test_commit_gate.c
+TEST_COMMIT_GATE_BIN=tests/test_commit_gate
+
+$(TEST_COMMIT_GATE_BIN): $(TEST_COMMIT_GATE_SRC) src/ebpf_proxy/proxy_commit.c src/ebpf_proxy/proxy_commit.h include/kvstore/replication/commit_gate.h
+	$(CC) $(CFLAGS) -I./src/ebpf_proxy -o $@ $(TEST_COMMIT_GATE_SRC) src/ebpf_proxy/proxy_commit.c
+
+test_commit_gate: $(TEST_COMMIT_GATE_BIN)
+	./$(TEST_COMMIT_GATE_BIN)
+
 # ---- 5w+5w 主从同步测试 ----
 TEST_REPL_5W5W_SRC=tests/test_repl_5w5w.c
 TEST_REPL_5W5W_BIN=tests/test_repl_5w5w
@@ -227,7 +238,7 @@ $(EBPF_DAEMON_BIN): $(EBPF_DAEMON_SRC)
 	$(CC) $(CFLAGS) -o $@ $< -lbpf -lelf -lz
 
 # ---- ebpf-proxy 独立代理进程 ----
-EBPF_PROXY_SRC = src/ebpf_proxy/main.c src/ebpf_proxy/proxy_cache.c src/ebpf_proxy/proxy_slave.c
+EBPF_PROXY_SRC = src/ebpf_proxy/main.c src/ebpf_proxy/proxy_cache.c src/ebpf_proxy/proxy_slave.c src/ebpf_proxy/proxy_commit.c
 EBPF_PROXY_BIN = build/ebpf_proxy
 EBPF_PROXY_CFLAGS = -Wall -Wextra -O2 -I./include -I./third_party/libbpf/include
 EBPF_LIBBPF_A = third_party/libbpf/lib/libbpf.a

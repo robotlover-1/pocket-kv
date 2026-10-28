@@ -136,3 +136,4 @@ tests/test_fullsync_protocol
 /kvstore/tests/test_hash_ownership
 /kvstore/test_kvstore
 /kvstore/test_uring_persist
+/kvstore/tests/test_commit_gate

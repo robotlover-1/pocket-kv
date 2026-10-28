@@ -47,10 +47,12 @@
 
 #define BUFFER_CAP 65536
 #define INBUF_CAP (1024 * 1024)  /* 接收缓冲（支持 1MB 级大 value 命令；独立于 BUFFER_CAP，避免栈数组爆栈） */
-/* eBPF fexit 捕获的单个 record 上限（CLIENT_ENTRY_MAX_LEN=32764）。
+/* eBPF fexit 捕获的单个 record payload 上限。
+ * Commit Gate 事件头为 24B（cookie/recv_seq/len/flags），PERCPU_ARRAY 值上限
+ * 32768，因此 payload 上限 = 32768 - 24 = 32744。
  * capture 生效时 Reactor/Proactor/NtyCo 必须统一把单次 recv 限制在该值以内，
  * 超过部分会被 BPF 丢弃（fail-closed），不能依赖后端各自处理。 */
-#define KVS_EBPF_CAPTURE_MAX_RECV 32764
+#define KVS_EBPF_CAPTURE_MAX_RECV 32744
 #define MAX_EVENTS 1024
 #define LISTEN_BACKLOG 128
 
@@ -176,7 +178,19 @@ typedef struct hashtable_s {
 typedef struct kvs_hash_s {
     hashtable_t ht[2];        // ht[0]: active, ht[1]: expansion target
     int rehash_idx;           // next bucket to migrate, -1 = no rehash in progress
+    uint64_t hash_k0, hash_k1; /* SipHash-2-4 进程级随机 key（防 Hash Flood） */
 } kvs_hash_t;
+
+typedef struct {
+    unsigned long long lookups;
+    unsigned long long hits;
+    unsigned long long misses;
+    unsigned long long probe_steps;
+    unsigned long long max_chain;
+    int slots;
+    int entries;
+    int rehashing;
+} kvs_hash_stats_t;
 
 extern kvs_hash_t global_hash;
 int kvs_hash_create(kvs_hash_t *hash);
@@ -188,10 +202,21 @@ char *kvs_hash_get_len(kvs_hash_t *hash, char *key, size_t *vlen);
 int kvs_hash_mod(kvs_hash_t *hash, char *key, char *value);
 int kvs_hash_del(kvs_hash_t *hash, char *key);
 int kvs_hash_exist(kvs_hash_t *hash, char *key);
+int kvs_hash_get_stats(kvs_hash_stats_t *out);
 /* kvs_vector.c：语义向量检索（VSEARCH 命令实现） */
 #define KVS_VSEARCH_DEFAULT_PREFIX "semcache:"
 int kvs_vector_search(int dim, const float *query, int topk,
                       const char *prefix, int plen, char *resp, int cap);
+typedef struct {
+    unsigned long long queries;
+    unsigned long long candidates;
+    unsigned long long returned;
+    unsigned long long total_us;
+    unsigned long long max_us;
+    unsigned long long topk_sum;
+    unsigned long long by_dim[3];   /* 256 / 384 / 1024 */
+} kvs_vector_stats_t;
+int kvs_vector_get_stats(kvs_vector_stats_t *out);
 #endif
 
 #if ENABLE_SKIPTABLE
@@ -292,6 +317,15 @@ typedef struct conn_s {
     unsigned long long repl_durable_offset_ack;
     long long repl_last_ack_ms;
     long long repl_last_send_ms;
+    /* ---- Commit Gate（阶段3） ---- */
+    uint64_t repl_socket_cookie;   /* accept 时 SO_COOKIE；0=不可用 */
+    uint64_t repl_parsed_seq;      /* 该连接已 dispatch 的命令数（从 1 开始） */
+    uint64_t cur_cmd_seq;          /* 当前正在执行的命令序号 */
+    uint32_t cur_cmd_len;          /* 当前命令原始字节数 */
+    uint64_t cur_cmd_crc;          /* 当前命令 FNV-1a 64 校验和 */
+    int cur_cmd_committed;         /* 当前命令是否已发布 WRITE */
+    uint64_t repl_commit_resume_global; /* 恢复期 RESUME marker（backlog 覆盖到的 global_seq） */
+    struct conn_s *next_all;       /* 全局连接注册表（仅 owner 线程访问） */
     unsigned char *inbuf;          /* 独立 malloc 的接收缓冲（accept 时分配，不清零） */
     size_t in_len;
     unsigned char *out_ring;       /* 独立 malloc 的输出 ring（accept 时分配，不清零） */
@@ -505,6 +539,39 @@ int repl_send_chunked_ctx(conn_t *c, const unsigned char *buf, size_t len, int s
 
 void repl_add_slave(conn_t *c);
 void repl_remove_slave(conn_t *c);
+
+/* ---- Commit Gate（阶段3）：SO_COOKIE / 连接注册 / Master 提交通道 ---- */
+int kvs_socket_cookie(int fd, uint64_t *out);   /* SO_COOKIE；成功 0 */
+/* BPF 捕获 allowlist：只有注册过的 client cookie 才会被捕获 */
+void repl_ebpf_cookie_allow(uint64_t cookie, int allow);
+uint64_t kvs_cmd_crc64(const unsigned char *buf, size_t len);
+/* owner 线程（reactor/proactor/ntyco）内调用 */
+void kvs_conn_register(conn_t *c);
+void kvs_conn_unregister(conn_t *c);
+
+void repl_commit_master_init(void);            /* 建立 commit socket 路径 */
+int repl_commit_connected(void);
+void repl_commit_health_tick(void);            /* 健康线程：重连/HELLO/REARM 标记 */
+int repl_commit_rearm_tick(void);              /* owner 线程：BASELINE + 重开 capture */
+void repl_commit_publish_write(conn_t *c);     /* post-commit（写成功） */
+void repl_commit_publish_skip(conn_t *c);      /* 非写/失败命令 */
+void repl_commit_flush(void);                  /* 批量发送描述符 */
+void repl_commit_baseline(conn_t *c);          /* 新连接/BASELINE */
+void repl_commit_ignore(conn_t *c);            /* 连接变为 replica */
+void repl_commit_forget(conn_t *c);            /* 连接关闭 */
+void repl_commit_resume(uint64_t global_seq);  /* 恢复期结束 */
+uint64_t repl_commit_global_seq(void);
+unsigned long long repl_commit_descriptor_count(void);
+unsigned long long repl_commit_write_count(void);
+unsigned long long repl_commit_skip_count(void);
+unsigned long long repl_commit_desync_count(void);
+unsigned long long repl_commit_timeout_count(void);
+unsigned long long repl_commit_gap_count(void);
+const char *repl_commit_fault_reason_name(void);
+int repl_commit_channel_ok(void);
+int repl_commit_active_mode(void);             /* master + ebpf transport */
+const char *repl_commit_socket_path(void);     /* <dump>.commit.sock */
+void repl_commit_note_proxy_fault(const char *reason);
 int repl_handle_replica_send_failure(conn_t *c, conn_t **linkp);
 void repl_broadcast(const unsigned char *raw, size_t rawlen);
 void repl_note_send_context(const char *stage, size_t len, unsigned long long offset, const unsigned char *buf);
@@ -572,6 +639,9 @@ typedef enum {
     REPL_INVALID_PROXY_HEARTBEAT_STALE,
     REPL_INVALID_CAPTURE_TRUNCATED,
     REPL_INVALID_COMMIT_TIMEOUT,
+    REPL_INVALID_COMMIT_DESYNC,
+    REPL_INVALID_COMMIT_GAP,
+    REPL_INVALID_COMMIT_CHANNEL,
     REPL_INVALID_PROXY_CACHE_FULL,
     REPL_INVALID_BARRIER_TIMEOUT,
 } repl_invalid_reason_t;
@@ -594,7 +664,7 @@ int repl_ebpf_supported(void);
  * 各网络后端据此把单次 recv 限制到 KVS_EBPF_CAPTURE_MAX_RECV。 */
 int repl_ebpf_capture_active(void);
 void repl_ebpf_set_capture_active(int on);
-void repl_ebpf_set_capture_disable(int disable);   /* 同步写 client_ctl[7] */
+void repl_ebpf_set_capture_enable(int enable);   /* 同步写 client_ctl[7]（1=捕获开启） */
 
 /* ebpf-proxy 生命周期（master）：启动时 spawn + 健康检查线程；故障时重启。 */
 void repl_ebpf_proxy_start(void);
@@ -616,6 +686,18 @@ typedef struct {
     unsigned long long dropped_bytes;
     unsigned long long proxy_reconnects;
     int capture_drop;
+    /* Commit Gate（proxy 侧） */
+    unsigned long long commit_descriptors;
+    unsigned long long commit_writes;
+    unsigned long long commit_pending;
+    unsigned long long commit_timeout;
+    unsigned long long commit_desync;
+    unsigned long long commit_gap;
+    unsigned long long commit_recovery_bytes;
+    unsigned long long commit_next_global;
+    int commit_channel_connected;
+    int cache_over_high;
+    unsigned long long cache_hard_hit;
 } kvs_repl_proxy_stats_t;
 int repl_ebpf_proxy_get_stats(kvs_repl_proxy_stats_t *out);
 int repl_ebpf_register_fd(int fd, int is_master_side);

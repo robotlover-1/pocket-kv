@@ -1,4 +1,5 @@
 #include "kvstore/kvstore.h"
+#include <sys/random.h>
 
 kvs_hash_t global_hash = {0};
 
@@ -6,14 +7,60 @@ kvs_hash_t global_hash = {0};
 #define HASH_LOAD_FACTOR 2
 #define REHASH_STEP_BUCKETS 10
 
-/* raw FNV-1a returning full 32-bit hash */
-static uint32_t _hash_raw(const char *key) {
-    uint32_t sum = 2166136261u;
-    for (int i = 0; key[i] != 0; ++i) {
-        sum ^= (unsigned char)key[i];
-        sum *= 16777619u;
+/* ---- SipHash-2-4（keyed；防 Hash Flood） ---- */
+static inline uint64_t _rotl64(uint64_t x, int b) { return (x << b) | (x >> (64 - b)); }
+#define SIPROUND do {                         \
+    v0 += v1; v1 = _rotl64(v1, 13); v1 ^= v0; v0 = _rotl64(v0, 32); \
+    v2 += v3; v3 = _rotl64(v3, 16); v3 ^= v2;                     \
+    v0 += v3; v3 = _rotl64(v3, 21); v3 ^= v0;                     \
+    v2 += v1; v1 = _rotl64(v1, 17); v1 ^= v2; v2 = _rotl64(v2, 32); \
+} while (0)
+
+static uint64_t _siphash24(const unsigned char *in, size_t len,
+                           uint64_t k0, uint64_t k1) {
+    uint64_t v0 = k0 ^ 0x736f6d6570736575ULL;
+    uint64_t v1 = k1 ^ 0x646f72616e646f6dULL;
+    uint64_t v2 = k0 ^ 0x6c7967656e657261ULL;
+    uint64_t v3 = k1 ^ 0x7465646279746573ULL;
+    size_t i = 0;
+    for (; i + 8 <= len; i += 8) {
+        uint64_t m = 0;
+        for (int b = 0; b < 8; ++b)
+            m |= (uint64_t)in[i + b] << (8 * b);
+        v3 ^= m; SIPROUND; SIPROUND; v0 ^= m;
     }
-    return sum;
+    uint64_t b = ((uint64_t)len & 0xff) << 56;
+    for (int shift = 0; i < len; ++i, shift += 8)
+        b |= (uint64_t)in[i] << shift;
+    v3 ^= b; SIPROUND; SIPROUND; v0 ^= b;
+    v2 ^= 0xff; SIPROUND; SIPROUND; SIPROUND; SIPROUND;
+    return v0 ^ v1 ^ v2 ^ v3;
+}
+
+static void _hash_seed(uint64_t *k0, uint64_t *k1) {
+    if (*k0 || *k1) return;
+    ssize_t r0 = getrandom(k0, sizeof(*k0), 0);
+    ssize_t r1 = getrandom(k1, sizeof(*k1), 0);
+    if (r0 != (ssize_t)sizeof(*k0) || r1 != (ssize_t)sizeof(*k1)) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        *k0 = ((uint64_t)ts.tv_sec << 32) ^ (uint64_t)ts.tv_nsec ^
+              ((uint64_t)getpid() << 16) ^ 0x9e3779b97f4a7c15ULL;
+        *k1 = (*k0 * 0xbf58476d1ce4e5b9ULL) ^ 0x94d049bb133111ebULL;
+    }
+}
+
+/* 统计（热路径用普通累加；单 reactor 线程写、INFO 读） */
+static unsigned long long g_hash_lookups = 0;
+static unsigned long long g_hash_hits = 0;
+static unsigned long long g_hash_misses = 0;
+static unsigned long long g_hash_probe_steps = 0;
+static unsigned long long g_hash_max_chain = 0;
+
+static uint32_t _hash_raw(kvs_hash_t *hash, const char *key, size_t klen) {
+    _hash_seed(&hash->hash_k0, &hash->hash_k1);
+    return (uint32_t)_siphash24((const unsigned char *)key, klen,
+                                hash->hash_k0, hash->hash_k1);
 }
 
 /* modulo-reduced for a given table size */
@@ -81,6 +128,7 @@ int kvs_hash_create(kvs_hash_t *hash) {
     if (!hash) return -1;
     memset(hash, 0, sizeof(*hash));
     hash->rehash_idx = -1;
+    _hash_seed(&hash->hash_k0, &hash->hash_k1);
     hash->ht[0].nodes = (hashnode_t**)kvs_malloc(sizeof(hashnode_t*) * HASH_INIT_SIZE);
     if (!hash->ht[0].nodes) return -1;
     memset(hash->ht[0].nodes, 0, sizeof(hashnode_t*) * HASH_INIT_SIZE);
@@ -191,22 +239,27 @@ static int _maybe_shrink(kvs_hash_t *hash) {
 
 /* search both tables, returns node pointer or NULL */
 static hashnode_t *_find_node(kvs_hash_t *hash, const char *key) {
+    size_t klen = strlen(key);
+    g_hash_lookups++;
     /* try ht[0] */
     if (hash->ht[0].nodes && hash->ht[0].count > 0) {
-        uint32_t hv = _hash_raw(key);
+        uint32_t hv = _hash_raw(hash, key, klen);
         int idx = _hash_idx(hv, hash->ht[0].max_slots);
         for (hashnode_t *n = hash->ht[0].nodes[idx]; n; n = n->next) {
-            if (strcmp(n->key, key) == 0) return n;
+            g_hash_probe_steps++;
+            if (strcmp(n->key, key) == 0) { g_hash_hits++; return n; }
         }
     }
     /* try ht[1] if rehashing */
     if (hash->rehash_idx >= 0 && hash->ht[1].nodes && hash->ht[1].count > 0) {
-        uint32_t hv = _hash_raw(key);
+        uint32_t hv = _hash_raw(hash, key, klen);
         int idx = _hash_idx(hv, hash->ht[1].max_slots);
         for (hashnode_t *n = hash->ht[1].nodes[idx]; n; n = n->next) {
-            if (strcmp(n->key, key) == 0) return n;
+            g_hash_probe_steps++;
+            if (strcmp(n->key, key) == 0) { g_hash_hits++; return n; }
         }
     }
+    g_hash_misses++;
     return NULL;
 }
 
@@ -232,12 +285,15 @@ int kvs_hash_set(kvs_hash_t *hash, char *key, char *value) {
     if (exist) return _overwrite_value(exist, value, strlen(value));
 
     /* compute hv once */
-    uint32_t hv = _hash_raw(key);
+    uint32_t hv = _hash_raw(hash, key, strlen(key));
 
     /* if rehashing, insert into ht[1]; else ht[0] */
     hashtable_t *target = (hash->rehash_idx >= 0) ? &hash->ht[1] : &hash->ht[0];
     int idx = _hash_idx(hv, target->max_slots);
 
+    unsigned long long chain = 0;
+    for (hashnode_t *it = target->nodes[idx]; it; it = it->next) chain++;
+    if (chain + 1 > g_hash_max_chain) g_hash_max_chain = chain + 1;
     hashnode_t *new_node = _create_node(hv, key, value);
     if (!new_node) return -2;
     new_node->next = target->nodes[idx];
@@ -257,10 +313,13 @@ int kvs_hash_set_len(kvs_hash_t *hash, char *key, char *value, size_t vlen) {
     hashnode_t *exist = _find_node(hash, key);
     if (exist) return _overwrite_value(exist, value, vlen);
 
-    uint32_t hv = _hash_raw(key);
+    uint32_t hv = _hash_raw(hash, key, strlen(key));
     hashtable_t *target = (hash->rehash_idx >= 0) ? &hash->ht[1] : &hash->ht[0];
     int idx = _hash_idx(hv, target->max_slots);
 
+    unsigned long long chain = 0;
+    for (hashnode_t *it = target->nodes[idx]; it; it = it->next) chain++;
+    if (chain + 1 > g_hash_max_chain) g_hash_max_chain = chain + 1;
     hashnode_t *new_node = _create_node_len(hv, key, strlen(key), value, vlen);
     if (!new_node) return -2;
     new_node->next = target->nodes[idx];
@@ -293,7 +352,7 @@ int kvs_hash_del(kvs_hash_t *hash, char *key) {
     if (!hash || !key) return -1;
     _rehash_step(hash, REHASH_STEP_BUCKETS);
 
-    uint32_t hv = _hash_raw(key);
+    uint32_t hv = _hash_raw(hash, key, strlen(key));
 
     /* search ht[0] */
     if (hash->ht[0].nodes && hash->ht[0].count > 0) {
@@ -330,4 +389,19 @@ int kvs_hash_del(kvs_hash_t *hash, char *key) {
     }
 
     return 1;
+}
+
+
+int kvs_hash_get_stats(kvs_hash_stats_t *out) {
+    if (!out) return -1;
+    memset(out, 0, sizeof(*out));
+    out->lookups = g_hash_lookups;
+    out->hits = g_hash_hits;
+    out->misses = g_hash_misses;
+    out->probe_steps = g_hash_probe_steps;
+    out->max_chain = g_hash_max_chain;
+    out->slots = global_hash.ht[0].max_slots;
+    out->entries = global_hash.ht[0].count + global_hash.ht[1].count;
+    out->rehashing = global_hash.rehash_idx >= 0;
+    return 0;
 }

@@ -658,6 +658,9 @@ static int queue_snapshot(conn_t *c) {
     repl_rdma_log("queue_snapshot - begin replid=%s offset=%llu", repl_master_id(), repl_master_offset());
     /* 记录全量同步启动时的 offset，用于后续回放 gap */
     unsigned long long snap_base_offset = repl_master_offset();
+    /* Commit Gate：快照对应的 global_seq 边界。REPLDONE 时 RESUME 会丢弃
+     * proxy recovery 缓冲中 <= 该值的提交（它们已包含在快照里）。 */
+    if (c) c->repl_commit_resume_global = repl_commit_global_seq();
 
     /* 全量同步期间抑制增量广播，避免 KVSD 数据流被 repl_broadcast 写穿插 */
     g_repl_fullsync_in_progress = 1;
@@ -1418,6 +1421,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         }
 
         repl_add_slave(c);
+        if (repl_commit_active_mode()) repl_commit_ignore(c);
         repl_replica_update_ack(c, req_offset, req_durable);
         c->repl_fullsync_pending = can_continue ? 0 : 1;
 
@@ -1425,10 +1429,22 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             repl_note_partialsync_result(1);
             int is_ebpf = (c->repl_transport_kind == KVS_REPL_TRANSPORT_EBPF_TCP);
             if (is_ebpf) {
-                /* 先停捕获并让 proxy 进入 BUFFERING，再把 backlog 同步发完；
-                 * 随后才打开捕获（新写 > 当前 offset），由 proxy 缓存到追平后 flush。 */
-                repl_ebpf_set_capture_disable(1);
-                repl_notify_ebpf_proxy_fullsync(1);
+                if (repl_commit_active_mode()) {
+                    /* Commit Gate：capture 保持开启（framing 不能从半包重启）。
+                     * 先切 BUFFERING，已提交写进入 proxy recovery 缓冲；
+                     * backlog 发完记录 RESUME marker，ACK 追平后丢弃 <= marker。 */
+                    repl_notify_ebpf_proxy_fullsync(1);
+                    if (!repl_ebpf_proxy_wait_buffering(100)) {
+                        fprintf(stderr, "repl: proxy did not enter BUFFERING, fail-closed\n");
+                        repl_session_invalidate(REPL_INVALID_BARRIER_TIMEOUT);
+                        c->repl_draining = 1;
+                        return 0;
+                    }
+                } else {
+                    /* 旧路径：停捕获 → 发 backlog → 重开捕获 */
+                    repl_ebpf_set_capture_enable(0);
+                    repl_notify_ebpf_proxy_fullsync(1);
+                }
             }
             int send_rc = is_ebpf
                 ? repl_backlog_send_continue_queued(c, req_offset)
@@ -1440,37 +1456,54 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
                 return 0;
             }
             if (is_ebpf) {
-                if (!repl_ebpf_proxy_wait_buffering(100)) {
-                    fprintf(stderr, "repl: proxy did not enter BUFFERING, fail-closed\n");
-                    repl_session_invalidate(REPL_INVALID_BARRIER_TIMEOUT);
-                    c->repl_draining = 1;
-                    return 0;
+                if (repl_commit_active_mode()) {
+                    c->repl_commit_resume_global = repl_commit_global_seq();
+                } else {
+                    if (!repl_ebpf_proxy_wait_buffering(100)) {
+                        fprintf(stderr, "repl: proxy did not enter BUFFERING, fail-closed\n");
+                        repl_session_invalidate(REPL_INVALID_BARRIER_TIMEOUT);
+                        c->repl_draining = 1;
+                        return 0;
+                    }
+                    repl_ebpf_set_capture_enable(1);
                 }
                 c->repl_recovery_mode = 2;
                 c->repl_capture_resume_offset = repl_master_offset();
                 c->repl_recovery_deadline_ms = kvs_now_ms() + 10000;
-                repl_ebpf_set_capture_disable(0);
             }
         } else {
             repl_note_partialsync_result(argc >= 3 ? 0 : 1);
-            if (queue_snapshot(c) != 0) {
-                repl_rdma_log("master_replsync - queue_snapshot failed");
-                c->repl_draining = 1;
-                c->repl_fullsync_pending = 0;
-                if (c->repl_transport_kind == KVS_REPL_TRANSPORT_EBPF_TCP)
-                    repl_session_invalidate(REPL_INVALID_BARRIER_TIMEOUT);
-            } else if (c->repl_transport_kind == KVS_REPL_TRANSPORT_EBPF_TCP) {
-                /* 快照发送期间 reactor 阻塞、无新写；发送完成后确认 proxy 已 BUFFERING，
-                 * 再从当前 offset 起捕获（REPLDONE 时 flush）。 */
+            int is_ebpf_full = (c->repl_transport_kind == KVS_REPL_TRANSPORT_EBPF_TCP);
+            if (is_ebpf_full && repl_commit_active_mode()) {
+                /* 快照发送前先切 BUFFERING：已提交写进入 recovery 缓冲，避免穿插快照 */
+                repl_notify_ebpf_proxy_fullsync(1);
                 if (!repl_ebpf_proxy_wait_buffering(100)) {
-                    fprintf(stderr, "repl: proxy did not enter BUFFERING after snapshot, fail-closed\n");
+                    fprintf(stderr, "repl: proxy did not enter BUFFERING before snapshot, fail-closed\n");
                     repl_session_invalidate(REPL_INVALID_BARRIER_TIMEOUT);
                     c->repl_draining = 1;
                     return 0;
                 }
+            }
+            if (queue_snapshot(c) != 0) {
+                repl_rdma_log("master_replsync - queue_snapshot failed");
+                c->repl_draining = 1;
+                c->repl_fullsync_pending = 0;
+                if (is_ebpf_full) {
+                    repl_session_invalidate(REPL_INVALID_BARRIER_TIMEOUT);
+                }
+            } else if (is_ebpf_full) {
+                if (!repl_commit_active_mode()) {
+                    /* 旧路径：快照发送期间 reactor 阻塞，发送完成后重开 capture */
+                    if (!repl_ebpf_proxy_wait_buffering(100)) {
+                        fprintf(stderr, "repl: proxy did not enter BUFFERING after snapshot, fail-closed\n");
+                        repl_session_invalidate(REPL_INVALID_BARRIER_TIMEOUT);
+                        c->repl_draining = 1;
+                        return 0;
+                    }
+                    repl_ebpf_set_capture_enable(1);
+                }
                 c->repl_capture_resume_offset = repl_master_offset();
                 c->repl_recovery_deadline_ms = kvs_now_ms() + 60000;
-                repl_ebpf_set_capture_disable(0);
             }
         }
         return 0;
@@ -1513,8 +1546,11 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             if (applied_offset >= c->repl_capture_resume_offset) {
                 c->repl_recovery_mode = 0;
                 c->repl_recovery_deadline_ms = 0;
-                if (!repl_capture_gate_blocked())
+                if (!repl_capture_gate_blocked()) {
+                    if (repl_commit_active_mode())
+                        repl_commit_resume(c->repl_commit_resume_global);
                     repl_notify_ebpf_proxy_fullsync(0);
+                }
                 fprintf(stderr, "repl: ebpf replica caught up at %llu, capture resumed\n",
                         applied_offset);
             } else {
@@ -1536,6 +1572,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
                 c->repl_recovery_deadline_ms = 0;
                 if (c->repl_capture_resume_offset < repl_master_offset())
                     c->repl_capture_resume_offset = repl_master_offset();
+                if (repl_commit_active_mode())
+                    repl_commit_resume(c->repl_commit_resume_global);
             }
 
             /* 通知 ebpf-proxy 全量同步结束，flush 缓存 → 恢复 FORWARDING */
@@ -1609,7 +1647,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         return 0;
     }
     if (!strcmp(cmd, "INFO")) {
-        char info[12288];
+        char info[16384];
         char recover[1024] = {0};
         kvs_repl_ebpf_stats_t ebpf_stats;
         kvs_repl_kprobe_stats_t kprobe_stats;
@@ -1668,6 +1706,21 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             "repl_proxy_cache_bytes:%llu\n"
             "repl_proxy_dropped_bytes:%llu\n"
             "repl_proxy_reconnects:%llu\n"
+            "repl_commit_active:%d\n"
+            "repl_commit_channel:%d\n"
+            "repl_commit_global_seq:%llu\n"
+            "repl_commit_descriptors:%llu\n"
+            "repl_commit_writes:%llu\n"
+            "repl_commit_skips:%llu\n"
+            "repl_commit_pending_bytes:%llu\n"
+            "repl_commit_timeout:%llu\n"
+            "repl_commit_desync:%llu\n"
+            "repl_commit_gap:%llu\n"
+            "repl_commit_recovery_bytes:%llu\n"
+            "repl_commit_next_global_seq:%llu\n"
+            "repl_commit_fault_reason:%s\n"
+            "repl_proxy_cache_over_high:%d\n"
+            "repl_proxy_cache_hard_hit:%llu\n"
             "repl_backlog_size:%llu\n"
             "repl_backlog_histlen:%llu\n"
             "repl_backlog_start_offset:%llu\n"
@@ -1759,6 +1812,21 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             px_stats.cache_bytes,
             px_stats.dropped_bytes,
             px_stats.proxy_reconnects,
+            repl_commit_active_mode(),
+            px_stats.commit_channel_connected,
+            (unsigned long long)repl_commit_global_seq(),
+            repl_commit_descriptor_count(),
+            repl_commit_write_count(),
+            repl_commit_skip_count(),
+            px_stats.commit_pending,
+            px_stats.commit_timeout,
+            px_stats.commit_desync,
+            px_stats.commit_gap,
+            px_stats.commit_recovery_bytes,
+            px_stats.commit_next_global,
+            repl_commit_fault_reason_name(),
+            px_stats.cache_over_high,
+            px_stats.cache_hard_hit,
             repl_backlog_size(),
             repl_backlog_histlen(),
             repl_backlog_start_offset(),
@@ -1809,6 +1877,37 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             kprobe_stats.rdma_errors,
             recover_n >= 0 ? recover : "");
 
+        {
+            size_t used = strlen(info);
+            kvs_hash_stats_t hs;
+            kvs_vector_stats_t vs;
+            if (used < sizeof(info) && kvs_hash_get_stats(&hs) == 0) {
+                kvs_vector_get_stats(&vs);
+                snprintf(info + used, sizeof(info) - used,
+                    "hash_lookups:%llu\n"
+                    "hash_hits:%llu\n"
+                    "hash_misses:%llu\n"
+                    "hash_probe_steps:%llu\n"
+                    "hash_max_chain:%llu\n"
+                    "hash_slots:%d\n"
+                    "hash_entries:%d\n"
+                    "hash_rehashing:%d\n"
+                    "vsearch_queries:%llu\n"
+                    "vsearch_candidates:%llu\n"
+                    "vsearch_returned:%llu\n"
+                    "vsearch_total_us:%llu\n"
+                    "vsearch_max_us:%llu\n"
+                    "vsearch_topk_sum:%llu\n"
+                    "vsearch_dim_256:%llu\n"
+                    "vsearch_dim_384:%llu\n"
+                    "vsearch_dim_1024:%llu\n",
+                    hs.lookups, hs.hits, hs.misses, hs.probe_steps,
+                    hs.max_chain, hs.slots, hs.entries, hs.rehashing,
+                    vs.queries, vs.candidates, vs.returned, vs.total_us,
+                    vs.max_us, vs.topk_sum,
+                    vs.by_dim[0], vs.by_dim[1], vs.by_dim[2]);
+            }
+        }
         n = resp_bulk(resp, BUFFER_CAP, info, strlen(info));
         if (c) queue_bytes(c, (unsigned char *)resp, (size_t)n);
         goto out;
@@ -1918,7 +2017,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
                 if (pr == KVS_PERSIST_PENDING) {
                     resp = NULL;
                 }
-                if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
+                if (g_cfg.role == ROLE_MASTER) { repl_commit_publish_write(c); repl_broadcast(raw, rawlen); }
             }
         } else if (lrc == 1) {
             n = resp_integer(resp, BUFFER_CAP, 0);
@@ -1944,7 +2043,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
                 if (pr == KVS_PERSIST_PENDING) {
                     resp = NULL;
                 }
-                if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
+                if (g_cfg.role == ROLE_MASTER) { repl_commit_publish_write(c); repl_broadcast(raw, rawlen); }
             }
         } else if (lrc == 1) {
             n = resp_integer(resp, BUFFER_CAP, 0);
@@ -1970,7 +2069,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
                 if (pr == KVS_PERSIST_PENDING) {
                     resp = NULL;
                 }
-                if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
+                if (g_cfg.role == ROLE_MASTER) { repl_commit_publish_write(c); repl_broadcast(raw, rawlen); }
             }
         } else if (lrc == 1) {
             n = resp_integer(resp, BUFFER_CAP, 0);
@@ -2056,7 +2155,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
                 if (pr == KVS_PERSIST_PENDING) {
                     resp = NULL;
                 }
-                if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
+                if (g_cfg.role == ROLE_MASTER) { repl_commit_publish_write(c); repl_broadcast(raw, rawlen); }
             }
         } else {
             n = resp_error(resp, BUFFER_CAP, "docset failed");
@@ -2085,7 +2184,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
                 if (pr == KVS_PERSIST_PENDING) {
                     resp = NULL;
                 }
-                if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
+                if (g_cfg.role == ROLE_MASTER) { repl_commit_publish_write(c); repl_broadcast(raw, rawlen); }
             }
         } else if (drc == 1) {
             n = resp_error(resp, BUFFER_CAP, "doc or field not found");
@@ -2110,7 +2209,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
                 if (pr == KVS_PERSIST_PENDING) {
                     resp = NULL;
                 }
-                if (g_cfg.role == ROLE_MASTER) repl_broadcast(raw, rawlen);
+                if (g_cfg.role == ROLE_MASTER) { repl_commit_publish_write(c); repl_broadcast(raw, rawlen); }
             }
         } else if (drc == 1) {
             n = resp_error(resp, BUFFER_CAP, "doc not found");
@@ -2366,6 +2465,7 @@ engine_dispatch:
                 g_last_write_ts = time(NULL);
                 repl_backlog_feed(raw, rawlen);
                 repl_note_broadcast(rawlen);   /* 无条件计数 — offset 反映所有写命令 */
+                repl_commit_publish_write(c);  /* Commit Gate：post-commit，成功写才转发 */
                 repl_broadcast(raw, rawlen);
             }
         }
@@ -2573,7 +2673,14 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
             int argc = split_inline_argv(line, argv, 32);
             if (argc > 0) {
                 for (int i = 0; i < argc; ++i) argl[i] = strlen(argv[i]);
+                if (c && !from_replication && !c->is_replica) {
+                    c->cur_cmd_seq = ++c->repl_parsed_seq;
+                    c->cur_cmd_len = (uint32_t)(line_end + 1 - pos);
+                    c->cur_cmd_crc = kvs_cmd_crc64(buf + pos, c->cur_cmd_len);
+                    c->cur_cmd_committed = 0;
+                }
                 handle_parsed_command(c, argc, argv, argl, buf + pos, line_end + 1 - pos, from_replication);
+                if (c && !from_replication) repl_commit_publish_skip(c);
             }
             kvs_free(line);
             pos = line_end + 1;
@@ -2689,7 +2796,14 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
             else break;
             continue;
         }
+        if (c && !from_replication && !c->is_replica) {
+            c->cur_cmd_seq = ++c->repl_parsed_seq;
+            c->cur_cmd_len = (uint32_t)(p - start);
+            c->cur_cmd_crc = kvs_cmd_crc64(buf + start, c->cur_cmd_len);
+            c->cur_cmd_committed = 0;
+        }
         handle_parsed_command(c, argc, argv, argl, buf + start, p - start, from_replication);
+        if (c && !from_replication) repl_commit_publish_skip(c);
         for (int i = 0; i < argc; ++i) {
             if (no_scratch && i >= 1) continue;  /* buf ptr, not allocated */
             if (argv[i] < scratch || argv[i] >= scratch + PARSE_SCRATCH) kvs_free(argv[i]);
@@ -2703,6 +2817,7 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
     } else if (pos >= *len) {
         *len = 0;
     }
+    if (!from_replication) repl_commit_flush();
     return 0;
 }
 
@@ -3117,6 +3232,7 @@ int main(int argc, char **argv) {
     if (g_cfg.role == ROLE_MASTER) {
         /* spawn + 健康监控：proxy 崩溃/心跳过期/截断时自动失效会话并重启 */
         repl_ebpf_proxy_start();
+        repl_commit_master_init();
         repl_ebpf_health_start();
         pthread_t tid;
         pthread_create(&tid, NULL, ebpf_proxy_init_bg, NULL);

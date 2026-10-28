@@ -10,6 +10,8 @@ static void close_conn_nty(conn_t *c) {
 
     if (c->is_replica) repl_remove_slave(c);
 
+    if (repl_commit_active_mode()) repl_commit_forget(c);
+    kvs_conn_unregister(c);
     repl_ebpf_unregister_fd(c->fd);
     close(c->fd);
 
@@ -70,6 +72,8 @@ static void server_reader(void *arg) {
 
         c->in_len += (size_t)n;
         parse_resp_stream(c, c->inbuf, &c->in_len, 0);
+        (void)repl_commit_rearm_tick();
+        repl_commit_flush();
         persist_flush_pending();
         persist_reap_completions();  /* reap AOF CQEs after command processing */
 
@@ -164,6 +168,9 @@ static void server_main(void *arg) {
         c->out_ring = c->inbuf + INBUF_CAP;
         c->fd = cfd;
         c->repl_transport_kind = KVS_REPL_TRANSPORT_TCP;
+        (void)kvs_socket_cookie(cfd, &c->repl_socket_cookie);
+        kvs_conn_register(c);
+        if (repl_commit_active_mode()) repl_commit_baseline(c);
 
         nty_coroutine *co = NULL;
         nty_coroutine_create(&co, server_reader, c);

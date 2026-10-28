@@ -65,21 +65,55 @@ static int allowed_dim(int d) {
     return 0;
 }
 
+/* ---- VSEARCH 观测指标 ---- */
+static kvs_vector_stats_t g_vec_stats;
+
+static long long _vnow_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000LL;
+}
+static int _dim_index(int d) {
+    for (int i = 0; i < VSEARCH_ALLOWED_DIMS; i++) if (VSEARCH_DIMS[i] == d) return i;
+    return -1;
+}
+static void _vec_stat_done(long long t0, int topk, int n) {
+    long long us = _vnow_us() - t0;
+    g_vec_stats.queries++;
+    g_vec_stats.total_us += (unsigned long long)us;
+    if ((unsigned long long)us > g_vec_stats.max_us) g_vec_stats.max_us = (unsigned long long)us;
+    if (topk > 0) g_vec_stats.topk_sum += (unsigned long long)topk;
+    if (n > 0) g_vec_stats.returned += (unsigned long long)n;
+}
+
+int kvs_vector_get_stats(kvs_vector_stats_t *out) {
+    if (!out) return -1;
+    *out = g_vec_stats;
+    return 0;
+}
+
 int kvs_vector_search(int dim, const float *query, int topk,
                       const char *prefix, int plen, char *resp, int cap) {
-    if (!query || !prefix) return resp_error(resp, cap, "vsearch bad args");
-    if (cap < 16) return -1;
+    long long t0 = _vnow_us();
+    if (!query || !prefix) { int rc = resp_error(resp, cap, "vsearch bad args");
+        _vec_stat_done(t0, 0, 0); return rc; }
+    if (cap < 16) { _vec_stat_done(t0, 0, 0); return -1; }
 
     /* 参数校验：dim 白名单、1<=topk<=100、前缀白名单（显式空前缀 len<1 → 非法） */
     if (!allowed_dim(dim) || topk < 1 || topk > 100) {
-        return resp_error(resp, cap, "vsearch bad args");
+        int rc = resp_error(resp, cap, "vsearch bad args");
+        _vec_stat_done(t0, 0, 0); return rc;
     }
     if (!valid_prefix(prefix, plen)) {
-        return resp_error(resp, cap, "vsearch bad prefix");
+        int rc = resp_error(resp, cap, "vsearch bad prefix");
+        _vec_stat_done(t0, 0, 0); return rc;
     }
+    int di = _dim_index(dim);
+    if (di >= 0) g_vec_stats.by_dim[di]++;
 
     cand_t *cands = (cand_t *)calloc((size_t)topk, sizeof(cand_t));
-    if (!cands) return resp_error(resp, cap, "vsearch oom");
+    if (!cands) { int rc = resp_error(resp, cap, "vsearch oom");
+        _vec_stat_done(t0, topk, 0); return rc; }
     int n = 0;
 
     /* 遍历 ht[0]（rehash 中再查 ht[1]；节点只在一个表），只收当前前缀条目；
@@ -89,6 +123,7 @@ int kvs_vector_search(int dim, const float *query, int topk,
         hashtable_t *ht = &global_hash.ht[t];
         for (int i = 0; i < ht->max_slots && ht->nodes; i++) {
             for (hashnode_t *node = ht->nodes[i]; node; node = node->next) {
+                g_vec_stats.candidates++;
                 if (memcmp(node->key, prefix, (size_t)plen) != 0) continue;
                 const float *vec = NULL; int vdim = 0;
                 if (parse_vec(node->value, node->vlen, dim, &vec, &vdim) != 0) continue;
@@ -114,15 +149,16 @@ int kvs_vector_search(int dim, const float *query, int topk,
     char ds[32];
     for (int i = 0; i < n; i++) {
         int klen = strlen(cands[i].key);
-        if (pos + 2 + klen + 2 + 16 > cap) { free(cands); return -1; } /* 前置粗检防超界 */
+        if (pos + 2 + klen + 2 + 16 > cap) { free(cands); _vec_stat_done(t0, topk, n); return -1; } /* 前置粗检防超界 */
         int rb = resp_bulk(resp + pos, cap - pos, cands[i].key, klen);
-        if (rb < 0) { free(cands); return -1; }
+        if (rb < 0) { free(cands); _vec_stat_done(t0, topk, n); return -1; }
         pos += rb;
         int dlen = snprintf(ds, sizeof(ds), "%.4f", cands[i].score);
         rb = resp_bulk(resp + pos, cap - pos, ds, dlen);
-        if (rb < 0) { free(cands); return -1; }
+        if (rb < 0) { free(cands); _vec_stat_done(t0, topk, n); return -1; }
         pos += rb;
     }
     free(cands);
+    _vec_stat_done(t0, topk, n);
     return pos;
 }

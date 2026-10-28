@@ -46,16 +46,60 @@ void repl_ebpf_set_capture_active(int on) {
     g_repl_ebpf_capture_active = on ? 1 : 0;
 }
 
-/* 同步写 BPF capture gate（client_ctl[7]）并更新进程内状态。
+/* SO_COOKIE：Commit Gate 用 socket cookie 关联 Master 命令与 BPF 捕获记录。
+ * 与 BPF 的 bpf_get_socket_cookie(sk) 返回同一个值。 */
+int kvs_socket_cookie(int fd, uint64_t *out) {
+    socklen_t len = sizeof(*out);
+    if (!out) return -1;
+    *out = 0;
+#ifdef SO_COOKIE
+    return getsockopt(fd, SOL_SOCKET, SO_COOKIE, out, &len);
+#else
+    (void)fd;
+    (void)len;
+    return -1;
+#endif
+}
+
+void repl_ebpf_cookie_allow(uint64_t cookie, int allow) {
+    if (cookie == 0) return;
+#if KVS_ENABLE_EBPF
+    if (!g_cfg.ebpf_pin_path[0]) return;
+    char path[512];
+    snprintf(path, sizeof(path), "%s/client_cookies", g_cfg.ebpf_pin_path);
+    int fd = bpf_obj_get(path);
+    if (fd < 0) return;
+    if (allow) {
+        uint8_t one = 1;
+        bpf_map_update_elem(fd, &cookie, &one, BPF_ANY);
+    } else {
+        bpf_map_delete_elem(fd, &cookie);
+    }
+    close(fd);
+#else
+    (void)allow;
+#endif
+}
+
+uint64_t kvs_cmd_crc64(const unsigned char *buf, size_t len) {
+    uint64_t h = 1469598103934665603ULL;   /* FNV-1a 64 offset basis */
+    for (size_t i = 0; i < len; ++i) {
+        h ^= (uint64_t)buf[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+/* 同步写 BPF capture gate（client_ctl[7]，1=开启）并更新进程内状态。
  * REPLSYNC/失效路径需要立即生效，不能等 100ms 健康线程。 */
-void repl_ebpf_set_capture_disable(int disable) {
-    unsigned int key = 7;   /* CTL_KEY_CAPTURE_DISABLE */
-    unsigned long long val = disable ? 1 : 0;
+void repl_ebpf_set_capture_enable(int enable) {
+    unsigned int key = 7;   /* CTL_KEY_CAPTURE_ENABLE */
+    unsigned long long val = enable ? 1 : 0;
     int fd = -1;
     /* 顺序必须保证 recv clamp 先于 BPF 打开捕获生效（关闭时晚于 BPF 停止）：
-     * 否则 map 写 0 到本地 active=1 之间的窗口内，BPF 可能已捕获一次
-     * >32764 的 recv，触发 CAPTURE_TRUNCATED fail-closed。 */
-    if (!disable) repl_ebpf_set_capture_active(1);
+     * 否则 map 写 1 到本地 active=1 之间的窗口内，BPF 可能已捕获一次
+     * >32744 的 recv，触发 CAPTURE_TRUNCATED fail-closed。 */
+    if (enable) repl_ebpf_set_capture_active(1);
 #if KVS_ENABLE_EBPF
     if (g_cfg.ebpf_pin_path[0]) {
         char path[512];
@@ -69,7 +113,7 @@ void repl_ebpf_set_capture_disable(int disable) {
 #else
     (void)key; (void)val; (void)fd;
 #endif
-    if (disable) repl_ebpf_set_capture_active(0);
+    if (!enable) repl_ebpf_set_capture_active(0);
 }
 
 #if KVS_ENABLE_EBPF
@@ -117,16 +161,7 @@ static void repl_ebpf_clear_fds(void) {
 }
 
 static int repl_ebpf_socket_cookie(int fd, __u64 *cookie_out) {
-    socklen_t len = sizeof(*cookie_out);
-    if (!cookie_out) return -1;
-    *cookie_out = 0;
-#ifdef SO_COOKIE
-    return getsockopt(fd, SOL_SOCKET, SO_COOKIE, cookie_out, &len);
-#else
-    (void)fd;
-    (void)len;
-    return -1;
-#endif
+    return kvs_socket_cookie(fd, (uint64_t *)cookie_out);
 }
 
 static void repl_ebpf_raise_memlock(void) {
@@ -449,13 +484,17 @@ int repl_ebpf_backpressure(void) {
         if (fd < 0) { g_repl_ebpf_bp_cached = 0; return 0; }   /* ebpf-proxy 未启动：无捕获，无需背压 */
         g_repl_ebpf_backpressure_fd = fd;
     }
-    __u32 key = 4;   /* KVS_EBPF_CLIENT_CTL_BACKPRESSURE */
-    __u64 val = 0;
-    if (bpf_map_lookup_elem(g_repl_ebpf_backpressure_fd, &key, &val) != 0) {
-        g_repl_ebpf_bp_cached = 0;
-        return 0;
+    /* 背压键：4=ringbuf、6=proxy 转发队列、11=cache 高水位（任一置位即停读） */
+    static const __u32 bp_keys[] = { 4, 6, 11 };
+    int any = 0;
+    for (size_t bi = 0; bi < sizeof(bp_keys) / sizeof(bp_keys[0]); ++bi) {
+        __u64 val = 0;
+        if (bpf_map_lookup_elem(g_repl_ebpf_backpressure_fd, &bp_keys[bi], &val) == 0 && val) {
+            any = 1;
+            break;
+        }
     }
-    if (val == 0) {
+    if (!any) {
         g_repl_ebpf_bp_cached = 0;
         return 0;
     }
@@ -502,8 +541,9 @@ int repl_ebpf_backpressure(void) {
 #define EBPF_CTL_KEY_MASTER_PID        1
 #define EBPF_CTL_KEY_MASTER_PORT       2
 #define EBPF_CTL_KEY_HEARTBEAT         5
-#define EBPF_CTL_KEY_CAPTURE_DISABLE   7
+#define EBPF_CTL_KEY_CAPTURE_ENABLE    7   /* 1=允许捕获（默认 0） */
 #define EBPF_CTL_KEY_CAPTURE_FAULT     8
+#define EBPF_CTL_KEY_COMMIT_FAULT      10  /* proxy 上报 commit gate 故障原因 */
 #define EBPF_CLIENT_STATS_EVENTS       6   /* ST_RB_OK */
 #define EBPF_CLIENT_STATS_BYTES        9   /* ST_BYTES */
 #define EBPF_CLIENT_STATS_TRUNCATED    8   /* ST_TRUNCATED */
@@ -664,6 +704,7 @@ static void ebpf_proxy_spawn(void) {
         (char *)"--master-pid", masterbuf,
         (char *)"--master-port", portbuf,
         (char *)"--pid-file", pidfile,
+        (char *)"--commit-sock", (char *)repl_commit_socket_path(),
         NULL
     };
     rc = posix_spawn(&pid, g_cfg.ebpf_proxy_bin, NULL, NULL, argv, environ);
@@ -729,26 +770,47 @@ static void repl_ebpf_health_tick(void) {
     }
     if (g_ebpf_proxy_healthy) {
         g_ebpf_proxy_ever_healthy = 1;
-        g_ebpf_failure_handled = 0;
+        /* 只有 commit 通道也恢复后才解除“已失效”标记，避免 proxy 刚死、
+         * 心跳尚未过期期间每 100ms 重复触发 COMMIT_CHANNEL 失效。 */
+        if (!repl_commit_active_mode() || repl_commit_connected())
+            g_ebpf_failure_handled = 0;
     }
 
     /* 恢复超时（fullsync/追赶卡住）→ 再次失效 */
     repl_recovery_tick();
 
+    /* Commit Gate 控制面维护（重连/HELLO；成功后由 owner 线程 REARM） */
+    repl_commit_health_tick();
+
     /* BPF 截断 fail-closed */
     if (g_ebpf_proxy_healthy && ebpf_ctl_read(EBPF_CTL_KEY_CAPTURE_FAULT, &fault) == 0 && fault) {
-        ebpf_ctl_write(EBPF_CTL_KEY_CAPTURE_DISABLE, 1);
-        repl_ebpf_set_capture_active(0);
+        repl_ebpf_set_capture_enable(0);
         repl_session_invalidate(REPL_INVALID_CAPTURE_TRUNCATED);
-        ebpf_ctl_write(EBPF_CTL_KEY_CAPTURE_FAULT, 0);   /* 已 fail-closed，proxy 靠 disable 丢弃 */
+        ebpf_ctl_write(EBPF_CTL_KEY_CAPTURE_FAULT, 0);
         g_ebpf_failure_handled = 1;
         fprintf(stderr, "repl: capture truncated → replication session invalidated\n");
     }
 
+    /* Commit Gate 故障（proxy 写 client_ctl[10]） */
+    {
+        unsigned long long cf = 0;
+        if (g_ebpf_proxy_healthy &&
+            ebpf_ctl_read(EBPF_CTL_KEY_COMMIT_FAULT, &cf) == 0 && cf) {
+            repl_ebpf_set_capture_enable(0);
+            repl_invalid_reason_t reason = REPL_INVALID_COMMIT_TIMEOUT;
+            if (cf == 2) reason = REPL_INVALID_COMMIT_DESYNC;
+            else if (cf == 3) reason = REPL_INVALID_COMMIT_GAP;
+            else if (cf == 4) reason = REPL_INVALID_COMMIT_CHANNEL;
+            repl_session_invalidate(reason);
+            ebpf_ctl_write(EBPF_CTL_KEY_COMMIT_FAULT, 0);
+            g_ebpf_failure_handled = 1;
+            fprintf(stderr, "repl: commit gate fault code=%llu → session invalidated\n", cf);
+        }
+    }
+
     if (!g_ebpf_proxy_healthy) {
         /* proxy 失活：关 capture → 失效副本会话 → 冷却后重启 proxy */
-        ebpf_ctl_write(EBPF_CTL_KEY_CAPTURE_DISABLE, 1);
-        repl_ebpf_set_capture_active(0);
+        repl_ebpf_set_capture_enable(0);
         if ((g_ebpf_proxy_ever_healthy || repl_capture_gate_has_replica()) &&
             !g_ebpf_failure_handled) {
             repl_session_invalidate(REPL_INVALID_PROXY_HEARTBEAT_STALE);
@@ -761,19 +823,24 @@ static void repl_ebpf_health_tick(void) {
         return;
     }
 
-    /* proxy 健康：非恢复期由健康线程统一开关 capture；恢复期（REPLSYNC 追赶）
-     * 由 REPLSYNC 在确认 proxy 已 BUFFERING 后自行打开，这里不能覆盖。 */
+    if (repl_commit_active_mode()) {
+        /* Commit Gate：capture 只由 owner 线程 REARM（等命令边界→BASELINE）打开；
+         * 通道断开时保持关闭，并失效一次当前复制会话。 */
+        if (!repl_commit_connected()) {
+            repl_ebpf_set_capture_enable(0);
+            if (g_ebpf_proxy_ever_healthy && !g_ebpf_failure_handled) {
+                repl_session_invalidate(REPL_INVALID_COMMIT_CHANNEL);
+                g_ebpf_failure_handled = 1;
+            }
+        }
+        return;
+    }
+
+    /* 旧模式（无 Commit Gate）：按副本存在与否开关 capture */
     if (!repl_capture_gate_blocked()) {
         int gate = repl_capture_gate_has_replica();
-        if (gate) {
-            /* 先置本地 clamp，再允许 BPF 捕获（避免大 recv 竞态） */
-            repl_ebpf_set_capture_active(1);
-            ebpf_ctl_write(EBPF_CTL_KEY_CAPTURE_DISABLE, 0);
-            ebpf_ctl_write(EBPF_CTL_KEY_CAPTURE_FAULT, 0);
-        } else {
-            ebpf_ctl_write(EBPF_CTL_KEY_CAPTURE_DISABLE, 1);
-            repl_ebpf_set_capture_active(0);
-        }
+        repl_ebpf_set_capture_enable(gate);
+        if (gate) ebpf_ctl_write(EBPF_CTL_KEY_CAPTURE_FAULT, 0);
     }
 }
 
@@ -843,6 +910,28 @@ int repl_ebpf_proxy_get_stats(kvs_repl_proxy_stats_t *out) {
             if (bpf_map_lookup_elem(fd, &k, &v) == 0) out->proxy_reconnects = v;
             k = 6;
             if (bpf_map_lookup_elem(fd, &k, &v) == 0) out->capture_drop = (int)v;
+            k = 7;
+            if (bpf_map_lookup_elem(fd, &k, &v) == 0) out->commit_descriptors = v;
+            k = 8;
+            if (bpf_map_lookup_elem(fd, &k, &v) == 0) out->commit_writes = v;
+            k = 9;
+            if (bpf_map_lookup_elem(fd, &k, &v) == 0) out->commit_pending = v;
+            k = 10;
+            if (bpf_map_lookup_elem(fd, &k, &v) == 0) out->commit_timeout = v;
+            k = 11;
+            if (bpf_map_lookup_elem(fd, &k, &v) == 0) out->commit_desync = v;
+            k = 12;
+            if (bpf_map_lookup_elem(fd, &k, &v) == 0) out->commit_gap = v;
+            k = 13;
+            if (bpf_map_lookup_elem(fd, &k, &v) == 0) out->commit_recovery_bytes = v;
+            k = 14;
+            if (bpf_map_lookup_elem(fd, &k, &v) == 0) out->commit_next_global = v;
+            k = 15;
+            if (bpf_map_lookup_elem(fd, &k, &v) == 0) out->commit_channel_connected = (int)v;
+            k = 16;
+            if (bpf_map_lookup_elem(fd, &k, &v) == 0) out->cache_over_high = (int)v;
+            k = 17;
+            if (bpf_map_lookup_elem(fd, &k, &v) == 0) out->cache_hard_hit = v;
             close(fd);
         }
     }

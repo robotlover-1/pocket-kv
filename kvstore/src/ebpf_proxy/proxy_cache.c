@@ -21,14 +21,9 @@ int cache_append(cache_ctx_t *ctx, const unsigned char *data, size_t len) {
     node->len = len;
     memcpy(node->data, data, len);
 
-    while (ctx->total_bytes + len > PROXY_CACHE_MAX_BYTES && ctx->head) {
-        cache_node_t *old = ctx->head;
-        ctx->head = old->next;
-        if (!ctx->head) ctx->tail = NULL;
-        ctx->total_bytes -= old->len;
-        ctx->node_count--;
-        ctx->dropped++;
-        free(old);
+    if (ctx->total_bytes + len > PROXY_CACHE_MAX_BYTES) {
+        ctx->hard_hit++;
+        return -2;
     }
 
     if (!ctx->head) {
@@ -41,6 +36,10 @@ int cache_append(cache_ctx_t *ctx, const unsigned char *data, size_t len) {
     ctx->total_bytes += len;
     ctx->node_count++;
     if (ctx->total_bytes > ctx->max_bytes) ctx->max_bytes = ctx->total_bytes;
+    if (!ctx->over_high && ctx->total_bytes >= PROXY_CACHE_HIGH_BYTES)
+        ctx->over_high = 1;
+    else if (ctx->over_high && ctx->total_bytes <= PROXY_CACHE_LOW_BYTES)
+        ctx->over_high = 0;
     return 0;
 }
 
@@ -83,6 +82,7 @@ int cache_flush(cache_ctx_t *ctx, int fd) {
     ctx->tail = NULL;
     ctx->total_bytes = 0;
     ctx->node_count = 0;
+    ctx->over_high = 0;
     return sent;
 }
 

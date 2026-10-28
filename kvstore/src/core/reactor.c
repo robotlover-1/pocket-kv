@@ -85,6 +85,8 @@ void close_conn(conn_t *c) {
     /* 从转发线程队列 + 发送状态移除该 conn，避免 free 后转发线程仍解引用 conn_t（UAF）。
      * 必须在 free 之前调用。 */
     repl_fwd_purge_conn(c);
+    if (repl_commit_active_mode()) repl_commit_forget(c);
+    kvs_conn_unregister(c);
 
     repl_ebpf_unregister_fd(c->fd);
     epoll_ctl(g_epfd, EPOLL_CTL_DEL, c->fd, NULL);
@@ -137,6 +139,9 @@ static void on_accept(conn_t *lc) {
 
         c->fd = cfd;
         c->repl_transport_kind = KVS_REPL_TRANSPORT_TCP;
+        (void)kvs_socket_cookie(cfd, &c->repl_socket_cookie);
+        kvs_conn_register(c);
+        if (repl_commit_active_mode()) repl_commit_baseline(c);
         fdmap[cfd] = c;
 
         struct epoll_event ev;
@@ -383,6 +388,11 @@ int reactor_start(void) {
                 on_write(c);
             }
         }
+
+        /* Commit Gate：proxy 重连后等命令边界→BASELINE→重开 capture；
+         * 同时发送本批 commit 描述符。 */
+        (void)repl_commit_rearm_tick();
+        repl_commit_flush();
 
         /* group-commit: flush + reap any completed batches */
         persist_flush_pending();

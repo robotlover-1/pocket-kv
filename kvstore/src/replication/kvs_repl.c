@@ -3386,6 +3386,9 @@ const char *repl_invalid_reason_name(repl_invalid_reason_t reason) {
     case REPL_INVALID_PROXY_HEARTBEAT_STALE: return "PROXY_HEARTBEAT_STALE";
     case REPL_INVALID_CAPTURE_TRUNCATED:     return "CAPTURE_TRUNCATED";
     case REPL_INVALID_COMMIT_TIMEOUT:        return "COMMIT_TIMEOUT";
+    case REPL_INVALID_COMMIT_DESYNC:         return "COMMIT_DESYNC";
+    case REPL_INVALID_COMMIT_GAP:            return "COMMIT_GAP";
+    case REPL_INVALID_COMMIT_CHANNEL:        return "COMMIT_CHANNEL";
     case REPL_INVALID_PROXY_CACHE_FULL:      return "PROXY_CACHE_FULL";
     case REPL_INVALID_BARRIER_TIMEOUT:       return "BARRIER_TIMEOUT";
     case REPL_INVALID_NONE:                  break;
@@ -3409,7 +3412,7 @@ void repl_session_invalidate(repl_invalid_reason_t reason) {
                 repl_invalid_reason_name(reason));
     }
     /* 捕获数据已不可信：先停 capture，避免失效窗口继续产生新数据 */
-    repl_ebpf_set_capture_disable(1);
+    repl_ebpf_set_capture_enable(0);
 
     /* 只影响 eBPF 增量副本；shutdown 唤醒 reactor 的 recv 并走正常关闭路径。
      * slave 侧控制连接断开后会自动重连并 REPLSYNC。 */
