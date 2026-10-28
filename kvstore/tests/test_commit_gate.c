@@ -26,12 +26,16 @@ static unsigned char g_out[65536];
 static size_t g_out_len = 0;
 static int g_out_count = 0;
 
-static void emit_cb(const unsigned char *buf, size_t len) {
+static int g_fail_emit = 0;
+
+static int emit_cb(const unsigned char *buf, size_t len) {
+    if (g_fail_emit) return -1;
     if (g_out_len + len <= sizeof(g_out)) {
         memcpy(g_out + g_out_len, buf, len);
         g_out_len += len;
     }
     g_out_count++;
+    return 0;
 }
 
 static int g_fault_reason = 0;
@@ -70,12 +74,15 @@ static void send_hello(uint64_t epoch) {
     CHECK(send(g_sock, &m, sizeof(m), 0) == (ssize_t)sizeof(m), "send hello");
 }
 
+/* 后续控制消息使用的 commit epoch；0 = 旧式/不校验，便于既有用例。 */
+static uint64_t g_msg_epoch = 0;
+
 static void send_baseline(uint64_t cookie, uint64_t next_seq) {
     repl_commit_msg_t m;
     repl_commit_kv_t kv = { cookie, next_seq };
     memset(&m, 0, sizeof(m));
     m.magic = REPL_COMMIT_MAGIC; m.version = REPL_COMMIT_VERSION;
-    m.type = REPL_COMMIT_MSG_BASELINE; m.count = 1;
+    m.type = REPL_COMMIT_MSG_BASELINE; m.count = 1; m.epoch = g_msg_epoch;
     unsigned char buf[sizeof(m) + sizeof(kv)];
     memcpy(buf, &m, sizeof(m));
     memcpy(buf + sizeof(m), &kv, sizeof(kv));
@@ -90,7 +97,7 @@ static void send_desc(uint64_t cookie, uint64_t seq, uint64_t global,
     memset(&m, 0, sizeof(m));
     memset(&d, 0, sizeof(d));
     m.magic = REPL_COMMIT_MAGIC; m.version = REPL_COMMIT_VERSION;
-    m.type = REPL_COMMIT_MSG_BATCH; m.count = 1;
+    m.type = REPL_COMMIT_MSG_BATCH; m.count = 1; m.epoch = g_msg_epoch;
     d.cookie = cookie; d.command_seq = seq; d.global_seq = global;
     d.raw_len = (uint32_t)len; d.flags = flags;
     d.crc = force_bad_crc ? crc_override : crc64(raw, len);
@@ -104,7 +111,7 @@ static void send_resume(uint64_t marker) {
     repl_commit_msg_t m;
     memset(&m, 0, sizeof(m));
     m.magic = REPL_COMMIT_MAGIC; m.version = REPL_COMMIT_VERSION;
-    m.type = REPL_COMMIT_MSG_RESUME; m.global_seq = marker;
+    m.type = REPL_COMMIT_MSG_RESUME; m.global_seq = marker; m.epoch = g_msg_epoch;
     CHECK(send(g_sock, &m, sizeof(m), 0) == (ssize_t)sizeof(m), "send resume");
 }
 
@@ -277,6 +284,59 @@ int main(void) {
     CHECK(g_fault_reason == 0 && g_out_count == 2 &&
           memcmp(g_out + strlen(b), c, strlen(c)) == 0,
           "stale RESUME keeps newer writes");
+
+    /* 9c. epoch 隔离：旧 epoch 的 BATCH/RESUME 不得影响当前 session */
+    reset_out();
+    proxy_commit_purge();
+    g_msg_epoch = 0xE1;
+    send_baseline(6001, 1);
+    poll_once(0);
+    poll_once(1);
+    feed(6001, 1, a);
+    g_msg_epoch = 0xE2;
+    send_desc(6001, 1, 20, (const unsigned char *)a, strlen(a), REPL_COMMIT_FLAG_WRITE, 0, 0);
+    poll_once(1);
+    CHECK(g_fault_reason == 0, "stale epoch BATCH ignored");
+    g_msg_epoch = 0xE1;
+    send_desc(6001, 1, 20, (const unsigned char *)a, strlen(a), REPL_COMMIT_FLAG_WRITE, 0, 0);
+    poll_once(1);
+    CHECK(g_fault_reason == 0 && g_out_count == 0, "current epoch BATCH buffered");
+    g_msg_epoch = 0xE2;
+    send_resume(19);
+    poll_once(1);
+    CHECK(g_fault_reason == 0 && g_out_count == 0, "stale epoch RESUME ignored");
+    g_msg_epoch = 0xE1;
+    send_resume(19);
+    poll_once(1);
+    CHECK(g_fault_reason == 0 && g_out_count == 1 &&
+          g_out_len == strlen(a) && memcmp(g_out, a, strlen(a)) == 0,
+          "current epoch RESUME drains recovery");
+    g_msg_epoch = 0;
+
+    /* 9d. emit 失败必须 fail-closed，且不得计入 delivered */
+    reset_out();
+    proxy_commit_purge();
+    send_baseline(7001, 1);
+    poll_once(0);
+    feed(7001, 1, a);
+    g_fail_emit = 1;
+    send_desc(7001, 1, 30, (const unsigned char *)a, strlen(a), REPL_COMMIT_FLAG_WRITE, 0, 0);
+    poll_once(0);
+    g_fail_emit = 0;
+    CHECK(g_fault_reason == 1 && g_out_count == 0,
+          "emit failure → timeout/fail-closed, nothing delivered");
+
+    /* 9e. BASELINE 之前到达的首批记录必须保留（大 value 首条 record 不能丢） */
+    reset_out();
+    proxy_commit_purge();
+    feed(8001, 1, a);                 /* ringbuf 记录先于 BASELINE 到达 */
+    send_baseline(8001, 1);
+    poll_once(0);
+    send_desc(8001, 1, 40, (const unsigned char *)a, strlen(a), REPL_COMMIT_FLAG_WRITE, 0, 0);
+    poll_once(0);
+    CHECK(g_fault_reason == 0 && g_out_count == 1 &&
+          g_out_len == strlen(a) && memcmp(g_out, a, strlen(a)) == 0,
+          "pre-baseline captured bytes preserved");
 
     /* 10. BASELINE 重定基：从 seq=5 开始 */
     reset_out();

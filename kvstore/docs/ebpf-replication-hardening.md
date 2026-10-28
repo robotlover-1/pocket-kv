@@ -362,7 +362,10 @@ vsearch_queries/candidates/returned/total_us/max_us/topk_sum/dim_*
 | 跨机 kill -9 proxy + 继续写 | `COMMIT_CHANNEL` 失效 1 次；proxy 自动重启；第二次 fullsync 正常加载（修复 `already_done` 后）；40 条断线写入全部一致 |
 | 跨机 kill -9 slave + 写 | partial 追平；`slave_repl_applied_offset == master_repl_offset`；断线期间写入一致 |
 | 跨机 Slave 重同步期间持续写（RESUME 竞态） | 连续 8 轮：`RESUME marker=... emitted 6~7 条`；`timeout/desync/gap=0`、`session_invalid=0`；150 条 race key 双端 SHA256 一致 |
-| 单元测试 `test_commit_gate` | RESP/inline/控制行/空行/畸形/半包；CRC/seq/recv_seq 缺口；全局序；BASELINE 重定基；RESUME 丢弃/放行/重复/旧 marker；pending 超时 — 全部 PASS |
+| 单元测试 `test_commit_gate` | RESP/inline/控制行/空行/畸形/半包；CRC/seq/recv_seq 缺口；全局序；BASELINE 重定基；RESUME 丢弃/放行/重复/旧 marker；epoch 隔离；emit 失败；baseline 前记录保留；pending 超时 — 全部 PASS |
+| 本地 root 故障门禁 `check-commit-gate-faults`（1 轮，seed=20261028） | 严格 RESP 全字节比对；空值/同长度不同值/30KB/31KB/缺失 key 全 PASS；kill proxy/slave 后 0 mismatch、`timeout/desync/gap=0`；RESULT: PASS |
+| ACK 超时 fail-closed（CG-02） | 代码已改为 `repl_barrier_cancel + session_invalidate(BARRIER_TIMEOUT)`，不 release/flush；**SIGSTOP 场景未能复现 partial barrier（本地均走 fullsync），动态未验证** |
+| >32KB 单命令（CG-03 扩展） | 6.1 `ITER_UBUF` 一次 recv 填满 32KB 时 `bpf_probe_read_user` 返回 -EFAULT。现改为：读失败不消耗 recv_seq、置 capture fault → session invalid → fullsync。50KB 实测经 fullsync 收敛；自动门禁只覆盖 ≤31KB，**流式转发 >32KB 仍受限** |
 
 ### 10.6 部署注意
 

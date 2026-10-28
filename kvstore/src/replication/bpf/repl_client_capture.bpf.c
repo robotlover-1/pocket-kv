@@ -212,7 +212,7 @@ int fexit_tcp_recvmsg(__u64 *ctx)
     unsigned long user_ptr;
     if (head._nr > 0) {
         cstat_inc(ST_IOVEC);
-        if (!head.ptr) return 0;
+        if (!head.ptr) { cstat_inc(24); return 0; }
         struct { unsigned long b; unsigned long l; } vec;
         if (bpf_probe_read_kernel(&vec, sizeof(vec), (const void *)head.ptr) != 0)
             return 0;
@@ -222,32 +222,27 @@ int fexit_tcp_recvmsg(__u64 *ctx)
             safe_len = (unsigned long long)retval;
         if (safe_len > CLIENT_ENTRY_MAX_LEN)
             safe_len = CLIENT_ENTRY_MAX_LEN;
-        if (safe_len == 0) return 0;
+        if (safe_len == 0) { cstat_inc(25); return 0; }
         data_len = (int)safe_len;
         user_ptr = (unsigned long)vec.b;
     } else {
         cstat_inc(ST_UBUF);
-        if (!head.ptr || head._count == 0) return 0;
-        /* ITER_UBUF: head.ptr = ubuf 基址（不随拷贝推进），数据在 [ubuf, ubuf+retval)。 */
+        /* ITER_UBUF: head.ptr = ubuf 基址（不随拷贝推进），数据在 [ubuf, ubuf+retval)。
+         * 不能检查 head._count == 0：fexit 时刻 iter.count 已被消费，当一次
+         * recv 正好填满请求缓冲（大 value / 满载 pipeline）时 count 归零，
+         * 会把整条 32KB record 静默丢弃（实测 33KB/50KB/100KB SET 的前 32744
+         * 字节丢失，尾部被当成新命令 → COMMIT_DESYNC）。长度以 retval 为准。 */
+        if (!head.ptr) { cstat_inc(26); return 0; }
         data_len = (int)retval;
         user_ptr = head.ptr;
     }
     if (data_len <= 0 || user_ptr == 0) return 0;
-    if (data_len > CLIENT_ENTRY_MAX_LEN) return 0;
+    if (data_len > CLIENT_ENTRY_MAX_LEN) { cstat_inc(27); return 0; }
     /* volatile 阻止编译器把已知范围优化掉 AND；给 verifier 一个明确的
      * 无符号上界（bpf_probe_read_user 的 size 参数要求 min>=0）。 */
     volatile unsigned int rd_tmp = (unsigned int)data_len;
     unsigned int rd_len = rd_tmp & 0x7fffu;
     if (rd_len > CLIENT_ENTRY_MAX_LEN) rd_len = CLIENT_ENTRY_MAX_LEN;
-
-    /* 序号只在“确实要输出 record”时分配：前面任何 early-return（EAGAIN/
-     * 非目标 socket/截断）都不能消耗序号，否则 proxy 会看到空洞。 */
-    __u64 *seqp = bpf_map_lookup_elem(&cookie_seq, &cookie);
-    __u64 seq = seqp ? (*seqp + 1) : 1;
-    if (bpf_map_update_elem(&cookie_seq, &cookie, &seq, BPF_ANY) != 0) {
-        cstat_inc(ST_SEQ_FAIL);
-        return 0;
-    }
 
     /* 用 client_tmpbuf 中转 + ringbuf_output。自适应唤醒：
      * 低水位 BPF_RB_NO_WAKEUP(1) 省每 recv 的 self-IPI（原 flags=0 占 master CPU2 25-27%）；
@@ -255,7 +250,26 @@ int fexit_tcp_recvmsg(__u64 *ctx)
     __u32 tmp_key = 0;
     unsigned char(*entry)[CLIENT_ENTRY_HDR_SZ + CLIENT_ENTRY_MAX_LEN];
     entry = bpf_map_lookup_elem(&client_tmpbuf, &tmp_key);
-    if (!entry) return 0;
+    if (!entry) { cstat_inc(28); return 0; }
+
+    /* 先读用户数据，成功后才分配序号：读失败（含 6.1 ITER_UBUF 满载 recv
+     * 的 -EFAULT）必须 fail-closed，不能消耗 recv_seq 造成 proxy 看到空洞。 */
+    if (bpf_probe_read_user((*entry) + CLIENT_ENTRY_HDR_SZ, rd_len,
+            (const void *)user_ptr) != 0) {
+        cstat_inc(ST_USER_FAIL);
+        __u64 one = 1;
+        bpf_map_update_elem(&client_ctl, &fault_key, &one, BPF_ANY);
+        return 0;
+    }
+
+    /* 序号只在“确实要输出 record”时分配：前面任何 early-return（EAGAIN/
+     * 非目标 socket/截断/读失败）都不能消耗序号，否则 proxy 会看到空洞。 */
+    __u64 *seqp = bpf_map_lookup_elem(&cookie_seq, &cookie);
+    __u64 seq = seqp ? (*seqp + 1) : 1;
+    if (bpf_map_update_elem(&cookie_seq, &cookie, &seq, BPF_ANY) != 0) {
+        cstat_inc(ST_SEQ_FAIL);
+        return 0;
+    }
 
     __u32 payload_len = (__u32)data_len;
     __u32 cap_flags = CAPTURE_FLAG_NONE;
@@ -263,12 +277,6 @@ int fexit_tcp_recvmsg(__u64 *ctx)
     __builtin_memcpy(*entry + 8, &seq, 8);
     __builtin_memcpy(*entry + 16, &payload_len, 4);
     __builtin_memcpy(*entry + 20, &cap_flags, 4);
-
-    if (bpf_probe_read_user((*entry) + CLIENT_ENTRY_HDR_SZ, rd_len,
-            (const void *)user_ptr) != 0) {
-        cstat_inc(ST_USER_FAIL);
-        return 0;
-    }
 
     /* 生产端水位背压：检测频率与 tcp_recvmsg 同步。只负责高水位置位（仅在状态变化时
      * 更新 map，避免正常低水位下每次 fexit 冗余写）；低水位由 proxy 消费端（ringbuf

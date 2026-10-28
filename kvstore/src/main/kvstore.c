@@ -25,8 +25,10 @@ extern int repl_backlog_copy_range(unsigned long long offset, unsigned char **ou
 
 /* 定义在本文件后部：repl_add_slave/repl_remove_slave 需要在此通知 proxy session 边界 */
 static void repl_notify_ebpf_proxy_session(int valid, unsigned long long sid);
-/* 定义在本文件后部：session end 时要放行屏障，避免 proxy 永久停在 BUFFERING */
+/* 定义在本文件后部：正常完成走 release（发 RESUME + flush）；
+ * 超时/断连/session end 走 cancel（不得 flush 未确认数据）。 */
 static void repl_barrier_release(void);
+static void repl_barrier_cancel(void);
 
 #define KVS_DEFAULT_CONFIG_PATH "kvstore.conf"
 
@@ -579,9 +581,11 @@ static void repl_reject_replica(conn_t *c) {
 static void repl_end_session_notify(void) {
     fprintf(stderr, "master: replication session end "
                     "(capture disabled, proxy cache invalidated)\n");
-    /* 最后一个 Slave 都没了：屏障不能继续立着，否则新 Slave 接入时 proxy 一直停在
-     * BUFFERING（虽然 begin 会复用屏障，但语义上应当先释放再重新建立）。 */
-    repl_barrier_release();
+    /* 最后一个 Slave 都没了：屏障必须作废，但**不能**走正常 release ——
+     * 那会发 RESUME 并让 proxy flush 未经 ACK 确认的数据。这里只清 Master 侧
+     * 屏障状态；proxy 侧由随后的 SESSION_VALID=0 / CAPTURE_ENABLE=0 丢弃 cache。
+     * 下一次 REPLSYNC 的 repl_barrier_begin() 会用下降沿重置 proxy 的屏障状态。 */
+    repl_barrier_cancel();
     repl_session_end();
     repl_notify_ebpf_proxy_session(0, 0);
 }
@@ -786,7 +790,8 @@ static unsigned long long g_barrier_resume_global = 0;/* 屏障边界对应的�
 static int g_barrier_resume_valid = 0;                /* marker 是否有效（0 也是合法 marker） */
 static long long g_barrier_deadline_ms = 0;           /* 等 Slave ack 的兜底期限，0=不设 */
 #define REPL_BARRIER_WAIT_MS      3000    /* 等 proxy 应答 BUFFERING */
-#define REPL_BARRIER_HOLD_MAX_MS 15000    /* 等 Slave 追上（兜底，防永久 BUFFERING） */
+#define REPL_BARRIER_DOWN_WAIT_MS  1000   /* 等 proxy 离开上一轮遗留的 BUFFERING */
+#define REPL_BARRIER_HOLD_MAX_MS 15000    /* 等 Slave 追上；超时 fail-closed，不强制放行 */
 
 static int repl_proxy_barrier_needed(void) {
     if (!g_cfg.ebpf_pin_path[0]) return 0;
@@ -807,17 +812,38 @@ static int repl_barrier_begin(unsigned long long *catchup_end) {
         return 0;
     }
 
-    /* 先清应答再拉请求：proxy 按 [3] 的**边沿**应答，清 [12] 保证不会把上一轮的
-     * 陈旧应答误判成本轮成功。 */
+    /* 若 proxy 仍停留在上一轮的 BUFFERING（session end / 超时 cancel 后 [3] 可能
+     * 仍为 1），先制造一次下降沿并等它确认 FORWARDING。否则本轮写 [3]=1 不会
+     * 产生边沿，proxy 不会重新应答，Master 会误判超时。 */
+    repl_ebpf_client_ctl_set(KVS_CTL_PROXY_STATE, 0);
+    if (repl_ebpf_client_ctl_get(KVS_CTL_FULLSYNC_STATE) != 0) {
+        repl_ebpf_client_ctl_set(KVS_CTL_FULLSYNC_STATE, 0);
+        long long down_deadline = kvs_now_ms() + REPL_BARRIER_DOWN_WAIT_MS;
+        int down = 0;
+        while (kvs_now_ms() < down_deadline) {
+            if (repl_ebpf_client_ctl_get(KVS_CTL_PROXY_STATE) == 0) { down = 1; break; }
+            usleep(2000);
+        }
+        if (!down) {
+            fprintf(stderr, "master: proxy did not leave stale BUFFERING within "
+                            "%dms — fail-closed, refusing to resync\n",
+                    REPL_BARRIER_DOWN_WAIT_MS);
+            g_barrier_resume_global = 0;
+            g_barrier_resume_valid = 0;
+            return -1;
+        }
+    }
+
+    /* 坑：proxy 按 [3] 的**边沿**应答，清 [12] 保证不会把上一轮的陈旧应答
+     * 误判成本轮成功。 */
     repl_ebpf_client_ctl_set(KVS_CTL_PROXY_STATE, 0);
     repl_ebpf_client_ctl_set(KVS_CTL_FULLSYNC_STATE, 1);
     /* 屏障时刻的 Commit Gate 边界：此后的写进入 proxy recovery 缓冲；
      * 放行时 RESUME 丢弃 <= 该 marker 的提交（已被快照/backlog replay 覆盖）。
      * 本函数在 owner 线程执行且阻塞等待 proxy 应答，期间不会再提交新写，
-     * 因此这里取的 global_seq 与 catchup_end 一致。 */
+     * 因此这里取的 global_seq 与 catchup_end 一致。
+     * marker=0 合法：必须用一个独立标志表示"需要发送 RESUME"。 */
     g_barrier_resume_global = repl_commit_global_seq();
-    /* marker=0 合法（屏障建立前本进程尚无提交）：必须用一个独立标志表示
-     * "需要发送 RESUME"，否则 0 会被误判为未设置而漏发。 */
     g_barrier_resume_valid = 1;
 
     long long deadline = kvs_now_ms() + REPL_BARRIER_WAIT_MS;
@@ -828,6 +854,8 @@ static int repl_barrier_begin(unsigned long long *catchup_end) {
     }
     if (!ok) {
         repl_ebpf_client_ctl_set(KVS_CTL_FULLSYNC_STATE, 0);   /* 回滚，避免遗留 BUFFERING */
+        g_barrier_resume_global = 0;
+        g_barrier_resume_valid = 0;
         fprintf(stderr, "master: ebpf-proxy barrier NOT confirmed within %dms — "
                         "fail-closed, refusing to resync (proxy dead/hung?)\n",
                 REPL_BARRIER_WAIT_MS);
@@ -843,32 +871,69 @@ static int repl_barrier_begin(unsigned long long *catchup_end) {
     return 0;
 }
 
-/* 放行：proxy 切回 FORWARDING 并 flush 本 session 的 cache。 */
+/* 正常放行：仅当 Slave 已 ACK 到 catchup_end（partial）或 REPLDONE（full）。
+ * 先发 RESUME（proxy 丢弃 <=marker、其余进 cache），再写 [3]=0 让 proxy flush；
+ * RESUME 发送失败则 fail-closed，绝不 flush 未确认数据。 */
 static void repl_barrier_release(void) {
     if (!g_barrier_active) return;
     g_barrier_active = 0;
     g_barrier_ack_gated = 0;
     g_barrier_deadline_ms = 0;
     if (repl_proxy_barrier_needed()) {
-        fprintf(stderr, "master: proxy barrier down — proxy will flush its cache\n");
-        repl_ebpf_client_ctl_set(KVS_CTL_FULLSYNC_STATE, 0);
-        /* 先放行屏障，再发 RESUME：proxy 收到后丢弃 <= marker 的 recovery 提交，
-         * 其余按 global_seq 放行，随后才会 flush cache。 */
+        int resume_rc = 0;   /* 0 = 成功；-1 = 发送失败 */
         if (repl_commit_active_mode() && g_barrier_resume_valid)
-            repl_commit_resume(g_barrier_resume_global);
+            resume_rc = repl_commit_resume(g_barrier_resume_global);
+        if (resume_rc != 0) {
+            /* 控制通道不可用：不能让 proxy 继续 flush recovery/cache。
+             * 保持 [3]=1（BUFFERING），由 session invalidate 关闭 capture 并
+             * 断开副本；Slave 重连后重新建立屏障（begin 会重置遗留状态）。 */
+            fprintf(stderr, "master: RESUME(marker=%llu) send failed — "
+                            "fail-closed, invalidating replication session\n",
+                    g_barrier_resume_global);
+            repl_session_invalidate(REPL_INVALID_COMMIT_CHANNEL);
+        } else {
+            fprintf(stderr, "master: proxy barrier down — proxy will flush its cache\n");
+            repl_ebpf_client_ctl_set(KVS_CTL_FULLSYNC_STATE, 0);
+        }
     }
+    g_barrier_resume_global = 0;
+    g_barrier_resume_valid = 0;
+}
+
+/* 异常作废屏障：不发 RESUME、不写 [3]=0（禁止 flush 未 ACK 的 recovery/cache）。
+ * 调用方负责失效 session / 断开副本；proxy 的旧 cache 由 SESSION_VALID=0 丢弃，
+ * 下一次 repl_barrier_begin() 会先用下降沿把 proxy 从 BUFFERING 清出来。 */
+static void repl_barrier_cancel(void) {
+    if (!g_barrier_active && !g_barrier_resume_valid) return;
+    fprintf(stderr, "master: proxy barrier cancelled without RESUME "
+                    "(fail-closed; unacked recovery must be discarded)\n");
+    g_barrier_active = 0;
+    g_barrier_ack_gated = 0;
+    g_barrier_deadline_ms = 0;
     g_barrier_resume_global = 0;
     g_barrier_resume_valid = 0;
 }
 
 int repl_barrier_pending(void) { return g_barrier_active; }
 
-/* partial resync 专用：改为"等 Slave 的 REPLACK 追上 catchup_end 再放行"，
- * 并启用超时兜底（避免 Slave 无写流量不发 REPLACK 时永久 BUFFERING）。 */
+/* Slave 每秒发送 REPLACK 心跳，因此正常情况下即使没有新写流量也会 ACK 追平；
+ * 超时只用于 fail-closed 兜底，绝不代表"可以放行"。测试可用环境变量缩短。 */
+static long long repl_barrier_hold_max_ms(void) {
+    static long long v = -1;
+    if (v < 0) {
+        const char *e = getenv("KVS_REPL_BARRIER_HOLD_MAX_MS");
+        v = e ? atoll(e) : REPL_BARRIER_HOLD_MAX_MS;
+        if (v < 1000) v = 1000;
+    }
+    return v;
+}
+
+/* partial resync 专用：等 Slave 的 REPLACK 追上 catchup_end 再放行，
+ * 并设置 fail-closed 的超时检查（到达后作废屏障 + 失效会话，见 repl_barrier_tick）。 */
 static void repl_barrier_gate_on_ack(void) {
     if (!g_barrier_active) return;
     g_barrier_ack_gated = 1;
-    g_barrier_deadline_ms = kvs_now_ms() + REPL_BARRIER_HOLD_MAX_MS;
+    g_barrier_deadline_ms = kvs_now_ms() + repl_barrier_hold_max_ms();
 }
 
 /* Slave 的 REPLACK 反馈：只有 applied 真正追上 catchup_end 才能放行 —— 这样代理
@@ -882,15 +947,18 @@ void repl_barrier_note_applied(unsigned long long applied_offset) {
     }
 }
 
-/* 兜底：Slave 长时间不 ack（例如 replay 为空、或链路静默）时强制放行，
- * 避免 proxy 永久停在 BUFFERING 而增量不再转发。由 reactor 的 100ms 定时块调用。 */
+/* 兜底：Slave 长时间不 ACK。超时**不能**强制 release —— 15s 没 ACK 不能证明
+ * backlog 已回放完，放行会让 proxy flush 未确认数据并与 replay 交错。
+ * 这里 fail-closed：失效会话、断开副本、作废屏障；Slave 重连后重新 REPLSYNC
+ * （partial 不可保证时走 fullsync）。由 owner 线程的 100ms 定时块调用。 */
 void repl_barrier_tick(void) {
     if (!g_barrier_active || !g_barrier_ack_gated || g_barrier_deadline_ms == 0) return;
     if (kvs_now_ms() < g_barrier_deadline_ms) return;
-    fprintf(stderr, "master: proxy barrier held >%dms without slave ack — "
-                    "force releasing (slave may have nothing to ack)\n",
-            REPL_BARRIER_HOLD_MAX_MS);
-    repl_barrier_release();
+    fprintf(stderr, "master: proxy barrier held >%lldms without slave ack — "
+                    "fail-closed (invalidate session, no release/flush)\n",
+            repl_barrier_hold_max_ms());
+    repl_barrier_cancel();
+    repl_session_invalidate(REPL_INVALID_BARRIER_TIMEOUT);
 }
 
 /* 生成快照并启动全量传输。snap_base_offset 由调用方在**屏障建立后**取好传入

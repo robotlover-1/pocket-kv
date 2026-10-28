@@ -563,7 +563,9 @@ void repl_commit_flush(void);                  /* 批量发送描述符 */
 void repl_commit_baseline(conn_t *c);          /* 新连接/BASELINE */
 void repl_commit_ignore(conn_t *c);            /* 连接变为 replica */
 void repl_commit_forget(conn_t *c);            /* 连接关闭 */
-void repl_commit_resume(uint64_t global_seq);  /* 恢复期结束 */
+/* 恢复期结束：发送 RESUME(marker)。返回 0 成功；-1 表示通道不可用/发送失败，
+ * 调用方必须 fail-closed（不得继续 flush recovery/cache）。 */
+int repl_commit_resume(uint64_t global_seq);
 uint64_t repl_commit_global_seq(void);
 unsigned long long repl_commit_descriptor_count(void);
 unsigned long long repl_commit_write_count(void);

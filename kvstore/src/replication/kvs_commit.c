@@ -219,10 +219,18 @@ static void commit_set_fault(const char *reason) {
 void repl_commit_note_proxy_fault(const char *reason) { commit_set_fault(reason); }
 
 static int commit_send_locked(const void *buf, size_t len) {
-    if (g_commit_fd < 0) return -1;
+    if (g_commit_fd < 0) {
+        fprintf(stderr, "repl commit: send failed: no channel\n");
+        return -1;
+    }
     for (int attempt = 0; attempt < 2; ++attempt) {
+        errno = 0;
         ssize_t w = send(g_commit_fd, buf, len, MSG_NOSIGNAL | MSG_DONTWAIT);
         if (w == (ssize_t)len) return 0;
+        if (w != (ssize_t)len) {
+            fprintf(stderr, "repl commit: send attempt=%d len=%zu w=%zd errno=%d(%s)\n",
+                    attempt, len, w, errno, strerror(errno));
+        }
         if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             struct pollfd pfd = { .fd = g_commit_fd, .events = POLLOUT };
             if (poll(&pfd, 1, COMMIT_SEND_POLL_MS) > 0) continue;
@@ -362,14 +370,24 @@ void repl_commit_forget(conn_t *c) {
 
 /* 屏障放行时发送 RESUME：proxy 丢弃 recovery 缓冲中 global_seq <= marker 的提交
  * （已被快照/backlog replay 覆盖），并按 global_seq 放行其余记录。
- * 与 HELLO/BASELINE 走同一条有序 SEQPACKET 通道；通道断开时健康线程会失效会话，
- * 因此这里失败不需要额外补救。 */
-void repl_commit_resume(uint64_t global_seq) {
-    if (!commit_active_mode() || g_commit_session == 0) return;
+ * 返回 -1 表示控制通道不可用/发送失败；调用方必须 fail-closed，不能继续 flush。 */
+int repl_commit_resume(uint64_t global_seq) {
+    if (!commit_active_mode() || g_commit_session == 0) return 0;
     pthread_mutex_lock(&g_commit_lock);
-    if (g_commit_fd >= 0)
-        commit_send_msg(REPL_COMMIT_MSG_RESUME, NULL, global_seq, g_commit_session);
+    int rc = 0;
+    if (g_commit_fd < 0) {
+        fprintf(stderr, "repl commit: RESUME(marker=%llu) not sent: channel fd<0 "
+                        "(session=%llu)\n",
+                (unsigned long long)global_seq,
+                (unsigned long long)g_commit_session);
+        rc = -1;
+    } else if (commit_send_msg(REPL_COMMIT_MSG_RESUME, NULL, global_seq,
+                               g_commit_session) != 0) {
+        commit_set_fault("CHANNEL");
+        rc = -1;
+    }
     pthread_mutex_unlock(&g_commit_lock);
+    return rc;
 }
 
 int repl_commit_connected(void) {

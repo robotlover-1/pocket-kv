@@ -176,6 +176,11 @@ static void on_read(conn_t *c) {
         if (repl_ebpf_capture_active() && want > KVS_EBPF_CAPTURE_MAX_RECV)
             want = KVS_EBPF_CAPTURE_MAX_RECV;   /* 防捕获 BPF 32KB 截断 */
         ssize_t n = recv(c->fd, c->inbuf + c->in_len, want, 0);
+        if (n > (ssize_t)KVS_EBPF_CAPTURE_MAX_RECV && !c->is_replica) {
+            fprintf(stderr, "DBG reactor recv n=%zd want=%zu capture_active=%d cookie=%llu\n",
+                    n, want, repl_ebpf_capture_active(),
+                    (unsigned long long)c->repl_socket_cookie);
+        }
         if (likely(n > 0)) {
             c->in_len += (size_t)n;
             c->defer_epollout = 1;  /* queue_bytes won't reg EPOLLOUT; on_write drains after */

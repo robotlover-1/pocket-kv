@@ -284,14 +284,15 @@ static void request_cache_flush(void) {
     pthread_mutex_unlock(&g_pfwd_lock);
 }
 
-/* 拷贝 payload 入队（payload 指针只在 ringbuf 回调期间有效） */
-static void proxy_fwd_enqueue(const unsigned char *buf, size_t len) {
+/* 拷贝 payload 入队（payload 指针只在 ringbuf 回调期间有效）。
+ * 返回 0 成功；-1 表示已停止或内存不足，调用方必须按 fail-closed 处理。 */
+static int proxy_fwd_enqueue(const unsigned char *buf, size_t len) {
     pthread_mutex_lock(&g_pfwd_lock);
     while (g_pfwd_bytes + len > MAX_PFWD_QUEUE_BYTES && !g_pfwd_stop)
         pthread_cond_wait(&g_pfwd_cond, &g_pfwd_lock);
-    if (g_pfwd_stop) { pthread_mutex_unlock(&g_pfwd_lock); return; }
+    if (g_pfwd_stop) { pthread_mutex_unlock(&g_pfwd_lock); return -1; }
     proxy_fwd_node_t *n = (proxy_fwd_node_t *)malloc(sizeof(*n) + len);
-    if (!n) { pthread_mutex_unlock(&g_pfwd_lock); return; }
+    if (!n) { pthread_mutex_unlock(&g_pfwd_lock); return -1; }
     n->buf = (unsigned char *)(n + 1); n->len = len;
     memcpy(n->buf, buf, len); n->next = NULL;
     if (g_pfwd_tail) g_pfwd_tail->next = n; else g_pfwd_head = n;
@@ -301,6 +302,7 @@ static void proxy_fwd_enqueue(const unsigned char *buf, size_t len) {
     /* 无 cond_signal：转发线程靠 PFWD_LINGER_US timed-wait 自醒（免每命令 futex_wake，
      * 单条命令有界延迟 ≤PFWD_LINGER_US）。 */
     pthread_mutex_unlock(&g_pfwd_lock);
+    return 0;
 }
 
 /* 转发线程处理一批节点：持 g_state_lock 校验 FORWARDING 后批量 writev（原子于 BUFFERING flip）。
@@ -688,19 +690,23 @@ static void proxy_stats_update(void) {
     write_proxy_stat_u64(PST_MEM_HARD_HIT, (__u64)cs.memory_hard_limit_count);
 }
 
-/* ---- Commit Gate：已提交命令的落地 + 故障回调 ---- */
-static void commit_emit(const unsigned char *buf, size_t len) {
-    if (g_capture_drop) { g_dropped_bytes += len; return; }
+/* ---- Commit Gate：已提交命令的落地 + 故障回调 ----
+ * 返回 0 表示已交付（入队/cache）；-1 表示未能交付，proxy_commit 必须 fail-closed，
+ * 绝不能把未交付的数据当作成功转发。 */
+static int commit_emit(const unsigned char *buf, size_t len) {
+    if (g_capture_drop) { g_dropped_bytes += len; return -1; }
     if (g_state == STATE_BUFFERING) {
-        if (cache_enq_wrap(buf, len) == -2) commit_fault_cb(5);
-        return;
+        int rc = cache_enq_wrap(buf, len);
+        if (rc == -2) commit_fault_cb(5);
+        return rc == 0 ? 0 : -1;
     }
     if (proxy_slave_is_connected(&g_slave)) {
-        proxy_fwd_enqueue(buf, len);
-        return;
+        return proxy_fwd_enqueue(buf, len);
     }
-    /* 无 slave：不缓存，Master 的 backlog 会在重连/REPLSYNC 后补齐 */
+    /* 无 slave：这批已提交数据无法交付；返回失败让上层失效会话，
+     * 由 Slave 重连后的 backlog/快照补齐，而不是静默丢弃。 */
     g_dropped_bytes += len;
+    return -1;
 }
 
 static void commit_fault_cb(int reason) {
@@ -803,7 +809,27 @@ static void proxy_capture_gate_poll(void) {
 /* ---- ringbuf 回调：解析 Commit Gate 记录头，交给 commit 模块 ---- */
 static int ringbuf_callback(void *ctx, void *data, size_t len) {
     (void)ctx;
-    if (g_capture_drop) return 0;
+    if (g_capture_drop) {
+        /* 竞态：Master 打开 capture 时，proxy 可能正在 ring_buffer__consume
+         * 中（尚未执行下一次 gate poll）。此时 g_capture_drop 仍为 1，若直接
+         * 丢弃，会丢掉新 session 的第一条 record（实测 50KB SET 的 32KB
+         * 首块被丢，尾部被误判为 inline 命令 → COMMIT_DESYNC）。
+         * 只记录到达时若 gate 已打开且没有 commit 故障，则接受并清除 drop。 */
+        __u64 en = 0, ft = 0;
+        int gate_on = (read_client_ctl_u64(CLIENT_CTL_KEY_CAPTURE_ENABLE, &en) == 0 && en == 1 &&
+                       read_client_ctl_u64(CLIENT_CTL_KEY_CAPTURE_FAULT, &ft) == 0 && ft == 0);
+        if (!gate_on || g_commit_fault_code) {
+            fprintf(stderr, "[commit] gate drop: en=%llu ft=%llu cf=%d len=%zu\n",
+                    (unsigned long long)en, (unsigned long long)ft,
+                    g_commit_fault_code, len);
+            g_dropped_bytes += len;
+            return 0;
+        }
+        g_capture_drop = 0;
+        fprintf(stderr, "ebpf-proxy: capture gate opened mid-consume — accepting record\n");
+    }
+    if (len > 30000)
+        fprintf(stderr, "[commit] ringbuf record len=%zu\n", len);
     if (len < CAPTURE_RECORD_HDR_SZ) return 0;
 
     const unsigned char *p = (const unsigned char *)data;
@@ -814,7 +840,10 @@ static int ringbuf_callback(void *ctx, void *data, size_t len) {
     memcpy(&payload_len, p + 16, 4);
     memcpy(&flags, p + 20, 4);
     (void)flags;
-    if (payload_len == 0 || CAPTURE_RECORD_HDR_SZ + payload_len > len) return 0;
+    if (payload_len == 0 || CAPTURE_RECORD_HDR_SZ + payload_len > len) {
+        fprintf(stderr, "[commit] drop bad record len=%zu payload=%u\n", len, payload_len);
+        return 0;
+    }
 
     proxy_commit_on_record(cookie, recv_seq,
                            p + CAPTURE_RECORD_HDR_SZ, payload_len);

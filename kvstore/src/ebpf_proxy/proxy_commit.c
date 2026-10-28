@@ -79,6 +79,9 @@ static int g_listen_fd = -1;
 static int g_master_fd = -1;
 static char g_sock_path[512];
 static uint64_t g_epoch = 0;
+/* 当前 replication session 的 commit epoch（来自最新 BASELINE）；0 = 未建立。
+ * 旧/跨 session 的 BATCH/RESUME/IGNORE 必须丢弃，避免污染新会话。 */
+static uint64_t g_session_epoch = 0;
 
 static proxy_commit_emit_fn g_emit = NULL;
 static proxy_commit_fault_fn g_fault = NULL;
@@ -367,13 +370,21 @@ static void pc_recovery_append(pc_cmd_t *cmd) {
     }
 }
 
-static void pc_emit_cmd(pc_cmd_t *cmd) {
+/* 返回 0 = 已入 recovery 缓冲或已成功交付；-1 = 交付失败（已置 fault）。 */
+static int pc_emit_cmd(pc_cmd_t *cmd) {
     if (g_buffering || g_wait_resume || g_rec_bytes > 0) {
         pc_recovery_append(cmd);
-    } else if (g_emit) {
-        g_emit(cmd->data, cmd->len);
+        return g_faulted ? -1 : 0;
+    }
+    if (g_emit) {
+        if (g_emit(cmd->data, cmd->len) != 0) {
+            /* 未交付：不能计入 emitted，也不能继续放行后续记录。 */
+            pc_fault(1);
+            return -1;
+        }
         g_st_emitted += cmd->len;
     }
+    return 0;
 }
 
 static void pc_drain_ready(void) {
@@ -383,8 +394,9 @@ static void pc_drain_ready(void) {
         if (cmd->global_seq < g_next_global) { pc_fault(2); return; }
         if (cmd->global_seq > g_next_global) break;   /* 等待更早的写 */
         g_ready_head = cmd->next;
-        pc_emit_cmd(cmd);
+        int rc = pc_emit_cmd(cmd);
         pc_cmd_free(cmd);
+        if (rc != 0) return;
         g_next_global++;
     }
 }
@@ -396,7 +408,16 @@ static void pc_try_match(pc_ctx_t *ctx) {
         pc_cmd_t *cmd = ctx->cmd_head;
         pc_desc_t *d = ctx->desc_head;
         if (cmd->seq != d->seq) { fprintf(stderr, "[commit] seq mismatch cmd=%llu desc=%llu\n", (unsigned long long)cmd->seq, (unsigned long long)d->seq); pc_fault(2); return; }
-        if (cmd->len != d->len) { fprintf(stderr, "[commit] len mismatch cmd=%u desc=%u seq=%llu\n", cmd->len, d->len, (unsigned long long)cmd->seq); pc_fault(2); return; }
+        if (cmd->len != d->len) {
+            char head[49]; size_t hn = cmd->len < 16 ? cmd->len : 16;
+            for (size_t hi = 0; hi < hn; ++hi)
+                snprintf(head + hi * 3, sizeof(head) - hi * 3, "%02x ", cmd->data[hi]);
+            head[hn * 3] = '\0';
+            fprintf(stderr, "[commit] len mismatch cookie=%llu cmd=%u desc=%u seq=%llu "
+                            "head=%s\n", (unsigned long long)ctx->cookie,
+                    cmd->len, d->len, (unsigned long long)cmd->seq, head);
+            pc_fault(2); return;
+        }
         /* CRC 由 main 侧同算法计算（FNV-1a 64） */
         uint64_t h = 1469598103934665603ull;
         for (uint32_t i = 0; i < cmd->len; ++i) {
@@ -498,6 +519,10 @@ void proxy_commit_on_record(uint64_t cookie, uint64_t recv_seq,
     }
     if (len) memcpy(ctx->buf + ctx->buf_len, payload, len);
     ctx->buf_len += len;
+    if (len > 4096)
+        fprintf(stderr, "[commit] record cookie=%llu seq=%llu len=%zu baseline=%d buf=%zu\n",
+                (unsigned long long)cookie, (unsigned long long)recv_seq, len,
+                ctx->baseline_set, ctx->buf_len);
 
     if (ctx->baseline_set) pc_frame_ctx(ctx);
     else pc_try_match(ctx);   /* 可能已有缓存的描述符 */
@@ -507,6 +532,14 @@ void proxy_commit_on_record(uint64_t cookie, uint64_t recv_seq,
 static void pc_on_baseline(uint64_t cookie, uint64_t next_seq) {
     pc_ctx_t *ctx = pc_get_ctx(cookie, 1);
     if (!ctx) { pc_fault(1); return; }
+    int had_baseline = ctx->baseline_set;
+    /* 新连接的首个 BASELINE 可能晚于第一批 ringbuf 记录到达：此时 ctx->buf
+     * 里保存的正是该连接从命令边界开始的原始字节，必须保留并在 baseline 后
+     * framing；若清空会把大 value 的前若干条 record 丢掉（实测 50KB SET
+     * 丢失前 32744 字节，尾部被误判为 inline 命令 → COMMIT_DESYNC）。
+     * 重新 BASELINE（重连/re-arm）时才丢弃旧字节：其中可能包含 Master 已解析
+     * 过的命令，保留会造成 seq 错位。 */
+    size_t saved_len = ctx->buf_len;
     pc_cmd_t *cm = ctx->cmd_head;
     while (cm) { pc_cmd_t *nx = cm->next; pc_cmd_free(cm); cm = nx; }
     pc_desc_t *d = ctx->desc_head;
@@ -519,38 +552,60 @@ static void pc_on_baseline(uint64_t cookie, uint64_t next_seq) {
     /* 重新 BASELINE 后捕获流可能已跨过被丢弃的窗口：序号重新对齐 */
     ctx->recv_seq_valid = 0;
     ctx->last_recv_seq = 0;
+    if (had_baseline) {
+        ctx->buf_len = 0;
+    } else {
+        ctx->buf_len = saved_len;   /* 保留 baseline 之前已缓存的首批数据 */
+    }
     pc_frame_ctx(ctx);
     pc_try_match(ctx);
 }
 
 static void pc_on_resume(uint64_t marker) {
-    /* 丢弃 <= marker（已被 backlog/快照覆盖），其余按序交出 */
+    /* 丢弃 <= marker（已被 backlog/快照覆盖），其余按序交出。
+     * 交付失败必须 fail-closed：未交付的记录不能计入 emitted，也不能继续放行。 */
     unsigned long long dropped_bytes = 0, emitted_bytes = 0;
-    int dropped = 0, emitted = 0;
+    int dropped = 0, emitted = 0, deliver_failed = 0;
     pc_rec_t *r = g_rec_head;
     while (r) {
         pc_rec_t *nx = r->next;
-        if (r->global_seq <= marker) {
+        if (!deliver_failed && r->global_seq <= marker) {
             dropped++;
             dropped_bytes += r->len;
-            if (g_rec_bytes >= r->len) g_rec_bytes -= r->len;
-        } else {
-            emitted++;
-            emitted_bytes += r->len;
-            if (g_emit) { g_emit(r->data, r->len); g_st_emitted += r->len; }
-            if (g_rec_bytes >= r->len) g_rec_bytes -= r->len;
+        } else if (!deliver_failed) {
+            if (g_emit && g_emit(r->data, r->len) != 0) {
+                deliver_failed = 1;
+            } else {
+                emitted++;
+                emitted_bytes += r->len;
+                g_st_emitted += r->len;
+            }
         }
         free(r);
         r = nx;
     }
     g_rec_head = g_rec_tail = NULL;
+    g_rec_bytes = 0;
     g_wait_resume = 0;
     g_wait_resume_ms = 0;
+    if (deliver_failed) {
+        fprintf(stderr, "ebpf-proxy: RESUME marker=%llu: delivery failed after "
+                        "%d/%llu bytes — fail-closed\n",
+                (unsigned long long)marker, emitted, emitted_bytes);
+        pc_fault(1);
+        return;
+    }
     g_resume_event = 1;
     fprintf(stderr, "ebpf-proxy: RESUME marker=%llu: emitted %d/%llu bytes, "
                     "dropped %d/%llu bytes (<=marker)\n",
             (unsigned long long)marker, emitted, emitted_bytes,
             dropped, dropped_bytes);
+}
+
+/* 旧 session/旧 epoch 的消息：epoch=0 视为通配（兼容手动测试/旧 Master），
+ * 非 0 且与当前 BASELINE 不一致则丢弃。 */
+static int pc_epoch_stale(uint64_t epoch) {
+    return epoch != 0 && g_session_epoch != 0 && epoch != g_session_epoch;
 }
 
 static void pc_process_msg(const unsigned char *buf, size_t len) {
@@ -567,18 +622,26 @@ static void pc_process_msg(const unsigned char *buf, size_t len) {
     switch (h.type) {
     case REPL_COMMIT_MSG_HELLO:
         g_epoch = h.epoch;
+        g_session_epoch = 0;
         proxy_commit_purge();
         break;
     case REPL_COMMIT_MSG_BASELINE: {
         repl_commit_kv_t kv;
         if (plen < sizeof(kv)) { pc_fault(2); break; }
         memcpy(&kv, payload, sizeof(kv));
+        /* BASELINE 定义新 session 的 epoch（0 表示旧式/测试消息，不启用校验）。 */
+        g_session_epoch = h.epoch;
         pc_on_baseline(kv.cookie, kv.value);
         break;
     }
     case REPL_COMMIT_MSG_IGNORE: {
         repl_commit_kv_t kv;
         if (plen < sizeof(kv)) break;
+        if (pc_epoch_stale(h.epoch)) {
+            fprintf(stderr, "ebpf-proxy: drop stale IGNORE epoch=%llu (current=%llu)\n",
+                    (unsigned long long)h.epoch, (unsigned long long)g_session_epoch);
+            break;
+        }
         memcpy(&kv, payload, sizeof(kv));
         pc_ctx_t *ctx = pc_get_ctx(kv.cookie, 1);
         if (ctx) { pc_ctx_reset(ctx); ctx->ignored = 1; }
@@ -587,15 +650,30 @@ static void pc_process_msg(const unsigned char *buf, size_t len) {
     case REPL_COMMIT_MSG_FORGET: {
         repl_commit_kv_t kv;
         if (plen < sizeof(kv)) break;
+        if (pc_epoch_stale(h.epoch)) {
+            fprintf(stderr, "ebpf-proxy: drop stale FORGET epoch=%llu (current=%llu)\n",
+                    (unsigned long long)h.epoch, (unsigned long long)g_session_epoch);
+            break;
+        }
         memcpy(&kv, payload, sizeof(kv));
         pc_ctx_t *ctx = pc_get_ctx(kv.cookie, 0);
         if (ctx) pc_remove_ctx(ctx);
         break;
     }
     case REPL_COMMIT_MSG_RESUME:
+        if (pc_epoch_stale(h.epoch)) {
+            fprintf(stderr, "ebpf-proxy: drop stale RESUME epoch=%llu (current=%llu)\n",
+                    (unsigned long long)h.epoch, (unsigned long long)g_session_epoch);
+            break;
+        }
         pc_on_resume(h.global_seq);
         break;
     case REPL_COMMIT_MSG_BATCH: {
+        if (pc_epoch_stale(h.epoch)) {
+            fprintf(stderr, "ebpf-proxy: drop stale BATCH epoch=%llu (current=%llu)\n",
+                    (unsigned long long)h.epoch, (unsigned long long)g_session_epoch);
+            break;
+        }
         size_t need = (size_t)h.count * sizeof(repl_commit_desc_t);
         if (plen < need || h.count > REPL_COMMIT_BATCH_MAX) { pc_fault(2); break; }
         for (uint32_t i = 0; i < h.count; ++i) {

@@ -4,8 +4,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* 已提交命令的落地回调：main.c 决定进转发队列/cache/丢弃 */
-typedef void (*proxy_commit_emit_fn)(const unsigned char *buf, size_t len);
+/* 已提交命令的落地回调：main.c 决定进转发队列/cache。
+ * 返回 0 = 已交付；-1 = 未能交付（调用方必须 fail-closed）。 */
+typedef int (*proxy_commit_emit_fn)(const unsigned char *buf, size_t len);
 
 /* 故障回调：1=timeout 2=desync 3=gap 4=channel 5=cache_full */
 typedef void (*proxy_commit_fault_fn)(int reason);
