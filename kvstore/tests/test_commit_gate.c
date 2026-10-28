@@ -264,6 +264,20 @@ int main(void) {
           g_out_len == strlen(b) && memcmp(g_out, b, strlen(b)) == 0,
           "resume drops <=marker, emits >marker");
 
+    /* 9b. 重复 RESUME 幂等；旧 marker 不应丢弃 >marker 的新写 */
+    send_resume(10);
+    poll_once(1);
+    CHECK(g_fault_reason == 0 && g_out_count == 1 && g_out_len == strlen(b),
+          "duplicate RESUME is idempotent");
+    feed(3001, 3, c);
+    send_desc(3001, 3, 12, (const unsigned char *)c, strlen(c), REPL_COMMIT_FLAG_WRITE, 0, 0);
+    poll_once(1);
+    send_resume(10);   /* 旧 marker */
+    poll_once(1);
+    CHECK(g_fault_reason == 0 && g_out_count == 2 &&
+          memcmp(g_out + strlen(b), c, strlen(c)) == 0,
+          "stale RESUME keeps newer writes");
+
     /* 10. BASELINE 重定基：从 seq=5 开始 */
     reset_out();
     proxy_commit_purge();

@@ -146,12 +146,16 @@ StartSlave || { Fail "slave restart failed"; }
 sleep 2
 
 INFO_AFTER=$(Resp "$SPORT" info)
-FRONTIER=$(Field "$INFO_AFTER" slave_recovered_frontier)
-RESUME=$(Field "$INFO_AFTER" slave_resume_offset)
 APPLIED=$(Field "$INFO_AFTER" slave_repl_applied_offset)
-echo "   recovered_frontier=$FRONTIER resume=$RESUME applied=$APPLIED"
-[ -n "$FRONTIER" ] && [ "$FRONTIER" -gt 0 ] || Fail "recovered frontier is zero"
-[ -n "$RESUME" ] && [ "$RESUME" -le "$FRONTIER" ] || Fail "resume > recovered frontier"
+DURABLE=$(Field "$INFO_AFTER" slave_repl_durable_offset)
+MASTER_OFF=$(Field "$(Resp "$MPORT" info)" master_repl_offset)
+echo "   applied=$APPLIED durable=$DURABLE master=$MASTER_OFF"
+# main 分支把恢复边界钳制在 repl_slave_state_load() 内部，INFO 不再暴露
+# recovered_frontier/resume。这里校验外部可见的不变量：恢复点非零、不超过
+# master offset，且持久化边界不领先于应用边界。
+[ -n "$APPLIED" ] && [ "$APPLIED" -gt 0 ] || Fail "applied offset is zero after restart"
+[ -n "$MASTER_OFF" ] && [ "$APPLIED" -le "$MASTER_OFF" ] || Fail "applied > master offset"
+[ -n "$DURABLE" ] && [ "$DURABLE" -le "$APPLIED" ] || Fail "durable > applied after restart"
 
 Info "wait for catch-up"
 for _ in $(seq 1 60); do
@@ -174,7 +178,7 @@ done
 
 Info "slave INFO"
 echo "$INFO_AFTER" | tr -d '\r' | grep -E \
-    "slave_recovered_frontier|slave_resume_offset|slave_repl_applied_offset|repl_last_invalid_reason" || true
+    "slave_repl_applied_offset|slave_repl_durable_offset|repl_last_invalid_reason" || true
 
 if [ "$FAIL" -ne 0 ]; then
     echo "RESULT: FAIL"

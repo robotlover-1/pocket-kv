@@ -324,7 +324,6 @@ typedef struct conn_s {
     uint32_t cur_cmd_len;          /* 当前命令原始字节数 */
     uint64_t cur_cmd_crc;          /* 当前命令 FNV-1a 64 校验和 */
     int cur_cmd_committed;         /* 当前命令是否已发布 WRITE */
-    uint64_t repl_commit_resume_global; /* 恢复期 RESUME marker（backlog 覆盖到的 global_seq） */
     struct conn_s *next_all;       /* 全局连接注册表（仅 owner 线程访问） */
     unsigned char *inbuf;          /* 独立 malloc 的接收缓冲（accept 时分配，不清零） */
     size_t in_len;
@@ -528,6 +527,8 @@ void repl_fullsync_send_end(int tcp_fd, uint64_t tid);
 int repl_rdma_wait_all_sends(int timeout_ms);
 int repl_rdma_slave_has_write_buffer(void);
 int repl_rdma_slave_check_write_complete(void);
+/* 仅在收到 +FULLRESYNC 后按需建立 RDMA 全量通道；partial（+CONTINUE）不建连。 */
+void repl_rdma_slave_start_fullsync_connect(void);
 int repl_rdma_slave_prepare_target(int tcp_fd, uint64_t transfer_id, size_t total_bytes);
 void repl_rdma_slave_target_cleanup(int remove_incomplete);
 void repl_rdma_slave_abort_target(uint64_t tid);
@@ -718,6 +719,10 @@ typedef struct {
     unsigned long long commit_gap;
     unsigned long long commit_recovery_bytes;
     unsigned long long commit_next_global;
+    unsigned long long commit_ctx_count;        /* proxy per-cookie framing 状态数 */
+    unsigned long long commit_pending_cmd_count;
+    unsigned long long commit_oldest_pending_ms;
+    unsigned long long commit_memory_hard_hit;  /* 共享内存上限触发次数 */
     int commit_channel_connected;
 } kvs_ebpf_proxy_stats_t;
 int repl_ebpf_proxy_get_stats(kvs_ebpf_proxy_stats_t *stats);

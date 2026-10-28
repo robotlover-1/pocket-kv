@@ -25,9 +25,11 @@
 #include <unistd.h>
 
 #define PC_MAX_COOKIES       4096
+#define PC_MAX_CTX           4096      /* per-cookie 状态上限，防止 cookie 抖动导致无界增长 */
 #define PC_CTX_BUF_CAP       (2u * 1024 * 1024)
-#define PC_PENDING_MAX       (256ull * 1024 * 1024)
-#define PC_RECOVERY_MAX      (256ull * 1024 * 1024)
+/* pending（已捕获待匹配）+ recovery（BUFFERING 期间已提交）共享同一份内存预算，
+ * 避免两个 256MB 队列叠加导致总 RSS 失控。 */
+#define PC_MEMORY_MAX        (256ull * 1024 * 1024)
 #define PC_TIMEOUT_MS        2000
 
 typedef struct pc_cmd_s {
@@ -98,6 +100,9 @@ static unsigned long long g_pending_bytes = 0;
 static unsigned long long g_st_desc = 0, g_st_writes = 0, g_st_skips = 0;
 static unsigned long long g_st_timeout = 0, g_st_desync = 0, g_st_gap = 0;
 static unsigned long long g_st_channel = 0, g_st_emitted = 0;
+static unsigned long long g_st_mem_hard = 0;
+static int g_ctx_count = 0;
+static long long g_pending_cmd_count = 0;
 
 static long long pc_now_ms(void) {
     struct timespec ts;
@@ -126,17 +131,23 @@ static pc_ctx_t *pc_get_ctx(uint64_t cookie, int create) {
     for (pc_ctx_t *c = g_buckets[b]; c; c = c->next)
         if (c->cookie == cookie) return c;
     if (!create) return NULL;
+    if (g_ctx_count >= PC_MAX_CTX) {
+        g_st_mem_hard++;
+        return NULL;
+    }
     pc_ctx_t *c = (pc_ctx_t *)calloc(1, sizeof(*c));
     if (!c) return NULL;
     c->cookie = cookie;
     c->next = g_buckets[b];
     g_buckets[b] = c;
+    g_ctx_count++;
     return c;
 }
 
 static void pc_cmd_free(pc_cmd_t *cmd) {
     if (!cmd) return;
     if (g_pending_bytes >= cmd->len) g_pending_bytes -= cmd->len;
+    if (g_pending_cmd_count > 0) g_pending_cmd_count--;
     free(cmd);
 }
 
@@ -167,6 +178,7 @@ static void pc_remove_ctx(pc_ctx_t *c) {
     pc_ctx_reset(c);
     free(c->buf);
     free(c);
+    if (g_ctx_count > 0) g_ctx_count--;
 }
 
 static void pc_ready_free_all(void) {
@@ -195,6 +207,8 @@ void proxy_commit_purge(void) {
     g_wait_resume_ms = 0;
     g_resume_event = 0;
     g_pending_bytes = 0;
+    g_ctx_count = 0;
+    g_pending_cmd_count = 0;
     g_faulted = 0;
 }
 
@@ -216,7 +230,12 @@ static void pc_frame_one(pc_ctx_t *ctx, const unsigned char *buf, size_t len) {
     if (ctx->cmd_tail) ctx->cmd_tail->next = cmd; else ctx->cmd_head = cmd;
     ctx->cmd_tail = cmd;
     g_pending_bytes += len;
-    if (g_pending_bytes > PC_PENDING_MAX) { pc_fault(1); return; }
+    g_pending_cmd_count++;
+    if (g_pending_bytes + g_rec_bytes > PC_MEMORY_MAX) {
+        g_st_mem_hard++;
+        pc_fault(1);
+        return;
+    }
     pc_try_match(ctx);
 }
 
@@ -317,7 +336,11 @@ static void pc_recovery_append(pc_cmd_t *cmd) {
     if (g_rec_tail) g_rec_tail->next = r; else g_rec_head = r;
     g_rec_tail = r;
     g_rec_bytes += cmd->len;
-    if (g_rec_bytes > PC_RECOVERY_MAX) { pc_fault(5); return; }
+    if (g_pending_bytes + g_rec_bytes > PC_MEMORY_MAX) {
+        g_st_mem_hard++;
+        pc_fault(5);
+        return;
+    }
 }
 
 static void pc_emit_cmd(pc_cmd_t *cmd) {
@@ -699,6 +722,25 @@ void proxy_commit_get_stats(proxy_commit_stats_t *out) {
     out->channel_fault = g_st_channel;
     out->recovery_bytes = (unsigned long long)g_rec_bytes;
     out->emitted_bytes = g_st_emitted;
+    out->conn_ctx_count = (unsigned long long)g_ctx_count;
+    out->pending_cmd_count = (unsigned long long)(g_pending_cmd_count > 0 ? g_pending_cmd_count : 0);
+    out->memory_hard_limit_count = g_st_mem_hard;
     out->next_global_seq = g_next_global;
     out->channel_connected = (g_master_fd >= 0);
+
+    /* oldest pending：ready 队列头 + 每个 ctx 的 cmd/desc 头中最早创建的时间。 */
+    long long now = pc_now_ms();
+    long long oldest = 0;
+    if (g_ready_head) oldest = g_ready_head->created_ms;
+    if (g_wait_resume_ms && (oldest == 0 || g_wait_resume_ms < oldest))
+        oldest = g_wait_resume_ms;
+    for (int i = 0; i < PC_MAX_COOKIES; ++i) {
+        for (pc_ctx_t *c = g_buckets[i]; c; c = c->next) {
+            long long t = 0;
+            if (c->cmd_head) t = c->cmd_head->created_ms;
+            else if (c->desc_head) t = c->desc_head->created_ms;
+            if (t && (oldest == 0 || t < oldest)) oldest = t;
+        }
+    }
+    out->oldest_pending_ms = oldest > 0 ? (unsigned long long)(now - oldest) : 0;
 }

@@ -21,6 +21,10 @@ typedef struct {
     unsigned long long channel_fault;
     unsigned long long recovery_bytes;
     unsigned long long emitted_bytes;
+    unsigned long long conn_ctx_count;      /* per-cookie framing 状态数 */
+    unsigned long long pending_cmd_count;   /* 已捕获待匹配命令数 */
+    unsigned long long oldest_pending_ms;   /* 最老 pending 命令的等待时长 */
+    unsigned long long memory_hard_limit_count; /* pending+recovery 触达共享上限次数 */
     uint64_t next_global_seq;
     int channel_connected;
 } proxy_commit_stats_t;

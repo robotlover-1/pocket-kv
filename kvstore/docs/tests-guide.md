@@ -745,6 +745,8 @@ redis-cli -p 5160 -h 192.168.233.128 HSET gap:mykey myvalue
 | `make check-repl-ebpf-sync`               | 64            | eBPF sockmap 同步验证                                                                                                | `artifacts/repl/ebpf-sync/`         |
 | `make check-repl-ebpf-sync-required`      | 64            | eBPF 同步验证（要求 eBPF 可用）                                                                                      | `artifacts/repl/ebpf-sync/`         |
 | `make check-repl-ebpf-redirect`           | 64            | eBPF ingress 重定向验证                                                                                              | `artifacts/repl/ebpf-sync/`         |
+| `make check-slave-crash-recovery`         | 160           | Slave kill -9 重启恢复（非 root，TCP 路径）                                                                          | —                                  |
+| `make check-commit-gate-faults`           | 80×轮次       | Commit Gate 故障注入（root+eBPF；kill proxy/slave；非 root SKIP）                                                    | —                                  |
 | `make check-repl-rdma-unsupported`        | 小            | RDMA 不可用时的优雅降级测试                                                                                          | —                                  |
 | `make check-repl-rdma-smoke`              | 小            | RDMA 冒烟测试                                                                                                        | `artifacts/repl/rdma-smoke/`        |
 | `make check-repl-rdma-stress`             | 中            | RDMA 压力测试（重启轮次 + 尾写验证）                                                                                 | `artifacts/repl/rdma-stress/`       |

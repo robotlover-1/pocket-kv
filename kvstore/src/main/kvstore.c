@@ -782,6 +782,7 @@ static int g_barrier_active = 0;
  * "invalid engine_id 64 at pos 8"）。只有 REPLDONE 才代表"快照已加载完成"。 */
 static int g_barrier_ack_gated = 0;
 static unsigned long long g_barrier_end_offset = 0;   /* catchup_end = 立屏障时的 master_offset */
+static unsigned long long g_barrier_resume_global = 0;/* 屏障边界对应的最后一个 global_seq（RESUME marker） */
 static long long g_barrier_deadline_ms = 0;           /* 等 Slave ack 的兜底期限，0=不设 */
 #define REPL_BARRIER_WAIT_MS      3000    /* 等 proxy 应答 BUFFERING */
 #define REPL_BARRIER_HOLD_MAX_MS 15000    /* 等 Slave 追上（兜底，防永久 BUFFERING） */
@@ -809,6 +810,11 @@ static int repl_barrier_begin(unsigned long long *catchup_end) {
      * 陈旧应答误判成本轮成功。 */
     repl_ebpf_client_ctl_set(KVS_CTL_PROXY_STATE, 0);
     repl_ebpf_client_ctl_set(KVS_CTL_FULLSYNC_STATE, 1);
+    /* 屏障时刻的 Commit Gate 边界：此后的写进入 proxy recovery 缓冲；
+     * 放行时 RESUME 丢弃 <= 该 marker 的提交（已被快照/backlog replay 覆盖）。
+     * 本函数在 owner 线程执行且阻塞等待 proxy 应答，期间不会再提交新写，
+     * 因此这里取的 global_seq 与 catchup_end 一致。 */
+    g_barrier_resume_global = repl_commit_global_seq();
 
     long long deadline = kvs_now_ms() + REPL_BARRIER_WAIT_MS;
     int ok = 0;
@@ -842,7 +848,12 @@ static void repl_barrier_release(void) {
     if (repl_proxy_barrier_needed()) {
         fprintf(stderr, "master: proxy barrier down — proxy will flush its cache\n");
         repl_ebpf_client_ctl_set(KVS_CTL_FULLSYNC_STATE, 0);
+        /* 先放行屏障，再发 RESUME：proxy 收到后丢弃 <= marker 的 recovery 提交，
+         * 其余按 global_seq 放行，随后才会 flush cache。 */
+        if (repl_commit_active_mode() && g_barrier_resume_global != 0)
+            repl_commit_resume(g_barrier_resume_global);
     }
+    g_barrier_resume_global = 0;
 }
 
 int repl_barrier_pending(void) { return g_barrier_active; }
@@ -1885,7 +1896,13 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             "repl_commit_timeout:%llu\n"
             "repl_commit_desync:%llu\n"
             "repl_commit_gap:%llu\n"
+            "repl_commit_ctxs:%llu\n"
+            "repl_commit_pending_cmds:%llu\n"
+            "repl_commit_oldest_pending_ms:%llu\n"
+            "repl_commit_mem_hard_hit:%llu\n"
             "repl_commit_fault_reason:%s\n"
+            "repl_session_invalid_count:%llu\n"
+            "repl_last_invalid_reason:%s\n"
             "slave_master_replid:%s\n"
             "slave_repl_offset:%llu\n"
             "slave_repl_applied_offset:%llu\n"
@@ -1989,7 +2006,13 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             repl_commit_timeout_count(),
             repl_commit_desync_count(),
             repl_commit_gap_count(),
+            proxy_stats.commit_ctx_count,
+            proxy_stats.commit_pending_cmd_count,
+            proxy_stats.commit_oldest_pending_ms,
+            proxy_stats.commit_memory_hard_hit,
             repl_commit_fault_reason_name(),
+            repl_session_invalid_count(),
+            repl_last_invalid_reason_name(),
             repl_slave_master_id(),
             repl_slave_offset(),
             repl_slave_applied_offset(),
@@ -2736,6 +2759,9 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
                         unsigned long long transfer_id = strtoull(argv[4], NULL, 10);
                         repl_slave_set_sync_state(argv[1], (unsigned long long)strtoull(argv[2], NULL, 10), (unsigned long long)strtoull(argv[2], NULL, 10), 1, fullsync_target);
                         repl_rdma_log("slave_parse - FULLRESYNC replid=%s offset=%s target=%s tid=%llu", argv[1], argv[2], argv[3], transfer_id);
+                        /* 只有确认是全量才建立 RDMA 通道（partial 的 +CONTINUE 不建连）。 */
+                        if (g_cfg.role == ROLE_SLAVE)
+                            repl_rdma_slave_start_fullsync_connect();
                         /* 尝试 One-Sided WRITE: 准备 file-backed 目标 + 注册 MR + 发 FULLRESYNCWR */
                         if (fullsync_target > 0) {
                             extern int g_slave_fd;
@@ -2760,7 +2786,8 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
                         if (continue_end < continue_start) continue_end = continue_start;
                         repl_slave_set_sync_state(argv[1], continue_start, durable_start, 0, 0);
                         repl_slave_send_ack();
-                        repl_rdma_log("slave_parse - CONTINUE replid=%s start_offset=%llu durable_offset=%llu end_offset=%llu", argv[1], continue_start, durable_start, continue_end);
+                        repl_rdma_log("slave_parse - CONTINUE(partial) replid=%s start_offset=%llu durable_offset=%llu end_offset=%llu (RDMA fullsync skipped)",
+                                      argv[1], continue_start, durable_start, continue_end);
                     }
                     kvs_free(line);
                 }

@@ -360,7 +360,17 @@ void repl_commit_forget(conn_t *c) {
     pthread_mutex_unlock(&g_commit_lock);
 }
 
-void repl_commit_resume(uint64_t global_seq) { (void)global_seq; }
+/* 屏障放行时发送 RESUME：proxy 丢弃 recovery 缓冲中 global_seq <= marker 的提交
+ * （已被快照/backlog replay 覆盖），并按 global_seq 放行其余记录。
+ * 与 HELLO/BASELINE 走同一条有序 SEQPACKET 通道；通道断开时健康线程会失效会话，
+ * 因此这里失败不需要额外补救。 */
+void repl_commit_resume(uint64_t global_seq) {
+    if (!commit_active_mode() || g_commit_session == 0) return;
+    pthread_mutex_lock(&g_commit_lock);
+    if (g_commit_fd >= 0)
+        commit_send_msg(REPL_COMMIT_MSG_RESUME, NULL, global_seq, g_commit_session);
+    pthread_mutex_unlock(&g_commit_lock);
+}
 
 int repl_commit_connected(void) {
     pthread_mutex_lock(&g_commit_lock);
@@ -531,17 +541,10 @@ static void commit_health_tick(void) {
 }
 
 int repl_commit_rearm_tick(void) {
-    if (g_proxy_failure_pending) {
+    int reason = g_proxy_failure_pending;
+    if (reason) {
         g_proxy_failure_pending = 0;
-        repl_session_end();
-        repl_ebpf_set_capture_enable(0);
-        pthread_mutex_lock(&g_repl_lock);
-        for (conn_t *c = g_replicas; c; c = c->next_replica) {
-            c->repl_draining = 1;
-            if (c->fd >= 0) shutdown(c->fd, SHUT_RDWR);
-        }
-        pthread_mutex_unlock(&g_repl_lock);
-        fprintf(stderr, "repl: ebpf-proxy failure → replication session invalidated\n");
+        repl_session_invalidate((repl_invalid_reason_t)reason);
         return 1;
     }
 
@@ -579,13 +582,21 @@ static void *proxy_health_thread(void *arg) {
                 unsigned long long fault = 0;
                 if (ctl_read_key(KVS_CTL_CAPTURE_FAULT, &fault) == 0 && fault) {
                     ctl_write_key(KVS_CTL_CAPTURE_FAULT, 0);
-                    if (g_commit_session != 0) g_proxy_failure_pending = 1;
+                    if (g_commit_session != 0)
+                        g_proxy_failure_pending = REPL_INVALID_CAPTURE_TRUNCATED;
                     fprintf(stderr, "repl: capture truncated → session invalidated\n");
                 }
                 fault = 0;
                 if (ctl_read_key(KVS_CTL_COMMIT_FAULT, &fault) == 0 && fault) {
                     ctl_write_key(KVS_CTL_COMMIT_FAULT, 0);
-                    if (g_commit_session != 0) g_proxy_failure_pending = 1;
+                    if (g_commit_session != 0) {
+                        repl_invalid_reason_t r = REPL_INVALID_COMMIT_TIMEOUT;
+                        if (fault == 2) r = REPL_INVALID_COMMIT_DESYNC;
+                        else if (fault == 3) r = REPL_INVALID_COMMIT_GAP;
+                        else if (fault == 4) r = REPL_INVALID_COMMIT_CHANNEL;
+                        else if (fault == 5) r = REPL_INVALID_PROXY_CACHE_FULL;
+                        g_proxy_failure_pending = (int)r;
+                    }
                     fprintf(stderr, "repl: commit gate fault code=%llu → session invalidated\n",
                             (unsigned long long)fault);
                 }
@@ -593,11 +604,11 @@ static void *proxy_health_thread(void *arg) {
                  * proxy 侧 PENDING 会超时；直接失效会话（fail-closed）。 */
                 if (g_commit_ever_connected && !repl_commit_connected() &&
                     g_commit_session != 0)
-                    g_proxy_failure_pending = 1;
+                    g_proxy_failure_pending = REPL_INVALID_COMMIT_CHANNEL;
             } else {
                 g_proxy_healthy = 0;
                 if (g_proxy_ever_healthy && g_commit_session != 0)
-                    g_proxy_failure_pending = 1;
+                    g_proxy_failure_pending = REPL_INVALID_PROXY_HEARTBEAT_STALE;
                 if (now - g_proxy_last_spawn_ms >= PROXY_RESPAWN_COOLDOWN_MS) {
                     proxy_kill();
                     proxy_spawn();

@@ -477,6 +477,10 @@ int repl_ebpf_backpressure(void) {
 #define KVS_PST_COMMIT_RECOVERY    13
 #define KVS_PST_COMMIT_NEXT_G      14
 #define KVS_PST_COMMIT_CHANNEL     15
+#define KVS_PST_CONN_CTX           18
+#define KVS_PST_PENDING_CMD        19
+#define KVS_PST_OLDEST_PENDING     20
+#define KVS_PST_MEM_HARD_HIT       21
 
 int repl_ebpf_proxy_get_stats(kvs_ebpf_proxy_stats_t *stats) {
     if (!stats) return -1;
@@ -526,21 +530,28 @@ int repl_ebpf_proxy_get_stats(kvs_ebpf_proxy_stats_t *stats) {
         g_repl_ebpf_proxy_stats_fd = bpf_obj_get(path);
     }
     if (g_repl_ebpf_proxy_stats_fd >= 0) {
-        const __u32 keys[9] = { KVS_PST_COMMIT_DESC, KVS_PST_COMMIT_WRITES,
-                                KVS_PST_COMMIT_PENDING, KVS_PST_COMMIT_TIMEOUT,
-                                KVS_PST_COMMIT_DESYNC, KVS_PST_COMMIT_GAP,
-                                KVS_PST_COMMIT_RECOVERY, KVS_PST_COMMIT_NEXT_G,
-                                KVS_PST_COMMIT_CHANNEL };
-        unsigned long long *out[8] = { &stats->commit_descriptors, &stats->commit_writes,
-                                       &stats->commit_pending, &stats->commit_timeout,
-                                       &stats->commit_desync, &stats->commit_gap,
-                                       &stats->commit_recovery_bytes, &stats->commit_next_global };
-        for (int i = 0; i < 9; i++) {
+        const __u32 keys[13] = { KVS_PST_COMMIT_DESC, KVS_PST_COMMIT_WRITES,
+                                 KVS_PST_COMMIT_PENDING, KVS_PST_COMMIT_TIMEOUT,
+                                 KVS_PST_COMMIT_DESYNC, KVS_PST_COMMIT_GAP,
+                                 KVS_PST_COMMIT_RECOVERY, KVS_PST_COMMIT_NEXT_G,
+                                 KVS_PST_COMMIT_CHANNEL, KVS_PST_CONN_CTX,
+                                 KVS_PST_PENDING_CMD, KVS_PST_OLDEST_PENDING,
+                                 KVS_PST_MEM_HARD_HIT };
+        unsigned long long *out[12] = { &stats->commit_descriptors, &stats->commit_writes,
+                                        &stats->commit_pending, &stats->commit_timeout,
+                                        &stats->commit_desync, &stats->commit_gap,
+                                        &stats->commit_recovery_bytes, &stats->commit_next_global,
+                                        &stats->commit_ctx_count, &stats->commit_pending_cmd_count,
+                                        &stats->commit_oldest_pending_ms,
+                                        &stats->commit_memory_hard_hit };
+        for (int i = 0; i < 13; i++) {
             __u64 v = 0;
             if (bpf_map_lookup_elem(g_repl_ebpf_proxy_stats_fd, &keys[i], &v) != 0)
                 continue;
+            /* i==8 是 channel 标志，其余按下标映射到 out[]。 */
             if (i < 8) *out[i] = v;
-            else stats->commit_channel_connected = (int)v;
+            else if (i == 8) stats->commit_channel_connected = (int)v;
+            else *out[i - 1] = v;
         }
     }
 #endif

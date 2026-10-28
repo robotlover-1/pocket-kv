@@ -458,6 +458,9 @@ static int g_repl_backlog_contiguous = 1;
 /* replication session 身份（§7/§9）：首个 Slave 建立复制会话时生成，最后一个
  * Slave 离开时清零。proxy_cache 只允许在本 session 内使用。 */
 static unsigned long long g_repl_session_id = 0;
+/* 失效诊断（INFO / 回归断言用）：累计次数与最近一次原因。 */
+static unsigned long long g_repl_session_invalid_count = 0;
+static repl_invalid_reason_t g_repl_last_invalid_reason = REPL_INVALID_NONE;
 static char g_slave_master_replid[41] = "?";
 static unsigned long long g_slave_repl_offset = 0;
 static unsigned long long g_slave_repl_applied_offset = 0;
@@ -2534,6 +2537,49 @@ void repl_session_end(void) {
     g_repl_session_id = 0;
 }
 
+const char *repl_invalid_reason_name(repl_invalid_reason_t reason) {
+    switch (reason) {
+    case REPL_INVALID_NONE:                  return "NONE";
+    case REPL_INVALID_PROXY_HEARTBEAT_STALE: return "PROXY_HEARTBEAT_STALE";
+    case REPL_INVALID_CAPTURE_TRUNCATED:     return "CAPTURE_TRUNCATED";
+    case REPL_INVALID_COMMIT_TIMEOUT:        return "COMMIT_TIMEOUT";
+    case REPL_INVALID_COMMIT_DESYNC:         return "COMMIT_DESYNC";
+    case REPL_INVALID_COMMIT_GAP:            return "COMMIT_GAP";
+    case REPL_INVALID_COMMIT_CHANNEL:        return "COMMIT_CHANNEL";
+    case REPL_INVALID_PROXY_CACHE_FULL:      return "PROXY_CACHE_FULL";
+    case REPL_INVALID_BARRIER_TIMEOUT:       return "BARRIER_TIMEOUT";
+    default:                                 return "UNKNOWN";
+    }
+}
+
+const char *repl_last_invalid_reason_name(void) {
+    return repl_invalid_reason_name(g_repl_last_invalid_reason);
+}
+
+unsigned long long repl_session_invalid_count(void) {
+    return __atomic_load_n(&g_repl_session_invalid_count, __ATOMIC_RELAXED);
+}
+
+/* 捕获/提交通道已不可信：关 capture 并断开 eBPF 增量副本，让 Slave 重连后
+ * 通过 REPLSYNC（partial/full）重建。其他传输的副本不受影响。 */
+void repl_session_invalidate(repl_invalid_reason_t reason) {
+    if (reason != REPL_INVALID_NONE) {
+        __atomic_add_fetch(&g_repl_session_invalid_count, 1, __ATOMIC_RELAXED);
+        g_repl_last_invalid_reason = reason;
+        fprintf(stderr, "repl: session invalidated reason=%s\n",
+                repl_invalid_reason_name(reason));
+    }
+    repl_ebpf_set_capture_enable(0);
+    pthread_mutex_lock(&g_repl_lock);
+    for (conn_t *c = g_replicas; c; c = c->next_replica) {
+        if (c->repl_transport_kind != KVS_REPL_TRANSPORT_EBPF_TCP) continue;
+        c->repl_draining = 1;
+        c->repl_recovery_mode = 0;
+        if (c->fd >= 0) shutdown(c->fd, SHUT_RDWR);
+    }
+    pthread_mutex_unlock(&g_repl_lock);
+}
+
 unsigned long long repl_session_id(void) {
     return g_repl_session_id;
 }
@@ -3585,12 +3631,51 @@ typedef struct repl_rdma_bg_connect_arg_s {
     int port;
 } repl_rdma_bg_connect_arg_t;
 
+/* 最近一次 slave 控制连接的目标地址（FULLRESYNC 到达时用于按需建 RDMA）。 */
+static char g_slave_link_host[128] = {0};
+static int g_slave_link_port = 0;
+static int g_rdma_bg_connecting = 0;
+
 static void *repl_rdma_bg_connect_thread(void *arg) {
     repl_rdma_bg_connect_arg_t *a = (repl_rdma_bg_connect_arg_t *)arg;
     repl_transport_rdma_connect_slave(a->host, a->port);
+    __atomic_store_n(&g_rdma_bg_connecting, 0, __ATOMIC_RELEASE);
     kvs_free(a);
     return NULL;
 }
+
+/* 仅在 slave 识别到 +FULLRESYNC 后调用：partial resync（+CONTINUE）不建 RDMA，
+ * 避免每次断线重连都在后台空转连接、刷 fallback 日志。 */
+void repl_rdma_slave_start_fullsync_connect(void) {
+    if (strcasecmp(repl_fullsync_transport_name(), "rdma") != 0) return;
+    /* 纯 rdma 实时传输由通用 ops->connect_slave() 建连，这里只服务
+     * “RDMA 仅用于 fullsync、实时走 TCP/eBPF”的混合路径。 */
+    if (!strcasecmp(repl_realtime_transport_name(), "rdma")) return;
+    if (g_slave_link_host[0] == '\0' || g_slave_link_port <= 0) return;
+    if (__atomic_exchange_n(&g_rdma_bg_connecting, 1, __ATOMIC_ACQ_REL) != 0) return;
+
+    repl_rdma_bg_connect_arg_t *arg =
+        (repl_rdma_bg_connect_arg_t *)kvs_malloc(sizeof(*arg));
+    if (!arg) {
+        __atomic_store_n(&g_rdma_bg_connecting, 0, __ATOMIC_RELEASE);
+        return;
+    }
+    snprintf(arg->host, sizeof(arg->host), "%s", g_slave_link_host);
+    arg->port = g_slave_link_port;
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, repl_rdma_bg_connect_thread, arg) != 0) {
+        kvs_free(arg);
+        __atomic_store_n(&g_rdma_bg_connecting, 0, __ATOMIC_RELEASE);
+        return;
+    }
+    pthread_detach(tid);
+    char detail[192];
+    snprintf(detail, sizeof(detail), "deferred RDMA connect started for %s:%d",
+             arg->host, arg->port);
+    repl_rdma_log("fullsync", detail);
+}
+#else
+void repl_rdma_slave_start_fullsync_connect(void) {}
 #endif
 
 static void *slave_thread(void *arg) {
@@ -3634,21 +3719,11 @@ static void *slave_thread(void *arg) {
 
             /* 按需模式: REPLSYNC 立即通过 TCP 发送，不再等待 RDMA 就绪。
              * Master 收到 REPLSYNC 后会在 queue_snapshot() 中按需启动 RDMA listener。
-             * Slave 在后台并发尝试 RDMA 连接（会自动重试直到 master listener 就绪）。 */
+             * 这里只记录目标地址；真正的 RDMA 建连延迟到 slave 收到 +FULLRESYNC，
+             * 这样 partial resync（+CONTINUE）不会空转连接、也不会误触发 fallback。 */
 #if KVS_ENABLE_RDMA
-            {
-                repl_rdma_bg_connect_arg_t *rdma_arg = (repl_rdma_bg_connect_arg_t *)kvs_malloc(sizeof(repl_rdma_bg_connect_arg_t));
-                if (rdma_arg) {
-                    snprintf(rdma_arg->host, sizeof(rdma_arg->host), "%s", host);
-                    rdma_arg->port = port;
-                    pthread_t rdma_tid;
-                    if (pthread_create(&rdma_tid, NULL, repl_rdma_bg_connect_thread, rdma_arg) != 0) {
-                        kvs_free(rdma_arg);
-                    } else {
-                        pthread_detach(rdma_tid);
-                    }
-                }
-            }
+            snprintf(g_slave_link_host, sizeof(g_slave_link_host), "%s", host);
+            g_slave_link_port = port;
 #endif
             g_slave_transport_kind = KVS_REPL_TRANSPORT_KPROBE_RDMA;
             repl_transport_mark_active("kprobe-rdma");
@@ -3818,25 +3893,12 @@ static void *slave_thread(void *arg) {
                     fprintf(stderr, "repl ebpf-tcp: REPLSYNC sent over TCP\n");
                 }
 
-                /* REPLSYNC 已发，等 master 启动 RDMA listener 后再尝试 RDMA 连接 */
-                usleep(500000);  /* 500ms — 给 master 时间启动 RDMA listener */
-
-                /* 后台尝试 RDMA 连接 */
+                /* REPLSYNC 已发。RDMA 连接延迟到 slave 收到 +FULLRESYNC 再建立：
+                 * partial resync（+CONTINUE）不应触发 RDMA listener 连接，
+                 * 也不需要在每次重连时固定等待 500ms。 */
         #if KVS_ENABLE_RDMA
-                {
-                    repl_rdma_bg_connect_arg_t *rdma_arg = (repl_rdma_bg_connect_arg_t *)
-                        kvs_malloc(sizeof(repl_rdma_bg_connect_arg_t));
-                    if (rdma_arg) {
-                        snprintf(rdma_arg->host, sizeof(rdma_arg->host), "%s", host);
-                        rdma_arg->port = port;
-                        pthread_t rdma_tid;
-                        if (pthread_create(&rdma_tid, NULL, repl_rdma_bg_connect_thread, rdma_arg) != 0) {
-                            kvs_free(rdma_arg);
-                        } else {
-                            pthread_detach(rdma_tid);
-                        }
-                    }
-                }
+                snprintf(g_slave_link_host, sizeof(g_slave_link_host), "%s", host);
+                g_slave_link_port = port;
         #endif
 
                 g_slave_fd = tcp_fd;
@@ -3979,21 +4041,10 @@ static void *slave_thread(void *arg) {
                 continue;
             }
 
-            /* 后台并发尝试 RDMA 连接（会自动重试直到 master listener 就绪） */
+            /* 只记录目标地址；RDMA 连接延迟到 +FULLRESYNC，partial 不建连。 */
 #if KVS_ENABLE_RDMA
-            {
-                repl_rdma_bg_connect_arg_t *rdma_arg = (repl_rdma_bg_connect_arg_t *)kvs_malloc(sizeof(repl_rdma_bg_connect_arg_t));
-                if (rdma_arg) {
-                    snprintf(rdma_arg->host, sizeof(rdma_arg->host), "%s", host);
-                    rdma_arg->port = port;
-                    pthread_t rdma_tid;
-                    if (pthread_create(&rdma_tid, NULL, repl_rdma_bg_connect_thread, rdma_arg) != 0) {
-                        kvs_free(rdma_arg);
-                    } else {
-                        pthread_detach(rdma_tid);
-                    }
-                }
-            }
+            snprintf(g_slave_link_host, sizeof(g_slave_link_host), "%s", host);
+            g_slave_link_port = port;
 #endif
             g_slave_transport_kind = KVS_REPL_TRANSPORT_EBPF;
             repl_transport_mark_active("ebpf");

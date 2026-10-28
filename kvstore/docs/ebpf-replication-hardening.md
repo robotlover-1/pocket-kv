@@ -317,9 +317,13 @@ RESUME{marker}               恢复期结束：丢弃 global_seq<=marker，其�
 ### 10.3 恢复期对齐
 
 - 正常 REPLSYNC/fullsync **不再关闭 capture**（否则 framer 会从半包重启）：
-  BUFFERING 期间已提交写进入 recovery 缓冲；Master 在 backlog/快照发送后记录
-  `marker=global_seq`；Slave ACK 追平 / REPLDONE 后发 `RESUME{marker}`：
-  `<=marker` 的提交已由 backlog/快照覆盖而丢弃，`>marker` 的按序转发。
+  BUFFERING 期间已提交写进入 recovery 缓冲；Master 在**立屏障时**
+  （`repl_barrier_begin`，owner 线程阻塞等待 proxy 应答，期间不会提交新写）
+  记录 `marker=repl_commit_global_seq()`；Slave ACK 追平 / REPLDONE 后由
+  `repl_barrier_release()` 发送 `RESUME{marker}`：`<=marker` 的提交已由
+  backlog/快照覆盖而丢弃，`>marker` 的按序转发。
+- `RESUME` 幂等：重复或更旧的 marker 不会重放已释放记录，也不会丢弃 `>marker`
+  的新写（单元测试 `test_commit_gate` 覆盖）。
 - proxy 崩溃/重启后：Master 关闭 capture，等待所有 client 到达命令边界
   （5s 超时则关闭半包连接），发 BASELINE 后再打开 capture；旧 proxy 的
   framing 状态不参与新会话。
@@ -331,7 +335,10 @@ repl_commit_active / repl_commit_channel / repl_commit_global_seq
 repl_commit_descriptors / repl_commit_writes / repl_commit_skips
 repl_commit_pending_bytes / repl_commit_timeout / repl_commit_desync /
 repl_commit_gap / repl_commit_recovery_bytes / repl_commit_next_global_seq
+repl_commit_ctxs / repl_commit_pending_cmds / repl_commit_oldest_pending_ms
+repl_commit_mem_hard_hit
 repl_commit_fault_reason
+repl_session_invalid_count / repl_last_invalid_reason
 repl_proxy_cache_over_high / repl_proxy_cache_hard_hit
 hash_lookups/hits/misses/probe_steps/max_chain/slots/entries/rehashing
 vsearch_queries/candidates/returned/total_us/max_us/topk_sum/dim_*

@@ -18,7 +18,7 @@ enum {
     REPL_COMMIT_MSG_BASELINE = 2,   /* {cookie, value=next_cmd_seq} */
     REPL_COMMIT_MSG_IGNORE   = 3,   /* {cookie, value=0} */
     REPL_COMMIT_MSG_FORGET   = 4,   /* {cookie, value=0} */
-    REPL_COMMIT_MSG_RESUME   = 5,   /* global_seq=marker */
+    REPL_COMMIT_MSG_RESUME   = 5,   /* global_seq=marker：丢弃 <=marker 的 recovery 提交 */
     REPL_COMMIT_MSG_BATCH    = 6,   /* desc[] */
 };
 

@@ -77,6 +77,10 @@ static __u64 g_fs_req_seen = 0;
 #define PST_COMMIT_CHANNEL   15
 #define PST_CACHE_OVER_HIGH  16
 #define PST_CACHE_HARD_HIT   17
+#define PST_CONN_CTX         18
+#define PST_PENDING_CMD      19
+#define PST_OLDEST_PENDING   20
+#define PST_MEM_HARD_HIT     21
 
 /* capture gate：drop=1 时丢弃所有 ringbuf/队列/缓存中的增量数据，
  * 等 Master 完成 REPLSYNC 后重新打开，避免残缺命令进入 slave。 */
@@ -678,6 +682,10 @@ static void proxy_stats_update(void) {
     write_proxy_stat_u64(PST_COMMIT_RECOVERY, (__u64)cs.recovery_bytes);
     write_proxy_stat_u64(PST_COMMIT_NEXT_G, cs.next_global_seq);
     write_proxy_stat_u64(PST_COMMIT_CHANNEL, (__u64)(cs.channel_connected ? 1 : 0));
+    write_proxy_stat_u64(PST_CONN_CTX, (__u64)cs.conn_ctx_count);
+    write_proxy_stat_u64(PST_PENDING_CMD, (__u64)cs.pending_cmd_count);
+    write_proxy_stat_u64(PST_OLDEST_PENDING, (__u64)cs.oldest_pending_ms);
+    write_proxy_stat_u64(PST_MEM_HARD_HIT, (__u64)cs.memory_hard_limit_count);
 }
 
 /* ---- Commit Gate：已提交命令的落地 + 故障回调 ---- */
