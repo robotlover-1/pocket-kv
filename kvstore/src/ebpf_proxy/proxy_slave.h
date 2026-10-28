@@ -34,6 +34,12 @@ void proxy_slave_mark_down(proxy_slave_ctx_t *ctx, const char *why);
 /* 获取 fd（-1 表示未连接） */
 int proxy_slave_fd(proxy_slave_ctx_t *ctx);
 
+/* 非阻塞排空 slave 数据通道上的响应（+OK/错误行）。
+ * ebpf+tcp / tcp+ebpf+tcp 下 proxy 直连 Slave 主端口，Slave 会为每个写命令
+ * 回 +OK；proxy 不排空会在长时间运行后把 Slave 的 out ring / socket buffer 塞满。
+ * 返回 0 正常（含 EAGAIN），-1 表示对端关闭/连接错误（调用方应 mark_down）。 */
+int proxy_slave_drain(proxy_slave_ctx_t *ctx);
+
 /* 在内部锁保护下向 slave writev。返回实际写入字节数；
  * 未连接或 writev 失败返回 -1（调用方回退 cache）。
  * 锁跨越“检查已连接 + writev”，保证 disconnect 不会在处理中途

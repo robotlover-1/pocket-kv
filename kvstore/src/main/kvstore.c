@@ -26,9 +26,18 @@ extern int repl_backlog_copy_range(unsigned long long offset, unsigned char **ou
 /* 定义在本文件后部：repl_add_slave/repl_remove_slave 需要在此通知 proxy session 边界 */
 static void repl_notify_ebpf_proxy_session(int valid, unsigned long long sid);
 /* 定义在本文件后部：正常完成走 release（发 RESUME + flush）；
- * 超时/断连/session end 走 cancel（不得 flush 未确认数据）。 */
-static void repl_barrier_release(void);
-static void repl_barrier_cancel(void);
+ * 超时/断连/session end 走 cancel（不得 flush 未确认数据）。
+ * 屏障是 per-replica 的：每个副本有自己的 catchup_end/marker/ack。 */
+static void repl_barrier_release(conn_t *c);
+static void repl_barrier_cancel(conn_t *c);
+static void repl_proxy_slot_release(conn_t *c);
+
+/* 多副本 fan-out slot 注册（定义在本文件后部）。每个 replica 控制连接对应
+ * ebpf-proxy 的一个独立发送上下文；slot 通过 proxy_cfg 下发地址/gen。 */
+static int repl_proxy_barrier_needed(void);
+static int repl_proxy_slot_register(conn_t *c, int proxy_port);
+static void repl_proxy_slot_unregister(int slot);
+static void repl_proxy_slots_reset_all(void);
 
 #define KVS_DEFAULT_CONFIG_PATH "kvstore.conf"
 
@@ -119,6 +128,7 @@ static size_t append_bulk(unsigned char *out, size_t pos, size_t cap, const char
     return pos;
 }
 size_t resp_build_cmd4(unsigned char *out, size_t cap, const char *cmd, const char *a1, const char *a2, const char *a3) { size_t pos=0; pos += (size_t)snprintf((char*)out+pos, cap-pos, "*4\r\n"); pos=append_bulk(out,pos,cap,cmd); pos=append_bulk(out,pos,cap,a1); pos=append_bulk(out,pos,cap,a2); pos=append_bulk(out,pos,cap,a3); return pos; }
+size_t resp_build_cmd5(unsigned char *out, size_t cap, const char *cmd, const char *a1, const char *a2, const char *a3, const char *a4) { size_t pos=0; pos += (size_t)snprintf((char*)out+pos, cap-pos, "*5\r\n"); pos=append_bulk(out,pos,cap,cmd); pos=append_bulk(out,pos,cap,a1); pos=append_bulk(out,pos,cap,a2); pos=append_bulk(out,pos,cap,a3); pos=append_bulk(out,pos,cap,a4); return pos; }
 size_t resp_build_cmd3(unsigned char *out, size_t cap, const char *cmd, const char *a1, const char *a2) { size_t pos=0; pos += (size_t)snprintf((char*)out+pos, cap-pos, "*3\r\n"); pos=append_bulk(out,pos,cap,cmd); pos=append_bulk(out,pos,cap,a1); pos=append_bulk(out,pos,cap,a2); return pos; }
 size_t resp_build_cmd2(unsigned char *out, size_t cap, const char *cmd, const char *a1) { size_t pos=0; pos += (size_t)snprintf((char*)out+pos, cap-pos, "*2\r\n"); pos=append_bulk(out,pos,cap,cmd); pos=append_bulk(out,pos,cap,a1); return pos; }
 size_t resp_build_cmd1(unsigned char *out, size_t cap, const char *cmd) { size_t pos=0; pos += (size_t)snprintf((char*)out+pos, cap-pos, "*1\r\n"); pos=append_bulk(out,pos,cap,cmd); return pos; }
@@ -233,6 +243,7 @@ static int parse_args(int argc, char **argv) {
         else if (!strcmp(argv[i], "--role") && i + 1 < argc) g_cfg.role = !strcmp(argv[++i], "slave") ? ROLE_SLAVE : ROLE_MASTER;
         else if (!strcmp(argv[i], "--master-host") && i + 1 < argc) snprintf(g_cfg.master_host, sizeof(g_cfg.master_host), "%s", argv[++i]);
         else if (!strcmp(argv[i], "--master-port") && i + 1 < argc) g_cfg.master_port = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--repl-proxy-port") && i + 1 < argc) g_cfg.repl_proxy_port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--requirepass") && i + 1 < argc) snprintf(g_cfg.requirepass, sizeof(g_cfg.requirepass), "%s", argv[++i]);
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) snprintf(g_cfg.dump_path, sizeof(g_cfg.dump_path), "%s", argv[++i]);
         else if (!strcmp(argv[i], "--aof") && i + 1 < argc) snprintf(g_cfg.aof_path, sizeof(g_cfg.aof_path), "%s", argv[++i]);
@@ -412,6 +423,7 @@ static int apply_config_kv(const char *key, const char *value) {
     else if (!strcmp(key, "role")) g_cfg.role = !strcasecmp(value, "slave") ? ROLE_SLAVE : ROLE_MASTER;
     else if (!strcmp(key, "master_host")) snprintf(g_cfg.master_host, sizeof(g_cfg.master_host), "%s", value);
     else if (!strcmp(key, "master_port")) g_cfg.master_port = atoi(value);
+    else if (!strcmp(key, "repl_proxy_port")) g_cfg.repl_proxy_port = atoi(value);
     else if (!strcmp(key, "dump_path")) snprintf(g_cfg.dump_path, sizeof(g_cfg.dump_path), "%s", value);
     else if (!strcmp(key, "aof_path")) snprintf(g_cfg.aof_path, sizeof(g_cfg.aof_path), "%s", value);
     else if (!strcmp(key, "mem_backend")) snprintf(g_cfg.mem_backend, sizeof(g_cfg.mem_backend), "%s", value);
@@ -580,22 +592,27 @@ static void repl_reject_replica(conn_t *c) {
  * 内部会做 bpf map 写入，必须在**锁外**调用。 */
 static void repl_end_session_notify(void) {
     fprintf(stderr, "master: replication session end "
-                    "(capture disabled, proxy cache invalidated)\n");
-    /* 最后一个 Slave 都没了：屏障必须作废，但**不能**走正常 release ——
-     * 那会发 RESUME 并让 proxy flush 未经 ACK 确认的数据。这里只清 Master 侧
-     * 屏障状态；proxy 侧由随后的 SESSION_VALID=0 / CAPTURE_ENABLE=0 丢弃 cache。
-     * 下一次 REPLSYNC 的 repl_barrier_begin() 会用下降沿重置 proxy 的屏障状态。 */
-    repl_barrier_cancel();
+                    "(capture disabled, proxy replicas unregistered)\n");
+    /* 最后一个 Slave 都没了：所有 per-replica 屏障必须作废，但**不能**走正常
+     * release —— 那会发 RESUME 并让 proxy flush 未经 ACK 确认的数据。
+     * 各连接移除时已经 cancel 了自己的屏障；这里把 proxy 的 slot 注册与
+     * 每 slot 控制位全部清零，proxy 会断开全部数据通道并丢弃恢复缓冲。 */
+    repl_proxy_slots_reset_all();
     repl_session_end();
     repl_notify_ebpf_proxy_session(0, 0);
 }
 
 void repl_remove_slave(conn_t *c) {
+    if (!c) return;
     int last;
+    /* 先作废该副本自己的屏障（不释放、不发 RESUME），再摘链：
+     * 其他副本的屏障与游标完全不受影响（多 Slave 故障隔离）。 */
+    repl_barrier_cancel(c);
     pthread_mutex_lock(&g_repl_lock);
     last = repl_unlink_replica_locked(c);
     pthread_mutex_unlock(&g_repl_lock);
     if (last) repl_end_session_notify();
+    else repl_proxy_slot_release(c);
 }
 
 void repl_broadcast(const unsigned char *raw, size_t rawlen) {
@@ -603,6 +620,8 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
     repl_note_send_context("broadcast", rawlen, repl_master_offset(), raw);
 
     int session_ended = 0;
+    conn_t *drained[KVS_MAX_REPLICA_SLOTS];
+    int n_drained = 0;
     pthread_mutex_lock(&g_repl_lock);
     conn_t **pp = &g_replicas;
     while (*pp) {
@@ -611,6 +630,9 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
             /* 统一走摘链 helper。原来手工改 next_replica/is_replica 会绕过 session end：
              * 最后一个 Slave 因 draining 被摘掉后 g_replicas 变 NULL，但 CAPTURE_ENABLE
              * 仍是 1，而随后真正 close 时的 repl_remove_slave 又因 found=0 不做清理。 */
+            repl_barrier_cancel(c);
+            if (n_drained < KVS_MAX_REPLICA_SLOTS)
+                drained[n_drained++] = c;
             if (repl_unlink_replica_locked(c)) session_ended = 1;
             continue;   /* *pp 已指向下一个节点 */
         }
@@ -656,8 +678,9 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen) {
     }
     pthread_mutex_unlock(&g_repl_lock);
 
-    /* draining 副本可能是最后一个：session end 必须在锁外做（内部要写 bpf map） */
+    /* slot 注销要写 bpf map，放在锁外；session end 会重置全部 slot。 */
     if (session_ended) repl_end_session_notify();
+    else for (int i = 0; i < n_drained; i++) repl_proxy_slot_release(drained[i]);
 }
 
 int repl_send_chunked(conn_t *c, const unsigned char *buf, size_t len) {
@@ -777,21 +800,228 @@ static void repl_notify_ebpf_proxy_session(int valid, unsigned long long sid) {
  * 注意 ① 与 CAPTURE_ENABLE 的先后：若先开捕获再立屏障，这段窗口里捕获到的写会被
  * proxy 实时转发出去，随后 replay 又会带上同一条命令 → 重复应用。
  */
-static int g_barrier_active = 0;
-/* 放行条件：0 = 由 REPLDONE 放行（全量同步）；1 = 由 Slave 的 REPLACK 放行（partial resync）。
- * 全量**绝不能**用"applied >= catchup_end"来放行：Slave 一收到 +FULLRESYNC 就把自己的
- * applied 设成快照基准 offset，此时它还在往临时文件里写快照。若据此提前放行，proxy 会
- * 立刻 flush cache，而 Slave 正处于 loading_fullsync 状态 —— 它会把收到的任何非控制行
- * 当成 KVSD 字节**写进快照文件**，直接损坏全量数据（实测 replay_dump_file 报
- * "invalid engine_id 64 at pos 8"）。只有 REPLDONE 才代表"快照已加载完成"。 */
-static int g_barrier_ack_gated = 0;
-static unsigned long long g_barrier_end_offset = 0;   /* catchup_end = 立屏障时的 master_offset */
-static unsigned long long g_barrier_resume_global = 0;/* 屏障边界对应的最后一个 global_seq（RESUME marker） */
-static int g_barrier_resume_valid = 0;                /* marker 是否有效（0 也是合法 marker） */
-static long long g_barrier_deadline_ms = 0;           /* 等 Slave ack 的兜底期限，0=不设 */
-#define REPL_BARRIER_WAIT_MS      3000    /* 等 proxy 应答 BUFFERING */
-#define REPL_BARRIER_DOWN_WAIT_MS  1000   /* 等 proxy 离开上一轮遗留的 BUFFERING */
-#define REPL_BARRIER_HOLD_MAX_MS 15000    /* 等 Slave 追上；超时 fail-closed，不强制放行 */
+/* ---- 多副本 slot 注册（proxy_cfg） ----
+ * 每个 replica 控制连接拥有独立的 proxy 发送上下文（slot）。地址与 generation
+ * 通过 pinned proxy_cfg map 下发：
+ *   slave_addr.<slot> / slave_port.<slot> / replica_gen.<slot>
+ * proxy 以 replica_gen 的变化作为"该 slot 被重新注册"的提交点（gen=0 表示注销），
+ * 避免半更新的 addr/port 被当成新副本。slot 上限 KVS_MAX_REPLICA_SLOTS。
+ *
+ * slot 身份是 (Slave 源 IP, proxy 数据端口)：同一 Slave 重连复用原 slot（gen 递增，
+ * proxy 重置该 slot 状态）；同机不同端口的多 Slave 也能区分。
+ * 全部函数只在 owner 线程调用。 */
+static struct {
+    int used;
+    unsigned int ip;
+    int port;                    /* Slave 上报的 proxy 数据端口（同机制区分同机多 Slave） */
+    conn_t *owner;               /* 当前拥有该 slot 的控制连接（重连时转移） */
+    unsigned long long gen;
+    unsigned long long barrier_seq;  /* 每次 barrier 递增；ACK 回显该值，避免漏边沿/陈旧 ACK */
+} g_repl_slots[KVS_MAX_REPLICA_SLOTS];
+static int g_repl_slots_cleared = 0;
+/* 单调递增的 gen / barrier seq：用时间做初值，Master 重启后也不会与旧 proxy
+ * 记忆的数值碰撞（proxy 以数值变化作为提交点/边沿）。 */
+static unsigned long long g_repl_gen_next = 0;
+static unsigned long long g_repl_barrier_seq_next = 0;
+
+static unsigned long long repl_proxy_next_gen(void) {
+    if (g_repl_gen_next == 0) {
+        unsigned long long base = (unsigned long long)kvs_now_ms() << 8;
+        g_repl_gen_next = base ? base : 1;
+    }
+    return g_repl_gen_next++;
+}
+
+static unsigned long long repl_proxy_next_barrier_seq(void) {
+    if (g_repl_barrier_seq_next == 0) {
+        unsigned long long base = (unsigned long long)kvs_now_ms() << 8;
+        g_repl_barrier_seq_next = base ? base + 1 : 1;
+    }
+    return g_repl_barrier_seq_next++;
+}
+
+/* 写 proxy_cfg 的单个键（value 为 u64，key 为 char[32]）。map 不存在时静默失败。 */
+static int repl_proxy_cfg_write_u64(const char *key, unsigned long long val) {
+#if KVS_ENABLE_EBPF
+    char path[512];
+    char k[32] = {0};
+    if (!g_cfg.ebpf_pin_path[0]) return -1;
+    snprintf(path, sizeof(path), "%s/proxy_cfg", g_cfg.ebpf_pin_path);
+    int fd = bpf_obj_get(path);
+    if (fd < 0) return -1;
+    snprintf(k, sizeof(k), "%s", key);
+    __u64 v = (__u64)val;
+    int rc = bpf_map_update_elem(fd, k, &v, BPF_ANY);
+    close(fd);
+    return rc;
+#else
+    (void)key; (void)val;
+    return -1;
+#endif
+}
+
+static void repl_proxy_cfg_slot_key(char *out, size_t cap, const char *name, int slot) {
+    snprintf(out, cap, "%s.%d", name, slot);
+}
+
+static void repl_proxy_slot_ctl_clear(int slot) {
+    repl_ebpf_client_ctl_set(KVS_CTL_SLOT_BARRIER(slot), 0);
+    repl_ebpf_client_ctl_set(KVS_CTL_SLOT_ACK(slot), 0);
+    repl_ebpf_client_ctl_set(KVS_CTL_SLOT_FAULT(slot), 0);
+}
+
+static void repl_proxy_slot_unregister(int slot) {
+    char key[32];
+    if (slot < 0 || slot >= KVS_MAX_REPLICA_SLOTS) return;
+    if (!g_repl_slots[slot].used) return;
+    g_repl_slots[slot].used = 0;
+    g_repl_slots[slot].owner = NULL;
+    g_repl_slots[slot].gen = 0;
+    /* 先让 gen=0 失效，再清地址；proxy 看到 gen 变化才重新读取地址。 */
+    repl_proxy_cfg_slot_key(key, sizeof(key), "replica_gen", slot);
+    repl_proxy_cfg_write_u64(key, 0);
+    repl_proxy_cfg_slot_key(key, sizeof(key), "slave_addr", slot);
+    repl_proxy_cfg_write_u64(key, 0);
+    repl_proxy_cfg_slot_key(key, sizeof(key), "slave_port", slot);
+    repl_proxy_cfg_write_u64(key, 0);
+    repl_proxy_slot_ctl_clear(slot);
+    if (slot == 0) {
+        repl_proxy_cfg_write_u64("slave_addr", 0);
+        repl_proxy_cfg_write_u64("slave_port", 0);
+    }
+    fprintf(stderr, "master: proxy replica slot %d unregistered\n", slot);
+}
+
+/* 连接关闭/被摘链时释放它拥有的 slot。若 slot 已因重连转移给新连接，
+ * 旧连接的清理不能把新连接的注册撤掉。 */
+static void repl_proxy_slot_release(conn_t *c) {
+    if (!c) return;
+    int slot = c->repl_slot;
+    c->repl_slot = -1;
+    if (slot >= 0 && slot < KVS_MAX_REPLICA_SLOTS &&
+        g_repl_slots[slot].used && g_repl_slots[slot].owner == c)
+        repl_proxy_slot_unregister(slot);
+}
+
+static void repl_proxy_slots_reset_all(void) {
+    int map_ok = 0;
+    for (int i = 0; i < KVS_MAX_REPLICA_SLOTS; i++) {
+        g_repl_slots[i].used = 0;
+        g_repl_slots[i].port = 0;
+        g_repl_slots[i].owner = NULL;
+        g_repl_slots[i].gen = 0;
+        char key[32];
+        repl_proxy_cfg_slot_key(key, sizeof(key), "replica_gen", i);
+        if (repl_proxy_cfg_write_u64(key, 0) == 0) map_ok = 1;
+        repl_proxy_cfg_slot_key(key, sizeof(key), "slave_addr", i);
+        repl_proxy_cfg_write_u64(key, 0);
+        repl_proxy_cfg_slot_key(key, sizeof(key), "slave_port", i);
+        repl_proxy_cfg_write_u64(key, 0);
+        repl_proxy_slot_ctl_clear(i);
+    }
+    repl_proxy_cfg_write_u64("slave_addr", 0);
+    repl_proxy_cfg_write_u64("slave_port", 0);
+    /* proxy 尚未启动/map 未 pin 时写失败：保持未清理，下一次 REPLSYNC 再试。 */
+    g_repl_slots_cleared = map_ok;
+    fprintf(stderr, "master: proxy replica slots reset (%d max)%s\n",
+            KVS_MAX_REPLICA_SLOTS, map_ok ? "" : " [map unavailable, will retry]");
+}
+
+static int repl_proxy_slot_register(conn_t *c, int proxy_port) {
+    if (!repl_proxy_barrier_needed()) return 0;
+    if (proxy_port <= 0) proxy_port = g_cfg.port + 1;
+    if (!c) return -1;
+    if (c->repl_slot >= 0) return 0;
+
+    /* 进程启动后第一次 REPLSYNC：清掉上一个 Master 实例残留的 slot 注册。 */
+    if (!g_repl_slots_cleared) repl_proxy_slots_reset_all();
+
+    struct sockaddr_in peer;
+    socklen_t peer_len = sizeof(peer);
+    if (getpeername(c->fd, (struct sockaddr *)&peer, &peer_len) != 0) {
+        fprintf(stderr, "master: replica slot: getpeername failed (fd=%d)\n", c->fd);
+        return -1;
+    }
+    unsigned int ip = (unsigned int)peer.sin_addr.s_addr;
+
+    int slot = -1;
+    /* 同一 Slave 以 (IP, proxy_port) 识别：同机多 Slave 也各有独立 slot。 */
+    for (int i = 0; i < KVS_MAX_REPLICA_SLOTS; i++) {
+        if (g_repl_slots[i].used && g_repl_slots[i].ip == ip &&
+            g_repl_slots[i].port == proxy_port) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        for (int i = 0; i < KVS_MAX_REPLICA_SLOTS; i++) {
+            if (!g_repl_slots[i].used) { slot = i; break; }
+        }
+    }
+    if (slot < 0) {
+        fprintf(stderr, "master: replica slot exhausted (%d) — refusing %u.%u.%u.%u\n",
+                KVS_MAX_REPLICA_SLOTS,
+                ip & 0xFF, (ip >> 8) & 0xFF, (ip >> 16) & 0xFF, (ip >> 24) & 0xFF);
+        return -1;
+    }
+
+    /* 同一 Slave 重连：旧控制连接若仍挂在同一 slot，先拒绝它，避免两个控制连接
+     * 共享一个 proxy 发送上下文（会产生重复 ACK/屏障互相踩踏）。 */
+    pthread_mutex_lock(&g_repl_lock);
+    for (conn_t *it = g_replicas; it; it = it->next_replica) {
+        if (it != c && it->repl_slot == slot) {
+            fprintf(stderr, "master: replica slot %d reused by fd=%d, rejecting old fd=%d\n",
+                    slot, c->fd, it->fd);
+            repl_reject_replica(it);
+            repl_barrier_cancel(it);
+            it->repl_slot = -1;      /* slot 所有权转移给新连接 */
+        }
+    }
+    pthread_mutex_unlock(&g_repl_lock);
+
+    g_repl_slots[slot].used = 1;
+    g_repl_slots[slot].owner = c;
+    g_repl_slots[slot].ip = ip;
+    g_repl_slots[slot].port = proxy_port;
+    g_repl_slots[slot].gen = repl_proxy_next_gen();
+
+    char key[32];
+    repl_proxy_cfg_slot_key(key, sizeof(key), "slave_addr", slot);
+    repl_proxy_cfg_write_u64(key, (unsigned long long)ip);
+    repl_proxy_cfg_slot_key(key, sizeof(key), "slave_port", slot);
+    repl_proxy_cfg_write_u64(key, (unsigned long long)proxy_port);
+    repl_proxy_cfg_slot_key(key, sizeof(key), "replica_gen", slot);
+    if (repl_proxy_cfg_write_u64(key, g_repl_slots[slot].gen) != 0) {
+        /* proxy_cfg 不可写（proxy 未启动）：不要留下半注册状态。 */
+        g_repl_slots[slot].used = 0;
+        g_repl_slots[slot].port = 0;
+        g_repl_slots[slot].gen = 0;
+        fprintf(stderr, "master: replica slot %d registration failed "
+                        "(proxy_cfg unavailable)\n", slot);
+        return -1;
+    }
+    if (slot == 0) {
+        /* 单副本兼容键：旧 proxy/监控仍可读。 */
+        repl_proxy_cfg_write_u64("slave_addr", (unsigned long long)ip);
+        repl_proxy_cfg_write_u64("slave_port", (unsigned long long)proxy_port);
+    }
+
+    c->repl_slot = slot;
+    c->repl_barrier_active = 0;
+    c->repl_barrier_ack_gated = 0;
+    c->repl_barrier_resume_valid = 0;
+    c->repl_barrier_end_offset = 0;
+    c->repl_barrier_resume_global = 0;
+    c->repl_barrier_deadline_ms = 0;
+    fprintf(stderr, "master: proxy replica slot %d registered ip=%u.%u.%u.%u proxy_port=%d gen=%llu\n",
+            slot, ip & 0xFF, (ip >> 8) & 0xFF, (ip >> 16) & 0xFF, (ip >> 24) & 0xFF,
+            proxy_port, g_repl_slots[slot].gen);
+    return 0;
+}
+
+#define REPL_BARRIER_WAIT_MS      3000    /* 等 proxy 应答该副本进入恢复缓冲 */
+#define REPL_BARRIER_DOWN_WAIT_MS  1000   /* 等 proxy 离开上一轮遗留的恢复缓冲 */
+#define REPL_BARRIER_HOLD_MAX_MS 15000    /* 等 Slave 追上；超时只拒绝该副本 */
 
 static int repl_proxy_barrier_needed(void) {
     if (!g_cfg.ebpf_pin_path[0]) return 0;
@@ -799,122 +1029,138 @@ static int repl_proxy_barrier_needed(void) {
            strcasecmp(g_cfg.repl_transport_backend, "ebpf+tcp") == 0;
 }
 
-/* 立屏障并返回 catchup_end（= 屏障时刻的 master_offset，即本 session 需要补齐的上界）。
+static void repl_barrier_clear_state(conn_t *c) {
+    c->repl_barrier_active = 0;
+    c->repl_barrier_ack_gated = 0;
+    c->repl_barrier_end_offset = 0;
+    c->repl_barrier_resume_global = 0;
+    c->repl_barrier_resume_valid = 0;
+    c->repl_barrier_deadline_ms = 0;
+}
+
+/* 立屏障并返回 catchup_end（= 屏障时刻的 master_offset，即该副本需要补齐的上界）。
+ * 只影响 c 自己的 slot：其他 LIVE 副本继续经 proxy 实时接收增量。
  * 返回 0 成功；-1 表示 proxy 未确认（fail-closed，调用方必须放弃本次 resync）。 */
-static int repl_barrier_begin(unsigned long long *catchup_end) {
+static int repl_barrier_begin(conn_t *c, unsigned long long *catchup_end) {
     if (catchup_end) *catchup_end = repl_master_offset();
     if (!repl_proxy_barrier_needed()) return 0;      /* 非 ebpf+tcp：同一连接有序，无需屏障 */
-    if (g_barrier_active) {
-        /* 屏障已立（如全量进行中又来了一个 Slave）。不复用旧 catchup_end：快照 dump 的是
-         * "现在"的引擎状态，边界必须取当前 offset，否则 Slave 会以为要补 [旧边界, 现在)
-         * 而这部分早已在 dump 里 → 重复应用。 */
+    if (!c || c->repl_slot < 0) {
+        fprintf(stderr, "master: REPLSYNC rejected — replica has no proxy slot "
+                        "(registration failed?)\n");
+        return -1;
+    }
+    int slot = c->repl_slot;
+    if (c->repl_barrier_active) {
+        /* 同一副本重复 REPLSYNC：不复用旧 catchup_end（快照 dump 的是"现在"
+         * 的引擎状态，边界必须取当前 offset）。 */
         if (catchup_end) *catchup_end = repl_master_offset();
         return 0;
     }
 
-    /* 若 proxy 仍停留在上一轮的 BUFFERING（session end / 超时 cancel 后 [3] 可能
-     * 仍为 1），先制造一次下降沿并等它确认 FORWARDING。否则本轮写 [3]=1 不会
-     * 产生边沿，proxy 不会重新应答，Master 会误判超时。 */
-    repl_ebpf_client_ctl_set(KVS_CTL_PROXY_STATE, 0);
-    if (repl_ebpf_client_ctl_get(KVS_CTL_FULLSYNC_STATE) != 0) {
-        repl_ebpf_client_ctl_set(KVS_CTL_FULLSYNC_STATE, 0);
+    __u32 bk = KVS_CTL_SLOT_BARRIER(slot);
+    __u32 ak = KVS_CTL_SLOT_ACK(slot);
+
+    /* barrier 值不是布尔位而是单调递增的 seq（ACK 回显同一 seq）：
+     * 即使 proxy 在两次轮询之间漏看了 0→1 边沿，也能凭 seq 变化识别新屏障；
+     * ACK 也不会把上一轮的值误判成本轮成功。 */
+    if (repl_ebpf_client_ctl_get(bk) != 0) {
+        /* 上一轮恢复态未退出：先写 0 并等 proxy 清 ACK（最多 1s）。即使 ACK
+         * 本来就是 0/等待超时，下面的新 seq 仍会被 proxy 视为新屏障。 */
+        repl_ebpf_client_ctl_set(bk, 0);
         long long down_deadline = kvs_now_ms() + REPL_BARRIER_DOWN_WAIT_MS;
-        int down = 0;
         while (kvs_now_ms() < down_deadline) {
-            if (repl_ebpf_client_ctl_get(KVS_CTL_PROXY_STATE) == 0) { down = 1; break; }
+            if (repl_ebpf_client_ctl_get(ak) == 0) break;
             usleep(2000);
-        }
-        if (!down) {
-            fprintf(stderr, "master: proxy did not leave stale BUFFERING within "
-                            "%dms — fail-closed, refusing to resync\n",
-                    REPL_BARRIER_DOWN_WAIT_MS);
-            g_barrier_resume_global = 0;
-            g_barrier_resume_valid = 0;
-            return -1;
         }
     }
 
-    /* 坑：proxy 按 [3] 的**边沿**应答，清 [12] 保证不会把上一轮的陈旧应答
-     * 误判成本轮成功。 */
-    repl_ebpf_client_ctl_set(KVS_CTL_PROXY_STATE, 0);
-    repl_ebpf_client_ctl_set(KVS_CTL_FULLSYNC_STATE, 1);
-    /* 屏障时刻的 Commit Gate 边界：此后的写进入 proxy recovery 缓冲；
-     * 放行时 RESUME 丢弃 <= 该 marker 的提交（已被快照/backlog replay 覆盖）。
+    unsigned long long seq = repl_proxy_next_barrier_seq();
+    g_repl_slots[slot].barrier_seq = seq;
+    /* 屏障时刻的 Commit Gate 边界 = RESUME marker。
      * 本函数在 owner 线程执行且阻塞等待 proxy 应答，期间不会再提交新写，
-     * 因此这里取的 global_seq 与 catchup_end 一致。
-     * marker=0 合法：必须用一个独立标志表示"需要发送 RESUME"。 */
-    g_barrier_resume_global = repl_commit_global_seq();
-    g_barrier_resume_valid = 1;
+     * 因此 marker 与 catchup_end 对应同一时刻。marker=0 合法（用 valid 标志区分）。 */
+    c->repl_barrier_resume_global = repl_commit_global_seq();
+    c->repl_barrier_resume_valid = 1;
+    repl_ebpf_client_ctl_set(bk, seq);
 
     long long deadline = kvs_now_ms() + REPL_BARRIER_WAIT_MS;
     int ok = 0;
     while (kvs_now_ms() < deadline) {
-        if (repl_ebpf_client_ctl_get(KVS_CTL_PROXY_STATE) == 1) { ok = 1; break; }
+        if (repl_ebpf_client_ctl_get(ak) == seq) { ok = 1; break; }
         usleep(2000);
     }
     if (!ok) {
-        repl_ebpf_client_ctl_set(KVS_CTL_FULLSYNC_STATE, 0);   /* 回滚，避免遗留 BUFFERING */
-        g_barrier_resume_global = 0;
-        g_barrier_resume_valid = 0;
-        fprintf(stderr, "master: ebpf-proxy barrier NOT confirmed within %dms — "
-                        "fail-closed, refusing to resync (proxy dead/hung?)\n",
-                REPL_BARRIER_WAIT_MS);
+        repl_ebpf_client_ctl_set(bk, 0);
+        c->repl_barrier_resume_global = 0;
+        c->repl_barrier_resume_valid = 0;
+        fprintf(stderr, "master: slot %d proxy barrier NOT confirmed within %dms — "
+                        "fail-closed (proxy dead/hung?)\n",
+                slot, REPL_BARRIER_WAIT_MS);
         return -1;
     }
-    g_barrier_active = 1;
-    g_barrier_ack_gated = 0;                 /* 默认全量语义：由 REPLDONE 放行 */
-    g_barrier_end_offset = repl_master_offset();
-    g_barrier_deadline_ms = 0;
-    if (catchup_end) *catchup_end = g_barrier_end_offset;
-    fprintf(stderr, "master: proxy barrier up (BUFFERING confirmed), catchup_end=%llu\n",
-            g_barrier_end_offset);
+    c->repl_barrier_active = 1;
+    c->repl_barrier_ack_gated = 0;           /* 默认全量语义：由 REPLDONE 放行 */
+    c->repl_barrier_end_offset = repl_master_offset();
+    c->repl_barrier_deadline_ms = 0;
+    if (catchup_end) *catchup_end = c->repl_barrier_end_offset;
+    fprintf(stderr, "master: slot %d proxy barrier up, catchup_end=%llu\n",
+            slot, c->repl_barrier_end_offset);
     return 0;
 }
 
-/* 正常放行：仅当 Slave 已 ACK 到 catchup_end（partial）或 REPLDONE（full）。
- * 先发 RESUME（proxy 丢弃 <=marker、其余进 cache），再写 [3]=0 让 proxy flush；
- * RESUME 发送失败则 fail-closed，绝不 flush 未确认数据。 */
-static void repl_barrier_release(void) {
-    if (!g_barrier_active) return;
-    g_barrier_active = 0;
-    g_barrier_ack_gated = 0;
-    g_barrier_deadline_ms = 0;
-    if (repl_proxy_barrier_needed()) {
-        int resume_rc = 0;   /* 0 = 成功；-1 = 发送失败 */
-        if (repl_commit_active_mode() && g_barrier_resume_valid)
-            resume_rc = repl_commit_resume(g_barrier_resume_global);
+/* 正常放行单个副本：仅当该 Slave 已 ACK 到 catchup_end（partial）或 REPLDONE（full）。
+ * 先发 RESUME(slot, marker)（proxy 丢弃 <=marker、其余放行），再写 barrier=0 让 proxy
+ * flush 该副本的恢复缓冲。RESUME 发送失败是 Commit Gate 全局故障（无法判断后续
+ * 提交是否还能发布），按既有语义失效整个 session。 */
+static void repl_barrier_release(conn_t *c) {
+    if (!c || !c->repl_barrier_active) return;
+    int slot = c->repl_slot;
+    unsigned long long marker = c->repl_barrier_resume_global;
+    int marker_valid = c->repl_barrier_resume_valid;
+    c->repl_barrier_active = 0;
+    c->repl_barrier_ack_gated = 0;
+    c->repl_barrier_deadline_ms = 0;
+    if (repl_proxy_barrier_needed() && slot >= 0) {
+        int resume_rc = 0;
+        if (repl_commit_active_mode() && marker_valid)
+            resume_rc = repl_commit_resume((uint64_t)slot, marker);
         if (resume_rc != 0) {
-            /* 控制通道不可用：不能让 proxy 继续 flush recovery/cache。
-             * 保持 [3]=1（BUFFERING），由 session invalidate 关闭 capture 并
-             * 断开副本；Slave 重连后重新建立屏障（begin 会重置遗留状态）。 */
-            fprintf(stderr, "master: RESUME(marker=%llu) send failed — "
+            fprintf(stderr, "master: slot %d RESUME(marker=%llu) send failed — "
                             "fail-closed, invalidating replication session\n",
-                    g_barrier_resume_global);
+                    slot, marker);
             repl_session_invalidate(REPL_INVALID_COMMIT_CHANNEL);
         } else {
-            fprintf(stderr, "master: proxy barrier down — proxy will flush its cache\n");
-            repl_ebpf_client_ctl_set(KVS_CTL_FULLSYNC_STATE, 0);
+            fprintf(stderr, "master: slot %d proxy barrier down — proxy will flush "
+                            "recovery buffer\n", slot);
+            repl_ebpf_client_ctl_set(KVS_CTL_SLOT_BARRIER(slot), 0);
         }
     }
-    g_barrier_resume_global = 0;
-    g_barrier_resume_valid = 0;
+    c->repl_barrier_resume_global = 0;
+    c->repl_barrier_resume_valid = 0;
+    c->repl_barrier_end_offset = 0;
 }
 
-/* 异常作废屏障：不发 RESUME、不写 [3]=0（禁止 flush 未 ACK 的 recovery/cache）。
- * 调用方负责失效 session / 断开副本；proxy 的旧 cache 由 SESSION_VALID=0 丢弃，
- * 下一次 repl_barrier_begin() 会先用下降沿把 proxy 从 BUFFERING 清出来。 */
-static void repl_barrier_cancel(void) {
-    if (!g_barrier_active && !g_barrier_resume_valid) return;
-    fprintf(stderr, "master: proxy barrier cancelled without RESUME "
-                    "(fail-closed; unacked recovery must be discarded)\n");
-    g_barrier_active = 0;
-    g_barrier_ack_gated = 0;
-    g_barrier_deadline_ms = 0;
-    g_barrier_resume_global = 0;
-    g_barrier_resume_valid = 0;
+/* 异常作废屏障：不发 RESUME、不写 barrier=0（禁止放行未 ACK 的恢复数据）。
+ * 调用方负责拒绝/断开该副本；proxy 的 per-slot 恢复缓冲会在 slot 注销或
+ * session invalid 时丢弃，下一次 REPLSYNC 的 begin 用下降沿重置。 */
+static void repl_barrier_cancel(conn_t *c) {
+    if (!c) return;
+    if (!c->repl_barrier_active && !c->repl_barrier_resume_valid) return;
+    fprintf(stderr, "master: slot %d proxy barrier cancelled without RESUME "
+                    "(fail-closed; unacked recovery must be discarded)\n",
+            c->repl_slot);
+    repl_barrier_clear_state(c);
 }
 
-int repl_barrier_pending(void) { return g_barrier_active; }
+int repl_barrier_pending(void) {
+    int pending = 0;
+    pthread_mutex_lock(&g_repl_lock);
+    for (conn_t *c = g_replicas; c; c = c->next_replica) {
+        if (c->repl_barrier_active) { pending = 1; break; }
+    }
+    pthread_mutex_unlock(&g_repl_lock);
+    return pending;
+}
 
 /* Slave 每秒发送 REPLACK 心跳，因此正常情况下即使没有新写流量也会 ACK 追平；
  * 超时只用于 fail-closed 兜底，绝不代表"可以放行"。测试可用环境变量缩短。 */
@@ -928,37 +1174,60 @@ static long long repl_barrier_hold_max_ms(void) {
     return v;
 }
 
-/* partial resync 专用：等 Slave 的 REPLACK 追上 catchup_end 再放行，
- * 并设置 fail-closed 的超时检查（到达后作废屏障 + 失效会话，见 repl_barrier_tick）。 */
-static void repl_barrier_gate_on_ack(void) {
-    if (!g_barrier_active) return;
-    g_barrier_ack_gated = 1;
-    g_barrier_deadline_ms = kvs_now_ms() + repl_barrier_hold_max_ms();
+/* partial resync 专用：等该副本的 REPLACK 追上 catchup_end 再放行，
+ * 并设置 fail-closed 的超时检查（见 repl_barrier_tick）。 */
+static void repl_barrier_gate_on_ack(conn_t *c) {
+    if (!c || !c->repl_barrier_active) return;
+    c->repl_barrier_ack_gated = 1;
+    c->repl_barrier_deadline_ms = kvs_now_ms() + repl_barrier_hold_max_ms();
 }
 
-/* Slave 的 REPLACK 反馈：只有 applied 真正追上 catchup_end 才能放行 —— 这样代理
- * flush cache 一定发生在 replay 数据被 Slave 应用**之后**，跨连接的重排被彻底消除。 */
-void repl_barrier_note_applied(unsigned long long applied_offset) {
-    if (!g_barrier_active || !g_barrier_ack_gated) return;   /* 全量由 REPLDONE 放行 */
-    if (applied_offset >= g_barrier_end_offset) {
-        fprintf(stderr, "master: slave caught up (applied=%llu >= catchup_end=%llu), "
-                        "releasing proxy barrier\n", applied_offset, g_barrier_end_offset);
-        repl_barrier_release();
+/* Slave 的 REPLACK 反馈：只有该副本的 applied 真正追上自己的 catchup_end 才放行它的
+ * 屏障。其他副本的 ACK 不能解除这个屏障（§7.4）。 */
+void repl_barrier_note_applied(conn_t *c, unsigned long long applied_offset) {
+    if (!c || !c->repl_barrier_active || !c->repl_barrier_ack_gated) return;
+    if (applied_offset >= c->repl_barrier_end_offset) {
+        fprintf(stderr, "master: slot %d slave caught up (applied=%llu >= catchup_end=%llu), "
+                        "releasing proxy barrier\n",
+                c->repl_slot, applied_offset, c->repl_barrier_end_offset);
+        repl_barrier_release(c);
     }
 }
 
-/* 兜底：Slave 长时间不 ACK。超时**不能**强制 release —— 15s 没 ACK 不能证明
- * backlog 已回放完，放行会让 proxy flush 未确认数据并与 replay 交错。
- * 这里 fail-closed：失效会话、断开副本、作废屏障；Slave 重连后重新 REPLSYNC
- * （partial 不可保证时走 fullsync）。由 owner 线程的 100ms 定时块调用。 */
+/* 兜底：某个副本长时间不 ACK。超时**不能**强制 release —— 放行会让 proxy 送出
+ * 未确认数据并与 replay 交错。这里只 fail-closed 该副本（cancel + 拒绝连接），
+ * 它重连后重新 REPLSYNC；其他副本继续正常复制。由 owner 线程定时块调用。 */
 void repl_barrier_tick(void) {
-    if (!g_barrier_active || !g_barrier_ack_gated || g_barrier_deadline_ms == 0) return;
-    if (kvs_now_ms() < g_barrier_deadline_ms) return;
-    fprintf(stderr, "master: proxy barrier held >%lldms without slave ack — "
-                    "fail-closed (invalidate session, no release/flush)\n",
-            repl_barrier_hold_max_ms());
-    repl_barrier_cancel();
-    repl_session_invalidate(REPL_INVALID_BARRIER_TIMEOUT);
+    if (!repl_proxy_barrier_needed()) return;
+    conn_t *expired[KVS_MAX_REPLICA_SLOTS];
+    int n = 0;
+    long long now = kvs_now_ms();
+    pthread_mutex_lock(&g_repl_lock);
+    for (conn_t *c = g_replicas; c && n < KVS_MAX_REPLICA_SLOTS; c = c->next_replica) {
+        if (c->repl_barrier_active && c->repl_barrier_ack_gated &&
+            c->repl_barrier_deadline_ms != 0 && now >= c->repl_barrier_deadline_ms)
+            expired[n++] = c;
+    }
+    pthread_mutex_unlock(&g_repl_lock);
+
+    for (int i = 0; i < n; i++) {
+        conn_t *c = expired[i];
+        /* 是否还有其他健康副本：有则只拒绝本副本；没有则沿用旧的全局失效语义
+         * （单副本场景下两者等价，仍会记录 BARRIER_TIMEOUT 供门禁/INFO 使用）。 */
+        int others = 0;
+        pthread_mutex_lock(&g_repl_lock);
+        for (conn_t *o = g_replicas; o; o = o->next_replica) {
+            if (o != c && !o->repl_draining) { others = 1; break; }
+        }
+        pthread_mutex_unlock(&g_repl_lock);
+
+        fprintf(stderr, "master: slot %d proxy barrier held >%lldms without slave ack — "
+                        "fail-closed (%s)\n", c->repl_slot, repl_barrier_hold_max_ms(),
+                others ? "reject this replica only" : "invalidate session");
+        repl_barrier_cancel(c);
+        repl_reject_replica(c);
+        if (!others) repl_session_invalidate(REPL_INVALID_BARRIER_TIMEOUT);
+    }
 }
 
 /* 生成快照并启动全量传输。snap_base_offset 由调用方在**屏障建立后**取好传入
@@ -973,6 +1242,17 @@ static int queue_snapshot(conn_t *c, unsigned long long snap_base_offset) {
     int rdma_ok = 0;
 
     repl_rdma_log("queue_snapshot - begin replid=%s offset=%llu", repl_master_id(), repl_master_offset());
+
+    /* 多副本第一版只支持 TCP 全量（§3.6）：RDMA 的 QP/MR/快照生命周期目前是
+     * 进程级单例，多个 Slave 同时建连会互相污染。配置成 rdma 时直接拒绝第二个
+     * 副本的全量，Slave 重连重试；把 repl-fullsync-transport 改成 tcp 即可。 */
+    if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma") &&
+        repl_connected_slaves() > 1) {
+        fprintf(stderr, "master: multi-replica fullsync requires TCP "
+                        "(repl-fullsync-transport=rdma, replicas=%llu) — rejecting\n",
+                repl_connected_slaves());
+        return -1;
+    }
 
     /* 全量同步期间抑制增量广播，避免 KVSD 数据流被 repl_broadcast 写穿插 */
     g_repl_fullsync_in_progress = 1;
@@ -1666,6 +1946,9 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         const char *req_replid = argc >= 2 ? argv[1] : "?";
         unsigned long long req_offset = argc >= 3 ? (unsigned long long)strtoull(argv[2], NULL, 10) : 0;
         unsigned long long req_durable = argc >= 4 ? (unsigned long long)strtoull(argv[3], NULL, 10) : req_offset;
+        /* 可选第 5 参数：Slave 的 ebpf-proxy 数据监听端口。多 Slave 同机测试或
+         * 非默认端口时必须显式携带；缺省回退 master port+1（旧 Slave 兼容）。 */
+        int req_proxy_port = argc >= 5 ? atoi(argv[4]) : 0;
         /* Use req_offset for backlog check (data the slave needs).
          * req_durable may lag behind req_offset due to lazy AOF fsync,
          * but that doesn't prevent partial resync since the master
@@ -1691,28 +1974,14 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             c->repl_transport_kind = KVS_REPL_TRANSPORT_EBPF_TCP;
             fprintf(stderr, "repl: replica transport set to ebpf+tcp\n");
         }
-        /* 向 ebpf-proxy 写入 slave 地址 */
-        {
-            char cfg_path[512];
-            snprintf(cfg_path, sizeof(cfg_path), "%s/proxy_cfg", g_cfg.ebpf_pin_path);
-            int proxy_cfg_fd = bpf_obj_get(cfg_path);
-            if (proxy_cfg_fd >= 0) {
-                __u64 val;
-                char key[32] = {0};
-                struct sockaddr_in peer;
-                socklen_t peer_len = sizeof(peer);
-                if (getpeername(c->fd, (struct sockaddr *)&peer, &peer_len) == 0) {
-                    val = (__u64)(peer.sin_addr.s_addr);
-                    snprintf(key, sizeof(key), "slave_addr");
-                    bpf_map_update_elem(proxy_cfg_fd, key, &val, BPF_ANY);
-                    val = (__u64)(g_cfg.port + 1);  /* proxy listener on slave port+1 (assumes same port) */
-                    snprintf(key, sizeof(key), "slave_port");
-                    bpf_map_update_elem(proxy_cfg_fd, key, &val, BPF_ANY);
-                    fprintf(stderr, "master: wrote slave addr to ebpf-proxy (proxy port=%llu)\n",
-                            (unsigned long long)val);
-                }
-                close(proxy_cfg_fd);
-            }
+        /* 向 ebpf-proxy 注册该副本的独立发送 slot（地址 + generation）。
+         * 必须在立屏障之前：proxy 要先发现 slot 才能应答该副本的屏障。 */
+        if (repl_proxy_slot_register(c, req_proxy_port) != 0) {
+            fprintf(stderr, "master: REPLSYNC rejected — no ebpf-proxy replica slot "
+                            "(fail-closed)\n");
+            if (repl_commit_active_mode()) repl_commit_ignore(c);
+            repl_reject_replica(c);
+            return 0;
         }
         /* ① 先立屏障，**再**建立 session（开 CAPTURE_ENABLE）。顺序不能反：
          * 若先开捕获，proxy 会在"屏障生效前"把这段窗口里捕获的写实时转发给 Slave，
@@ -1720,7 +1989,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
          * 屏障失败一律 fail-closed：宁可让 Slave 重连重试，也不能在无屏障的情况下
          * 让"控制连接补数据"和"proxy 实时转发"两条连接并行。 */
         unsigned long long catchup_end = 0;
-        if (repl_barrier_begin(&catchup_end) != 0) {
+        if (repl_barrier_begin(c, &catchup_end) != 0) {
             fprintf(stderr, "master: REPLSYNC rejected — proxy barrier unavailable "
                             "(fail-closed), slave will reconnect and retry\n");
             if (repl_commit_active_mode()) repl_commit_ignore(c);
@@ -1743,9 +2012,9 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
              * 保证 proxy flush 一定发生在 replay 数据被应用之后。 */
             repl_backlog_send_continue_upto(c, req_offset, catchup_end);
             if (req_offset >= catchup_end) {
-                repl_barrier_release();   /* 无缺口：直接放行 */
+                repl_barrier_release(c);   /* 无缺口：直接放行该副本 */
             } else {
-                repl_barrier_gate_on_ack();   /* 有缺口：等 Slave REPLACK 追上再放行 */
+                repl_barrier_gate_on_ack(c);   /* 有缺口：等该副本 REPLACK 追上再放行 */
                 fprintf(stderr, "master: partial resync replayed [%llu,%llu) — "
                                 "waiting slave REPLACK before releasing barrier\n",
                         req_offset, catchup_end);
@@ -1757,7 +2026,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             if (queue_snapshot(c, catchup_end) != 0) {
                 repl_rdma_log("master_replsync - queue_snapshot failed");
                 repl_reject_replica(c);
-                repl_barrier_release();
+                repl_barrier_release(c);
             }
         }
         return 0;
@@ -1769,22 +2038,23 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         unsigned long long durable_offset = argc >= 3 ? (unsigned long long)strtoull(argv[2], NULL, 10) : applied_offset;
         repl_replica_update_ack(c, applied_offset, durable_offset);
 
-        /* proxy_cache 溢出（client_ctl[10]=1）：proxy 已经无法保证同一 session 内无损，
-         * 此时绝不能让它继续 flush（会形成永久缺数据的错误副本）。断开 replica 链路，
-         * 让 Slave 重新 REPLSYNC —— backlog 已不连续/偏移对不上，会走 FULLRESYNC（§12）。 */
-        if (c && c->repl_transport_kind == KVS_REPL_TRANSPORT_EBPF_TCP
-            && repl_ebpf_client_ctl_get(KVS_CTL_CACHE_INVALID) == 1) {
-            fprintf(stderr, "master: ebpf-proxy cache invalid (overflow) — "
-                            "dropping replica link to force full resync\n");
-            repl_ebpf_client_ctl_set(KVS_CTL_CACHE_INVALID, 0);   /* 重新武装，避免反复触发 */
+        /* 该副本的 proxy 侧缓冲溢出/数据面失败（slot FAULT=1）：只拒绝这个副本，
+         * 其他副本继续正常复制。Slave 会重连并按自己的 offset 走 partial/full resync。 */
+        if (c && c->repl_transport_kind == KVS_REPL_TRANSPORT_EBPF_TCP && c->repl_slot >= 0
+            && repl_ebpf_client_ctl_get(KVS_CTL_SLOT_FAULT(c->repl_slot)) == 1) {
+            fprintf(stderr, "master: slot %d proxy replica fault (buffer overflow/data "
+                            "channel) — dropping this replica only, force resync\n",
+                    c->repl_slot);
+            repl_ebpf_client_ctl_set(KVS_CTL_SLOT_FAULT(c->repl_slot), 0);
+            repl_barrier_cancel(c);
             repl_reject_replica(c);
             return 0;
         }
 
-        /* partial resync 屏障的放行条件：Slave 的 applied 真正追上 catchup_end。
-         * 必须在这里放行（而不是 replay 完就放），否则 proxy 的 cache flush 可能先于
+        /* partial resync 屏障的放行条件：该副本的 applied 真正追上**自己的** catchup_end。
+         * 必须在这里放行（而不是 replay 完就放），否则 proxy 的恢复缓冲放行可能先于
          * 控制连接上的 replay 数据被应用 —— 那正是两条连接重排的根源。 */
-        repl_barrier_note_applied(applied_offset);
+        repl_barrier_note_applied(c, applied_offset);
 
         /* 若 slave 落后且 backlog 有数据，推送追赶。经转发线程发送（回放数据深拷贝后入队），
          * 使转发线程成为 c->fd 的唯一写者，避免与转发线程并发写同一 fd（流穿插/破坏）。
@@ -1821,7 +2091,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             /* Slave 确认快照已加载完成 → 放行屏障：proxy 切回 FORWARDING 并 flush
              * 全量期间攒下的 proxy_cache。放行必须由 Slave 的确认触发，这样 cache 里的
              * 增量一定排在快照之后被应用。 */
-            repl_barrier_release();
+            repl_barrier_release(c);
 
             /* 回放全量同步期间积压的增量数据。
              * 用 backlog 自身的 start_offset，而非 c->repl_offset_sent
@@ -3496,6 +3766,7 @@ int main(int argc, char **argv) {
                 "  --role master|slave     角色 (默认 master)\n"
                 "  --master-host HOST      主机地址 (默认 192.168.233.128)\n"
                 "  --master-port PORT      主机端口 (默认 5160)\n"
+                "  --repl-proxy-port PORT  slave 侧 ebpf-proxy 数据端口 (默认 master_port+1)\n"
                 "  --dump PATH             dump 文件路径 (默认 kvstore.dump)\n"
                 "  --aof PATH              AOF 文件路径 (默认 kvstore.aof)\n"
                 "  --mem libc|jemalloc|custom  内存后端 (默认 libc)\n"

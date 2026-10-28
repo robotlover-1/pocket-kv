@@ -3855,7 +3855,9 @@ static void *slave_thread(void *arg) {
                  * 在发送 REPLSYNC 之前创建，确保 master 通知 proxy 时 listener 已就绪。 */
                 int proxy_listen_fd = -1;
                 int proxy_fd = -1;
-                int proxy_port = g_cfg.master_port + 1;
+                int proxy_port = g_cfg.repl_proxy_port > 0
+                                     ? g_cfg.repl_proxy_port
+                                     : g_cfg.master_port + 1;
                 {
                     proxy_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
                     if (proxy_listen_fd >= 0) {
@@ -3888,13 +3890,17 @@ static void *slave_thread(void *arg) {
 
                 {
                     unsigned char cmd[256];
-                    char offbuf[32], durablebuf[32];
+                    char offbuf[32], durablebuf[32], portbuf[16];
                     snprintf(offbuf, sizeof(offbuf), "%llu", g_slave_repl_offset);
                     snprintf(durablebuf, sizeof(durablebuf), "%llu", g_slave_repl_durable_offset);
-                    size_t n = resp_build_cmd4(cmd, sizeof(cmd), "REPLSYNC",
-                        g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf, durablebuf);
+                    snprintf(portbuf, sizeof(portbuf), "%d", proxy_port);
+                    /* 第 5 参数告知 Master 本 Slave 的 proxy 数据端口，多 Slave
+                     * 可以部署在同一主机（各自不同端口）。 */
+                    size_t n = resp_build_cmd5(cmd, sizeof(cmd), "REPLSYNC",
+                        g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf, durablebuf, portbuf);
                     if (send(tcp_fd, cmd, n, 0) < 0) { close(tcp_fd); continue; }
-                    fprintf(stderr, "repl ebpf-tcp: REPLSYNC sent over TCP\n");
+                    fprintf(stderr, "repl ebpf-tcp: REPLSYNC sent over TCP (proxy_port=%d)\n",
+                            proxy_port);
                 }
 
                 /* REPLSYNC 已发。RDMA 连接延迟到 slave 收到 +FULLRESYNC 再建立：
@@ -4012,9 +4018,13 @@ static void *slave_thread(void *arg) {
                         parse_resp_stream(NULL, buf, &blen, 1);
                     }
 
-                    /* 无数据时短暂休眠避免忙循环 */
-                    if (!had_new_data)
+                    /* 无数据时短暂休眠避免忙循环；同时补 REPLACK 心跳
+                     * （partial barrier 的放行依赖 applied 回报，不能只在
+                     * 收到数据时才 ACK）。 */
+                    if (!had_new_data) {
+                        repl_slave_ack_heartbeat();
                         usleep(1000);
+                    }
                 }
 
                 g_slave_fd = -1;
@@ -4275,7 +4285,22 @@ static void *slave_thread(void *arg) {
         char durablebuf[32];
         snprintf(offbuf, sizeof(offbuf), "%llu", g_slave_repl_offset);
         snprintf(durablebuf, sizeof(durablebuf), "%llu", g_slave_repl_durable_offset);
-        size_t n = resp_build_cmd4(cmd, sizeof(cmd), "REPLSYNC", g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf, durablebuf);
+        size_t n;
+        if (!strcasecmp(repl_realtime_transport_name(), "ebpf+tcp")) {
+            /* ebpf+tcp 的增量由 proxy 直连 Slave **主端口**注入（主端口写路径的
+             * !from_replication 分支会推进 replicated offset）。把主端口作为第 5
+             * 参数带给 Master：多 Slave 可部署在同一主机/任意端口，不再依赖
+             * “Slave 端口 == Master 端口 + 1” 的隐式约定。 */
+            char portbuf[16];
+            snprintf(portbuf, sizeof(portbuf), "%d", g_cfg.port);
+            n = resp_build_cmd5(cmd, sizeof(cmd), "REPLSYNC",
+                g_slave_master_replid[0] ? g_slave_master_replid : "?",
+                offbuf, durablebuf, portbuf);
+        } else {
+            n = resp_build_cmd4(cmd, sizeof(cmd), "REPLSYNC",
+                g_slave_master_replid[0] ? g_slave_master_replid : "?",
+                offbuf, durablebuf);
+        }
         if (send(fd, cmd, n, 0) < 0) {
             repl_transport_mark_active("tcp");
             g_slave_transport_kind = KVS_REPL_TRANSPORT_TCP;
@@ -4308,7 +4333,15 @@ static void *slave_thread(void *arg) {
                 continue;
             }
             if (r == 0) break;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* 控制连接空闲（SO_RCVTIMEO 1s）也要发 REPLACK 心跳。
+                 * partial resync 的屏障放行条件是 applied >= catchup_end；
+                 * 如果 replay 最后一包之后没有新数据，只在收到数据时 ACK 会
+                 * 让 Master 一直等到 barrier hold timeout 并误判副本故障
+                 * （实测：活跃 Slave 的 partial 屏障被 4s 超时拒绝）。 */
+                repl_slave_ack_heartbeat();
+                continue;
+            }
             break;
         }
 

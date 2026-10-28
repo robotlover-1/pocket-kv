@@ -14,6 +14,9 @@ LDFLAGS=-lpthread -ldl -L./NtyCo -lntyco -L./liburing/src -luring -ldl -lm $(if 
 
 SRC_DIR=src
 INC_DIR=include/kvstore
+# 头文件变化必须触发重编：Commit Gate/多副本协议分布在 replication/*.h，
+# 只依赖 kvstore.h 会留下“改了协议但目标文件没重编”的旧对象。
+KVS_HDRS=$(wildcard $(INC_DIR)/*.h) $(wildcard $(INC_DIR)/replication/*.h)
 TEST_HOST?=127.0.0.1
 TEST_PORT?=5000
 REPL_RDMA_SMOKE_HOST?=$(TEST_HOST)
@@ -120,7 +123,7 @@ build/replication/kvs_repl_ebpf.o: $(SRC_DIR)/replication/kvs_repl_ebpf.c $(INC_
 	@mkdir -p $(dir $@)
 	$(CC) $(filter-out -O2,$(CFLAGS)) -O0 -c $< -o $@
 
-build/%.o: $(SRC_DIR)/%.c $(INC_DIR)/kvstore.h
+build/%.o: $(SRC_DIR)/%.c $(KVS_HDRS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -154,6 +157,10 @@ check-commit-gate-faults: kvstore ebpf-proxy
 # ---- Barrier ACK 超时 fail-closed（root + eBPF；非 root 自动 SKIP）----
 check-barrier-timeout: kvstore ebpf-proxy
 	./tools/tests/test_barrier_timeout.sh ./kvstore
+
+# ---- 2-Slave 增量复制 / 故障隔离（root + eBPF；非 root 自动 SKIP）----
+check-multi-slave: kvstore ebpf-proxy client_capture_bpf
+	./tools/tests/test_multi_slave.sh ./kvstore
 
 # ---- 全量同步传输无关协议单元测试 ----
 TEST_FULLSYNC_SRC=tests/test_fullsync_protocol.c
@@ -251,7 +258,10 @@ EBPF_PROXY_BIN = build/ebpf_proxy
 EBPF_PROXY_CFLAGS = -Wall -Wextra -O2 -I./include -I./third_party/libbpf/include
 EBPF_LIBBPF_A = third_party/libbpf/lib/libbpf.a
 
-$(EBPF_PROXY_BIN): $(EBPF_PROXY_SRC) $(EBPF_LIBBPF_A)
+EBPF_PROXY_HDRS = src/ebpf_proxy/proxy_slave.h src/ebpf_proxy/proxy_commit.h \
+                  $(wildcard $(INC_DIR)/replication/*.h)
+
+$(EBPF_PROXY_BIN): $(EBPF_PROXY_SRC) $(EBPF_PROXY_HDRS) $(EBPF_LIBBPF_A)
 	@mkdir -p build
 	$(CC) $(EBPF_PROXY_CFLAGS) -o $@ $(EBPF_PROXY_SRC) $(EBPF_LIBBPF_A) -lelf -lz -lpthread
 
@@ -463,4 +473,4 @@ check-10w:
 
 check: check-resp check-ttl check-persist check-doc
 
-.PHONY: all clean build_dir check-kvstore check-slave-crash-recovery check-commit-gate-faults check-barrier-timeout check-repl-5w5w test_persist_dump_demo test_persist_aof_demo test_vsearch check check-resp check-ttl check-persist check-doc check-bulk-1w check-all check-all-quick check-mass-ttl check-uring-persist check-mmap-recover check-repl check-repl-metrics check-repl-profile check-repl-ebpf check-repl-ebpf-env check-repl-ebpf-sync check-repl-ebpf-sync-required check-repl-ebpf-redirect check-repl-rdma-unsupported check-repl-rdma-smoke check-repl-rdma-stress check-repl-rdma-soak check-repl-rdma-soak-skip check-rdma-standalone-probe check-rdma-pingpong-smoke check-demo-full-dump check-demo-incr-aof check-demo-repl-sync test_uring_persist test_mmap_recover test_repl_basic check-uring-persist-c check-mmap-recover-c check-repl-basic check-persist-purge check-persist-save-frontier tools/ebpf/repl_ebpf_daemon ebpf-proxy client_capture_bpf
+.PHONY: all clean build_dir check-kvstore check-slave-crash-recovery check-commit-gate-faults check-barrier-timeout check-multi-slave check-repl-5w5w test_persist_dump_demo test_persist_aof_demo test_vsearch check check-resp check-ttl check-persist check-doc check-bulk-1w check-all check-all-quick check-mass-ttl check-uring-persist check-mmap-recover check-repl check-repl-metrics check-repl-profile check-repl-ebpf check-repl-ebpf-env check-repl-ebpf-sync check-repl-ebpf-sync-required check-repl-ebpf-redirect check-repl-rdma-unsupported check-repl-rdma-smoke check-repl-rdma-stress check-repl-rdma-soak check-repl-rdma-soak-skip check-rdma-standalone-probe check-rdma-pingpong-smoke check-demo-full-dump check-demo-incr-aof check-demo-repl-sync test_uring_persist test_mmap_recover test_repl_basic check-uring-persist-c check-mmap-recover-c check-repl-basic check-persist-purge check-persist-save-frontier tools/ebpf/repl_ebpf_daemon ebpf-proxy client_capture_bpf

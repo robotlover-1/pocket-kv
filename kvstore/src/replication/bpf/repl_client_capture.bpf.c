@@ -71,14 +71,18 @@ struct iov_head {
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 16);
+    /* 0~15 全局键；16 起为 per-replica slot 控制区间（8 slots × 4），
+     * 只有 master/proxy 用户态读写，BPF 不迭代。与 client_ctl.h 的
+     * KVS_CTL_KEY_MAX/KVS_MAX_REPLICA_SLOTS 保持一致。 */
+    __uint(max_entries, 64);
     __type(key, __u32);
     __type(value, __u64);
 } client_ctl SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 16);
+    /* master_pid/master_port + 每 slot 的 addr/port/gen（8×3）+ 旧版单副本键 */
+    __uint(max_entries, 64);
     __type(key, char[32]);
     __type(value, __u64);
 } proxy_cfg SEC(".maps");

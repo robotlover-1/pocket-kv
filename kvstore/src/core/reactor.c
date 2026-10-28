@@ -139,6 +139,7 @@ static void on_accept(conn_t *lc) {
 
         c->fd = cfd;
         c->repl_transport_kind = KVS_REPL_TRANSPORT_TCP;
+        c->repl_slot = -1;   /* 多副本 proxy slot：注册前无效 */
         (void)kvs_socket_cookie(cfd, &c->repl_socket_cookie);
         kvs_conn_register(c);
         if (repl_commit_active_mode()) repl_commit_baseline(c);

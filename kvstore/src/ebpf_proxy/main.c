@@ -21,7 +21,6 @@ enum bpf_link_type;
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 
-#include "proxy_cache.h"
 #include "proxy_slave.h"
 #include "proxy_commit.h"
 #include "kvstore/replication/client_ctl.h"
@@ -29,31 +28,44 @@ enum bpf_link_type;
 /* Commit Gate 捕获记录头：cookie(8) + recv_seq(8) + payload_len(4) + flags(4) */
 #define CAPTURE_RECORD_HDR_SZ 24
 
-/* ---- 状态 ---- */
-typedef enum {
-    STATE_FORWARDING = 0,
-    STATE_BUFFERING  = 1,
-} proxy_state_t;
+/* ---- 多副本 fan-out ----
+ * Master 只产生一份有序已提交流（Commit Gate），proxy 为每个 Slave 维护：
+ *   - 独立数据连接（proxy → slave 的 master_port+1）
+ *   - 独立发送 FIFO 与发送线程
+ *   - 独立 phase（LIVE / RECOVERY）与 barrier 应答
+ * 一个副本慢/断/全量重同步不会阻塞其他副本；恢复缓冲由 Commit Gate 按副本
+ * 分开管理（proxy_commit_set_buffering），发送 FIFO 只承载 LIVE 数据。
+ * 设计依据：docs/multi-slave-design.md。 */
+#define PROXY_MAX_REPLICAS        KVS_MAX_REPLICA_SLOTS
+/* 单副本 LIVE FIFO 内存上限：超过即隔离该副本（写 slot FAULT），由 Master
+ * 只拒绝它并重新同步；全局其他副本继续。 */
+#define PROXY_REPL_QUEUE_MAX      (128u * 1024 * 1024)
+#define PROXY_REPL_BATCH_MAX      256
+#define PROXY_REPL_BATCH_BYTES_MAX (512u * 1024)
+#define PROXY_REPL_LINGER_US      200
+/* 所有副本积压合计的高/低水位：只对整体内存压力做上游背压，
+ * 不让单个慢副本永久背压所有客户端（per-replica 有独立 hard limit）。 */
+#define PROXY_TOTAL_HIGH_BYTES    (192u * 1024 * 1024)
+#define PROXY_TOTAL_LOW_BYTES     (128u * 1024 * 1024)
+/* 全局转发积压背压：阈值要比旧版单队列 4MB 高——per-replica FIFO 由各自线程
+ * 消费，单个慢副本在 128MB hard limit 前不应长期拖慢其他副本；64MB 只用于
+ * 全局限速（proxy 主线程/内存整体跟不上），慢副本仍由 per-replica 上限隔离。 */
+#define PROXY_FWDQ_BP_HIGH        (64u * 1024 * 1024)
+#define PROXY_FWDQ_BP_LOW         (16u * 1024 * 1024)
+/* barrier 处理等待在途 writev 的封顶时间。超过说明该副本数据通道已经卡死：
+ * 隔离该副本（写入 slot FAULT），避免拖住 Master 的屏障握手。等待发生在共享
+ * 主线程上，因此设得较短（健康副本 512KB 批次远小于此值）。 */
+#define PROXY_BARRIER_QUIESCE_MS  1000
 
-static volatile int g_shutdown = 0;
-static proxy_state_t g_state = STATE_FORWARDING;
-static proxy_slave_ctx_t g_slave;
-static cache_ctx_t g_cache;
-
-/* ---- replication session 身份（§7/§8/§9 ----
+/* ---- replication session 身份 ----
  * 全由 master 通过 pinned client_ctl map 下发：
  *   client_ctl[8]  SESSION_VALID  当前 session 是否有效
- *   client_ctl[9]  SESSION_ID     当前 session 身份（cache node 据此打标）
- *   client_ctl[10] CACHE_INVALID  本 session 的 cache 已作废，禁止 flush
- * 只有 SESSION_VALID=1 且 cache 未被作废时才允许把 cache 刷给 Slave。控制连接
- * 断开（master 置 SESSION_VALID=0）后旧 cache 一律丢弃，绝不能跨 session 重放。 */
+ *   client_ctl[9]  SESSION_ID     当前 session 身份
+ */
 static uint64_t g_session_id = 0;
 static int g_session_valid = 0;
-static int g_cache_invalid_remote = 0;   /* client_ctl[10] 的本地影子 */
-/* 上一次处理过的 client_ctl[3] 值：屏障按边沿应答，避免重复清 cache / 漏应答 */
-static __u64 g_fs_req_seen = 0;
 
-/* ---- Commit Gate ---- */
+/* ---- Commit Gate / capture gate ---- */
 #define CLIENT_CTL_KEY_CAPTURE_ENABLE  KVS_CTL_CAPTURE_ENABLE
 #define CLIENT_CTL_KEY_CAPTURE_FAULT   KVS_CTL_CAPTURE_FAULT
 #define CLIENT_CTL_KEY_COMMIT_FAULT    KVS_CTL_COMMIT_FAULT
@@ -82,512 +94,91 @@ static __u64 g_fs_req_seen = 0;
 #define PST_OLDEST_PENDING   20
 #define PST_MEM_HARD_HIT     21
 
-/* capture gate：drop=1 时丢弃所有 ringbuf/队列/缓存中的增量数据，
- * 等 Master 完成 REPLSYNC 后重新打开，避免残缺命令进入 slave。 */
-static volatile int g_capture_drop = 0;
-static unsigned long long g_dropped_bytes = 0;
-static unsigned long long g_slave_reconnects = 0;
-static volatile int g_commit_fault_code = 0;
-static int g_commit_fault_handled = 0;
-
-static void proxy_stats_update(void);
-static void commit_fault_cb(int reason);
-
-/* ---- 跨线程安全 ----
- * g_state 用 g_state_lock 保护（主线程 set_state 写、转发线程 proxy_fwd_send_one
- * 持锁校验 FORWARDING 并 writev，原子于 BUFFERING flip）。
- * g_cache 用 g_cache_lock 保护。slave 连接状态 fd 由 proxy_slave.c 内部锁
- * （g_slave_lock）成对保护：主线程 connect/disconnect 写、转发线程经
- * proxy_slave_writev 读取并 writev，故无未同步的跨线程 fd 读写。 */
-static pthread_mutex_t g_state_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t g_cache_lock = PTHREAD_MUTEX_INITIALIZER;
-
-/* 主线程发布路由状态（写 g_state 必须在锁内） */
-static void set_state(proxy_state_t s) {
-    pthread_mutex_lock(&g_state_lock);
-    g_state = s;
-    pthread_mutex_unlock(&g_state_lock);
-}
-
-/* 加锁的缓存入队/刷出。入队统一打上当前 session 身份，跨 session 的节点刷不出去。 */
-static int cache_enq_wrap(const void *data, size_t len) {
-    pthread_mutex_lock(&g_cache_lock);
-    int rc = cache_append(&g_cache, (const unsigned char *)data, len, g_session_id);
-    pthread_mutex_unlock(&g_cache_lock);
-    return rc;
-}
-static int cache_flush_wrap(int fd) {
-    pthread_mutex_lock(&g_cache_lock);
-    int rc = cache_flush(&g_cache, fd, g_session_id);
-    pthread_mutex_unlock(&g_cache_lock);
-    return rc;
-}
-static void cache_clear_wrap(void) {
-    pthread_mutex_lock(&g_cache_lock);
-    cache_clear(&g_cache);
-    pthread_mutex_unlock(&g_cache_lock);
-}
-/* 新 session 建立：清数据并且解除 invalid（否则一次溢出后终身不可用） */
-static void cache_reset_for_new_session_wrap(void) {
-    pthread_mutex_lock(&g_cache_lock);
-    cache_reset_for_new_session(&g_cache);
-    pthread_mutex_unlock(&g_cache_lock);
-}
-/* 是否允许把 cache 刷给 Slave（§9）：控制面确认仍是同一个有效 session，
- * 且本 session 的 cache 未被作废（未触发硬上限、master 未置 CACHE_INVALID）。 */
-static int cache_flush_allowed(void) {
-    int allowed;
-    pthread_mutex_lock(&g_cache_lock);
-    allowed = g_session_valid && !g_cache.invalid;
-    pthread_mutex_unlock(&g_cache_lock);
-    return allowed;
-}
-
-/* ---- 转发队列 + 独立转发线程 ----
- * 主线程读 ringbuf → proxy_fwd_enqueue 入队；
- * 转发线程出队 → writev 到 slave（阻塞 OK，慢 slave 只挡转发线程）。
- * 按字节限长 64MB，满时主线程在 enqueue 处等待（背压）。 */
-typedef struct proxy_fwd_node_s {
-    unsigned char *buf; size_t len;
-    struct proxy_fwd_node_s *next;
-} proxy_fwd_node_t;
-
-static pthread_mutex_t g_pfwd_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  g_pfwd_cond = PTHREAD_COND_INITIALIZER;
-static proxy_fwd_node_t *g_pfwd_head = NULL, *g_pfwd_tail = NULL;
-static size_t g_pfwd_bytes = 0;
-static int g_pfwd_stop = 0;
-/* cache flush 请求：主线程置位唤醒 fwd 线程刷 cache。fwd 线程是 slave fd 的唯一 writer，
- * 主线程不再直接写 slave fd（消除了 fwd writev 与主线程 cache_flush 的并发写竞态）。 */
-static int g_cache_flush_pending = 0;
-static pthread_t g_pfwd_thread = 0;
-#define MAX_PFWD_QUEUE_BYTES (64 * 1024 * 1024)
-/* 超大 payload 阈值：等价替换原 BATCH_BUF_SZ 限制，> 此值直接进 cache */
-/* 单 recv 条目超此阈值走 heap cache 慢路径。原 8200 按 P=1 单命令（~124B）设计；
- * 高 P 下一条 recv 是批量（P=160 时 ~20KB）>8200 全被误判走慢 cache，转发跟不上。
- * 提到 32768 覆盖 capture 最大条目（CLIENT_ENTRY_MAX_LEN=32764+4），让高 P 走快队列。 */
-#define PFWD_LARGE_SZ 32768
-#define PFWD_BATCH_MAX 256        /* 转发线程每次 writev 最多节点数 */
-#define PFWD_BATCH_BYTES_MAX (512u * 1024)   /* 单批最多 512KB（≤ slave 1MB 发送缓冲，防 EAGAIN） */
-#define PFWD_LINGER_US 200        /* 空队列等待上限（µs）：单条命令有界延迟，免每命令 futex_wake */
-
-/* ---- 双信号背压 ----
- * client_ctl[4] = ringbuf 背压：BPF 生产端高水位置位，proxy 消费端（ringbuf 排空后）清除。
- * client_ctl[6] = 转发队列背压：proxy 入队端高水位置位，出队端低水位清除。
- * 拆成两个 key 避免 BPF/入队/出队三方写同一值互相覆盖（ringbuf 恢复但队列仍高时
- * 不能清除，反之亦然）。master 侧读两者取或。 */
-#define CLIENT_CTL_KEY_BACKPRESSURE      KVS_CTL_RINGBUF_BACKPRESSURE
-#define CLIENT_CTL_KEY_FWDQ_BACKPRESSURE KVS_CTL_FWDQ_BACKPRESSURE
-#define CLIENT_CTL_KEY_HEARTBEAT         KVS_CTL_PROXY_HEARTBEAT
-#define CLIENT_CTL_KEY_CACHE_BACKPRESSURE KVS_CTL_CACHE_BACKPRESSURE
-#define CLIENT_CTL_KEY_PROXY_STATE       KVS_CTL_PROXY_STATE
-/* 转发队列高水位 4MB：master 生产远超跨机转发，队列快速填满会阻塞 proxy 主线程、
- * ringbuf 停止排空而溢出。低水位提前触发背压、留足余量（4MB→64MB 有 60MB 余量）。 */
-#define PFWD_BACKPRESSURE_HIGH      (4u * 1024 * 1024)
-#define PFWD_BACKPRESSURE_LOW       (1u * 1024 * 1024)
-static __u64 g_fwdq_bp_state = 0;   /* 最近写入 client_ctl[6] 的值 */
-static int write_client_ctl_u64(__u32 key, __u64 val);   /* 定义在本文件后部 */
-static int g_client_stats_fd;        /* 定义在本文件后部（publish_cache_stats 用） */
-static __u64 g_cache_bp_state = 0;   /* 最近写入 client_ctl[11] 的值 */
-/* ringbuf 占用（m[513] = consumer_pos，用于 proxy 消费端清除 client_ctl[4]） */
-static void *g_rb_meta = MAP_FAILED;
-#define RB_BACKPRESSURE_LOW  (8u * 1024 * 1024)   /* ringbuf 排空到 8MB 以下即清背压 */
-/* 诊断计数（原子累加，由诊断线程每秒打印，不进热路径 stderr） */
-static unsigned long long g_enq_bytes = 0;
-static unsigned long long g_sent_bytes = 0;
-static unsigned long long g_fwdq_bp_count = 0;
-static unsigned long long g_rb_bp_count = 0;
-static unsigned long long g_inflight_bytes = 0;   /* 已出队未发完的字节（原子，诊断/背压用） */
-static unsigned long long g_writev_calls = 0;     /* writev 成功调用次数 */
-static unsigned long long g_eagain_count = 0;     /* EAGAIN 次数 */
-static unsigned long long g_poll_count = 0;       /* poll 调用次数 */
-static unsigned long long g_poll_timeout = 0;     /* poll 超时次数 */
-static unsigned long long g_poll_out = 0;         /* poll 返回 POLLOUT 次数 */
-static unsigned long long g_poll_err = 0;         /* poll 返回 POLLERR/POLLHUP/POLLNVAL */
-static unsigned long long g_partial_write = 0;    /* 部分写（0<n<请求）次数 */
-/* mmap ringbuf 头页（2 页）。必须用 BPF 对象内 fd（BPF 实际写入的实例），且在
- * ring_buffer__new 之前调用（fd 被其消费后 mmap 可能失败）。 */
-static void rb_meta_init(int rb_fd) {
-    long page = sysconf(_SC_PAGESIZE);
-    g_rb_meta = mmap(NULL, (size_t)page * 2, PROT_READ, MAP_SHARED, rb_fd, 0);
-    if (g_rb_meta == MAP_FAILED) {
-        fprintf(stderr, "ebpf-proxy: mmap ringbuf meta failed: %s\n", strerror(errno));
-        g_rb_meta = NULL;
-    }
-}
-
-/* ringbuf 当前占用（producer_pos - consumer_pos）。consumer_pos 在页1偏移8（m[513]）：
- * 实测（kernel 6.1）页0/页1 都有 producer_pos@0，consumer_pos 只在页1@8（libbpf 推进）。 */
-static size_t ringbuf_occupancy(void) {
-    if (!g_rb_meta || g_rb_meta == MAP_FAILED) return 0;
-    const __u64 *m = (const __u64 *)g_rb_meta;
-    __u64 prod = m[0];
-    __u64 cons = m[513];
-    return prod > cons ? (size_t)(prod - cons) : 0;
-}
-
-/* 压力指标 = 队列字节 + 在途字节（已出队未发完）。仅看 g_pfwd_bytes 会在批次出队时过早
- * 判定"已排空"而清背压，但数据仍在 writev 发送中——导致 P=160 反复"过早恢复生产→再填满"。
- * 须持 g_pfwd_lock（g_pfwd_bytes 由持锁者维护）；g_inflight_bytes 原子读。 */
-static unsigned long long fwdq_pending(void) {
-    return g_pfwd_bytes + __atomic_load_n(&g_inflight_bytes, __ATOMIC_RELAXED);
-}
-/* 转发队列背压：入队后超高水位置 client_ctl[6]（须持 g_pfwd_lock，状态变化才写 map）。
- * 必须在入队后立即置位，不能等 ring_buffer__consume 整轮返回——一次 consume 可让队列
- * 从 0 涨到几十 MB，若等 consume 完才置位，队列先到 64MB、enqueue 阻塞在回调内、
- * consume 不返回、背压永不置位 → ringbuf 溢出。 */
-static void fwdq_set_backpressure_locked(void) {
-    if (g_fwdq_bp_state == 0 && fwdq_pending() > PFWD_BACKPRESSURE_HIGH) {
-        g_fwdq_bp_state = 1;
-        g_fwdq_bp_count++;
-        write_client_ctl_u64(CLIENT_CTL_KEY_FWDQ_BACKPRESSURE, 1);
-    }
-}
-/* 转发队列背压：pending 低于低水位才清 client_ctl[6]（须持 g_pfwd_lock） */
-static void fwdq_clear_backpressure_locked(void) {
-    if (g_fwdq_bp_state == 1 && fwdq_pending() < PFWD_BACKPRESSURE_LOW) {
-        g_fwdq_bp_state = 0;
-        write_client_ctl_u64(CLIENT_CTL_KEY_FWDQ_BACKPRESSURE, 0);
-    }
-}
-
-/* 发布 proxy_cache 的占用/丢弃统计到 client_stats map，供 master 的 INFO 读取。
- * 键位与 BPF 的 client_stats 分开（BPF 只用到 0~8，这里用 16 起的私有区间）。 */
+/* client_stats 私有区间（与 BPF 的 0~15 分开）：聚合所有副本的恢复/FIFO 统计 */
 #define CSTAT_CACHE_BYTES      16
 #define CSTAT_CACHE_NODES      17
 #define CSTAT_CACHE_DROPPED    18
 #define CSTAT_CACHE_DROP_BYTES 19
 #define CSTAT_CACHE_MAX_BYTES  20
 #define CSTAT_CACHE_INVALID    21
-static void publish_cache_stats(void) {
-    if (g_client_stats_fd < 0) return;
-    pthread_mutex_lock(&g_cache_lock);
-    __u64 vals[6];
-    vals[0] = (__u64)g_cache.total_bytes;
-    vals[1] = (__u64)g_cache.node_count;
-    vals[2] = g_cache.dropped;
-    vals[3] = g_cache.drop_bytes;
-    vals[4] = (__u64)g_cache.max_bytes;
-    vals[5] = (__u64)g_cache.invalid;
-    pthread_mutex_unlock(&g_cache_lock);
-    for (__u32 i = 0; i < 6; i++) {
-        __u32 key = CSTAT_CACHE_BYTES + i;
-        bpf_map_update_elem(g_client_stats_fd, &key, &vals[i], BPF_ANY);
-    }
-}
 
-/* 请求 fwd 线程刷新缓存（唤醒 + 置位）。fwd 线程是唯一 writer，主线程不直接写 slave fd。 */
-static void request_cache_flush(void) {
-    pthread_mutex_lock(&g_pfwd_lock);
-    g_cache_flush_pending = 1;
-    pthread_cond_broadcast(&g_pfwd_cond);
-    pthread_mutex_unlock(&g_pfwd_lock);
-}
+/* capture gate：drop=1 时丢弃所有 ringbuf/队列/缓存中的增量数据，
+ * 等 Master 完成 REPLSYNC 后重新打开，避免残缺命令进入 slave。 */
+static volatile int g_shutdown = 0;
+static volatile int g_capture_drop = 0;
+static unsigned long long g_dropped_bytes = 0;
+static unsigned long long g_commit_fault_code = 0;
+static int g_commit_fault_handled = 0;
 
-/* 拷贝 payload 入队（payload 指针只在 ringbuf 回调期间有效）。
- * 返回 0 成功；-1 表示已停止或内存不足，调用方必须按 fail-closed 处理。 */
-static int proxy_fwd_enqueue(const unsigned char *buf, size_t len) {
-    pthread_mutex_lock(&g_pfwd_lock);
-    while (g_pfwd_bytes + len > MAX_PFWD_QUEUE_BYTES && !g_pfwd_stop)
-        pthread_cond_wait(&g_pfwd_cond, &g_pfwd_lock);
-    if (g_pfwd_stop) { pthread_mutex_unlock(&g_pfwd_lock); return -1; }
-    proxy_fwd_node_t *n = (proxy_fwd_node_t *)malloc(sizeof(*n) + len);
-    if (!n) { pthread_mutex_unlock(&g_pfwd_lock); return -1; }
-    n->buf = (unsigned char *)(n + 1); n->len = len;
-    memcpy(n->buf, buf, len); n->next = NULL;
-    if (g_pfwd_tail) g_pfwd_tail->next = n; else g_pfwd_head = n;
-    g_pfwd_tail = n; g_pfwd_bytes += len;
-    __atomic_fetch_add(&g_enq_bytes, len, __ATOMIC_RELAXED);
-    fwdq_set_backpressure_locked();   /* 入队后立即按队列长度置位 */
-    /* 无 cond_signal：转发线程靠 PFWD_LINGER_US timed-wait 自醒（免每命令 futex_wake，
-     * 单条命令有界延迟 ≤PFWD_LINGER_US）。 */
-    pthread_mutex_unlock(&g_pfwd_lock);
-    return 0;
-}
+static void commit_fault_cb(int reason);
+static void commit_replica_fault_cb(uint64_t replica_id, int reason);
 
-/* 转发线程处理一批节点：持 g_state_lock 校验 FORWARDING 后批量 writev（原子于 BUFFERING flip）。
- * 批内节点要么整体在 FORWARDING 下送、要么整体进 cache，不穿插全量流。
- * 注意：writev 部分写（w>=0 且 <total）按既有语义视为已送（slave 健康+SO_SNDTIMEO 下全写），
- * 与原逐节点版本一致。 */
-static void proxy_fwd_send_batch(proxy_fwd_node_t **batch, int nbatch) {
-    struct iovec iov[PFWD_BATCH_MAX];
-    size_t total = 0;
-    for (int i = 0; i < nbatch; i++) {
-        iov[i].iov_base = batch[i]->buf;
-        iov[i].iov_len = batch[i]->len;
-        total += batch[i]->len;
-    }
-    pthread_mutex_lock(&g_state_lock);
-    if (g_state == STATE_FORWARDING) {
-        __atomic_fetch_add(&g_inflight_bytes, total, __ATOMIC_RELAXED);
-        /* 循环 writev 处理部分写：单批最多 ~5MB（P=160 时 256 条 × 20KB），阻塞 socket
-         * 的一次 writev 很可能 0<w<total（既有代码把部分写当成功、直接 free 节点，未发送
-         * 尾部永久丢失——P=160 稳定丢 ~30% 的主因）。循环重发直到全部发送或出错。
-         * 逐次 writev(n>0) 立即累计 sent 字节（非整批后），并扣减 in_flight。 */
-        int idx = 0;
-        size_t sent = 0;
-        int gave_up = 0;
-        while (idx < nbatch && sent < total) {
-            ssize_t w = proxy_slave_writev(&g_slave, &iov[idx], nbatch - idx);
-            if (w < 0) {
-                if (errno == EINTR) continue;
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    g_eagain_count++;
-                    /* 发送缓冲满（slave 暂缓）：等 socket 可写再重试，保持流顺序。
-                     * 区分 POLLOUT 与 POLLERR/POLLHUP/POLLNVAL——后者是 fd 异常，必须放弃
-                     * 回退 cache，不能继续无意义重试。 */
-                    for (;;) {
-                        int sfd = proxy_slave_fd(&g_slave);
-                        if (sfd < 0) { gave_up = 1; break; }
-                        struct pollfd pfd = {.fd = sfd, .events = POLLOUT};
-                        g_poll_count++;
-                        int pr = poll(&pfd, 1, 1000);
-                        if (pr < 0) {
-                            if (errno == EINTR) continue;
-                            gave_up = 1; break;
-                        }
-                        if (pr == 0) { g_poll_timeout++; continue; }
-                        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
-                            g_poll_err++; gave_up = 1; break;
-                        }
-                        g_poll_out++;
-                        break;   /* 可写，重试 writev */
-                    }
-                    if (!gave_up) continue;
-                    break;
-                }
-                gave_up = 1;
-                break;   /* 真错误：未发送部分回退 cache */
-            }
-            if (w == 0) {
-                /* 理论不应发生（阻塞 socket 写 0 字节视为对端关闭），按错误处理 */
-                gave_up = 1;
-                break;
-            }
-            g_writev_calls++;
-            sent += (size_t)w;
-            __atomic_fetch_add(&g_sent_bytes, (unsigned long long)w, __ATOMIC_RELAXED);
-            __atomic_fetch_sub(&g_inflight_bytes, (unsigned long long)w, __ATOMIC_RELAXED);
-            ssize_t left = w;
-            while (idx < nbatch && left >= (ssize_t)iov[idx].iov_len) {
-                left -= iov[idx].iov_len;
-                idx++;
-            }
-            if (idx < nbatch && left > 0) {
-                iov[idx].iov_base = (char *)iov[idx].iov_base + left;
-                iov[idx].iov_len -= (size_t)left;
-                g_partial_write++;
-            }
-        }
-        pthread_mutex_unlock(&g_state_lock);
-        __atomic_fetch_sub(&g_inflight_bytes, (unsigned long long)(total - sent), __ATOMIC_RELAXED);
-        if (sent < total && gave_up) {
-            /* 真失败（非瞬态 EAGAIN）才回退 cache：当前节点从未发送起点起，后续整块 */
-            fprintf(stderr, "ebpf-proxy: writev fail sent=%zu total=%zu errno=%d, "
-                    "requeue %d nodes to cache\n",
-                    sent, total, errno, nbatch - idx);
-            if (idx < nbatch)
-                cache_enq_wrap(iov[idx].iov_base, iov[idx].iov_len);
-            for (int i = idx + 1; i < nbatch; i++)
-                cache_enq_wrap(batch[i]->buf, batch[i]->len);
-            /* 链接已真失败：摘掉 fd，主循环会重连（§8.1）。数据已回退到 cache，
-             * 重连成功后（同 session）flush 出去，不丢也不重放。 */
-            proxy_slave_mark_down(&g_slave, "writev failed");
-            /* 回退的数据必须在下一次发队列新数据前刷出（保持顺序），请求 flush */
-            request_cache_flush();
-        }
-    } else {
-        pthread_mutex_unlock(&g_state_lock);
-        for (int i = 0; i < nbatch; i++) cache_enq_wrap(batch[i]->buf, batch[i]->len);
-    }
-}
+/* ---- 跨线程计数（原子） ---- */
+static unsigned long long g_enq_bytes = 0;
+static unsigned long long g_sent_bytes = 0;
+static unsigned long long g_slave_reconnects = 0;
+static unsigned long long g_fwdq_bp_count = 0;
+static unsigned long long g_rb_bp_count = 0;
+static unsigned long long g_writev_calls = 0;
+static unsigned long long g_eagain_count = 0;
+static unsigned long long g_poll_count = 0;
+static unsigned long long g_poll_timeout = 0;
+static unsigned long long g_poll_out = 0;
+static unsigned long long g_poll_err = 0;
+static unsigned long long g_partial_write = 0;
+static __u64 g_fwdq_bp_state = 0;
+static __u64 g_cache_bp_state = 0;
 
-static void *proxy_fwd_thread_main(void *arg) {
-    (void)arg;
-    proxy_fwd_node_t *batch[PFWD_BATCH_MAX];
-    for (;;) {   /* stop 后仍继续，直到队列排空 + cache 刷完才退出（防关闭丢数据） */
-        int nbatch = 0;
-        int flush_pending = 0;
-        pthread_mutex_lock(&g_pfwd_lock);
-        while (!g_pfwd_head && !g_cache_flush_pending && !g_pfwd_stop) {
-            /* 有界等待：空队列时短暂休眠让 ringbuf 回调攒批（linger），
-             * 免每命令 futex_wake；单条命令最多等 PFWD_LINGER_US 即下送。 */
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_nsec += (long)PFWD_LINGER_US * 1000L;
-            if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
-            pthread_cond_timedwait(&g_pfwd_cond, &g_pfwd_lock, &ts);
-        }
-        flush_pending = g_cache_flush_pending;
-        g_cache_flush_pending = 0;
-        /* 攒批：同时按节点数(PFWD_BATCH_MAX)与字节数(PFWD_BATCH_BYTES_MAX)上限。
-         * 单批不能超过 slave 发送缓冲（1MB）——P=160 时 256×20KB=5MB 的批次会把
-         * 1MB 缓冲瞬间撑满触发 EAGAIN，转发线程 poll 等 2s 后回退 cache，吞吐被卡死。 */
-        size_t batch_bytes = 0;
-        while (nbatch < PFWD_BATCH_MAX && g_pfwd_head &&
-               batch_bytes + g_pfwd_head->len <= PFWD_BATCH_BYTES_MAX) {
-            proxy_fwd_node_t *n = g_pfwd_head;
-            g_pfwd_head = n->next;
-            if (!g_pfwd_head) g_pfwd_tail = NULL;
-            g_pfwd_bytes -= n->len;
-            batch_bytes += n->len;
-            batch[nbatch++] = n;
-        }
-        /* 出队后唤醒被 64MB 满队列背压阻塞的入队者（原代码缺此唤醒，属修复） */
-        if (nbatch > 0) {
-            fwdq_clear_backpressure_locked();   /* 出队后按队列长度清背压 */
-            pthread_cond_broadcast(&g_pfwd_cond);
-        }
-        pthread_mutex_unlock(&g_pfwd_lock);
+/* ---- 每个副本的发送 FIFO ---- */
+typedef struct proxy_repl_node_s {
+    struct proxy_repl_node_s *next;
+    size_t off;          /* 已部分写出的偏移（writev 失败回退时保留） */
+    size_t len;
+    unsigned char data[];
+} proxy_repl_node_t;
 
-        /* fwd 线程是 slave fd 的唯一 writer：有 cache 待刷（REPLDONE/全量结束/回退/重连）
-         * 时先刷 cache 再发队列，保证 pre/回退数据先于队列 post。主线程不再直接写 slave fd，
-         * 消除并发写竞态（原 cache_flush_wrap 在主线程 send_full，与 fwd writev 抢同一 socket）。 */
-        if (flush_pending) {
-            int forwarding = 0;
-            pthread_mutex_lock(&g_state_lock);
-            forwarding = (g_state == STATE_FORWARDING);
-            pthread_mutex_unlock(&g_state_lock);
-            /* session 失效（控制连接断开 / cache 被作废）时禁止 flush：缓存的数据
-             * 属于已作废的 session，刷出去会与 backlog 回放叠加造成重复应用（§8.2/§9）。 */
-            if (!cache_flush_allowed()) {
-                cache_clear_wrap();
-            } else if (forwarding && proxy_slave_is_connected(&g_slave)) {
-                int fd = proxy_slave_fd(&g_slave);
-                int sent = cache_flush_wrap(fd);
-                if (sent > 0)
-                    fprintf(stderr, "ebpf-proxy: cache flushed (%d items) [fwd]\n", sent);
-                /* 刷不完（send_full 只在非 EAGAIN 的真错误上失败）：链路已死，
-                 * 摘掉 fd 让主循环重连，剩余 cache 留给重连后的那次 flush。
-                 * 不能在这里直接 request_cache_flush 重试——fd 未变时必然再次失败，
-                 * 形成每秒数百万次的 EPIPE 空转（实测 Slave 重启后 6.8M 次）且永不重连。
-                 * 停止态下不再重试，剩余 cache 由 cleanup 的 cache_destroy 释放。 */
-                pthread_mutex_lock(&g_cache_lock);
-                int leftover = (g_cache.head != NULL);
-                pthread_mutex_unlock(&g_cache_lock);
-                if (leftover)
-                    proxy_slave_mark_down(&g_slave, "cache flush failed");
-            }
-        }
+enum { REPL_PHASE_LIVE = 0, REPL_PHASE_RECOVERY = 1 };
 
-        if (nbatch == 0 && !flush_pending && g_pfwd_stop) break;   /* stop 且无工作 */
-        if (nbatch > 0) {
-            proxy_fwd_send_batch(batch, nbatch);
-            for (int i = 0; i < nbatch; i++) free(batch[i]);
-        }
-    }
-    return NULL;
-}
+typedef struct {
+    int id;
+    int used;                        /* proxy_cfg 中 replica_gen != 0 */
+    uint32_t addr;                   /* peer.sin_addr.s_addr（网络序原始 u32） */
+    int port;
+    unsigned long long gen;          /* proxy_cfg 下发的 generation */
+    unsigned long long conn_gen;     /* 本地连接代次：地址变化/强制重连时 +1 */
 
-/* 全量同步开始（切 BUFFERING）时清空转发队列剩余节点（IMPORTANT 2）：
- * 这些是全量开始前捕获的增量，排在转发线程尚未 writev 的队列尾部；若不清理，
- * 转发线程会在 BUFFERING 期间把它们下送到 slave，穿插进全量同步流（流破坏）。
- * 全量快照已包含这些写，故直接丢弃（而非进 cache 后被全量后重复应用）。 */
-static void proxy_fwd_drain_to_cache_or_discard(void) {
-    pthread_mutex_lock(&g_pfwd_lock);
-    proxy_fwd_node_t *n = g_pfwd_head;
-    g_pfwd_head = g_pfwd_tail = NULL;
-    g_pfwd_bytes = 0;
-    /* 队列被外力清空：入队端背压必须同步解除，否则转发线程因队列已空不会再出队，
-     * 清背压无从触发，master 会永久停在 client_ctl[6]=1 上。 */
-    fwdq_clear_backpressure_locked();
-    pthread_mutex_unlock(&g_pfwd_lock);
-    while (n) {
-        proxy_fwd_node_t *nx = n->next;
-        free(n);
-        n = nx;
-    }
-}
+    int phase;                       /* LIVE / RECOVERY（barrier 期只入 commit recovery） */
+    int resumed;                     /* 收到该副本的 RESUME */
+    int failed;                      /* 已隔离，等待 Master 重同步（slot FAULT=1） */
+    unsigned long long barrier_last; /* 上次观察到的 slot BARRIER seq（0=未立） */
+    unsigned long long barrier_gen;  /* 每次 barrier up +1（在途批次据此判断是否过期） */
 
-/* 启动/停止转发线程 */
-static void proxy_fwd_start(void) {
-    g_pfwd_stop = 0;
-    g_cache_flush_pending = 0;
-    if (pthread_create(&g_pfwd_thread, NULL, proxy_fwd_thread_main, NULL) != 0)
-        fprintf(stderr, "ebpf-proxy: failed to start forwarding thread\n");
-    /* 转发线程不单独钉核：4 核 VM 上钉 CPU1 与 memtier 客户端线程争抢，转发速率波动
-     * （0.3%~89%），反而更不稳定。与 proxy 主线程共享 CPU0，靠 writev 重试 + 背压
-     * 保证无损，吞吐受限但稳定。 */
-}
-static void proxy_fwd_stop(void) {
-    pthread_mutex_lock(&g_pfwd_lock);
-    g_pfwd_stop = 1;
-    pthread_cond_broadcast(&g_pfwd_cond);
-    pthread_mutex_unlock(&g_pfwd_lock);
-    if (g_pfwd_thread)
-        pthread_join(g_pfwd_thread, NULL);
-    g_cache_flush_pending = 0;
-    /* 排空剩余节点 */
-    proxy_fwd_node_t *n = g_pfwd_head;
-    while (n) { proxy_fwd_node_t *nx = n->next; free(n); n = nx; }
-    g_pfwd_head = g_pfwd_tail = NULL;
-    g_pfwd_bytes = 0;
-}
+    proxy_slave_ctx_t slave;         /* 仅发送线程访问 */
+    int connected;                   /* 仅发送线程写，持 lock 读 */
+    int in_flight;                   /* 有 writev 批次在途（barrier 需等待静默） */
 
-/* ---- 独立心跳线程 ----
- * master 在背压标志置位时校验 client_ctl[5] 心跳新鲜度（2s 内须推进）判断 proxy 存活。
- * 原心跳在 main_loop 更新——当转发队列满（64MB）时主线程阻塞于 proxy_fwd_enqueue，
- * 心跳停止推进，master 误判 proxy 死亡而忽略背压标志、继续生产，导致 ringbuf 溢出
- * 丢数据（实测跨机 P=160 丢 64%）。独立线程保证心跳与主循环阻塞解耦。 */
-static pthread_t g_hb_thread = 0;
-static int g_client_ctl_fd = -1;   /* 定义在本文件后部（BPF map fds） */
-static void *heartbeat_thread_main(void *arg) {
-    (void)arg;
-    __u64 hb = 0;
-    while (!g_shutdown) {
-        hb++;
-        write_client_ctl_u64(CLIENT_CTL_KEY_HEARTBEAT, hb);
-        proxy_stats_update();
-        usleep(100000);   /* 100ms 一跳，远低于 master 的 2s 过期窗口 */
-    }
-    return NULL;
-}
+    proxy_repl_node_t *head, *tail;
+    size_t bytes;                    /* FIFO 中尚未发送的字节（按 off 计） */
+    unsigned long long nodes;
 
-/* 独立诊断线程：每秒打印一次累计统计（不进热路径 stderr） */
-static void *diag_thread_main(void *arg) {
-    (void)arg;
-    __u64 last_enq = 0, last_sent = 0;
-    unsigned long long last_us = 0;
-    while (!g_shutdown) {
-        usleep(1000000);
-        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-        unsigned long long now_us = (unsigned long long)ts.tv_sec * 1000000ULL
-                                    + (unsigned long long)ts.tv_nsec / 1000ULL;
-        __u64 enq = __atomic_load_n(&g_enq_bytes, __ATOMIC_RELAXED);
-        __u64 sent = __atomic_load_n(&g_sent_bytes, __ATOMIC_RELAXED);
-        double dt = last_us ? (double)(now_us - last_us) / 1e6 : 1.0;
-        pthread_mutex_lock(&g_pfwd_lock);
-        fprintf(stderr,
-                "ebpf-proxy: [diag] fwdq=%zuMB inflight=%lluMB ringbuf=%zuMB "
-                "enq=%.1fMB/s sent=%.1fMB/s bp=%llu/%llu "
-                "wv=%llu eagain=%llu poll=%llu(pout=%llu,timeout=%llu,err=%llu) partial=%llu\n",
-                g_pfwd_bytes / (1024 * 1024),
-                __atomic_load_n(&g_inflight_bytes, __ATOMIC_RELAXED) / (1024 * 1024),
-                ringbuf_occupancy() / (1024 * 1024),
-                (enq - last_enq) / dt / (1024 * 1024),
-                (sent - last_sent) / dt / (1024 * 1024),
-                g_fwdq_bp_count, g_rb_bp_count,
-                g_writev_calls, g_eagain_count,
-                g_poll_count, g_poll_out, g_poll_timeout, g_poll_err,
-                g_partial_write);
-        pthread_mutex_unlock(&g_pfwd_lock);
-        last_enq = enq; last_sent = sent; last_us = now_us;
-    }
-    return NULL;
-}
-static void diag_start(void) {
-    if (getenv("EBPF_PROXY_DIAG") == NULL) return;   /* 默认不打印：每秒刷屏干扰日志；排查时 EBPF_PROXY_DIAG=1 */
-    pthread_t t;
-    if (pthread_create(&t, NULL, diag_thread_main, NULL) != 0)
-        fprintf(stderr, "ebpf-proxy: failed to start diag thread\n");
-}
-static void heartbeat_start(void) {
-    if (pthread_create(&g_hb_thread, NULL, heartbeat_thread_main, NULL) != 0)
-        fprintf(stderr, "ebpf-proxy: failed to start heartbeat thread\n");
-}
+    unsigned int backoff_ms;
+    int stop;
+    pthread_t tid;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;             /* 数据/状态变化 */
+    pthread_cond_t idle;             /* in_flight 归零 */
+    unsigned long long reconnects;
+    unsigned long long overflow_count;
+    unsigned long long dropped_bytes;
+    unsigned long long enq_bytes;
+    unsigned long long sent_bytes;
+} proxy_replica_t;
 
+static proxy_replica_t g_reps[PROXY_MAX_REPLICAS];
+static size_t g_repl_bytes_peak = 0;
 
-/* BPF map fds（g_client_ctl_fd 前向声明在上方，供心跳线程使用） */
+/* BPF map fds */
+static int g_client_ctl_fd = -1;
 static int g_proxy_cfg_fd = -1;
 static int g_client_stats_fd = -1;
 static int g_proxy_stats_fd = -1;
@@ -595,30 +186,26 @@ static int g_proxy_stats_fd = -1;
 /* ringbuf */
 static struct bpf_object *g_bpf_obj = NULL;
 static struct ring_buffer *g_rb = NULL;
-
-/* fexit link（fexit-only） */
 static struct bpf_link *g_fexit_link = NULL;
+static void *g_rb_meta = MAP_FAILED;
+#define RB_BACKPRESSURE_LOW  (8u * 1024 * 1024)
 
 /* config */
 static char g_pin_path[256] = "/sys/fs/bpf/kvstore_repl_sockmap";
 static char g_obj_path[256] = "build/replication/bpf/repl_client_capture.bpf.o";
 static int g_master_pid = 0;
 static int g_master_port = 0;
-/* Master spawn 时通过 argv 直接传入，省去 proxy_cfg 轮询（重启后也不会读到旧 pin）。 */
 static int g_master_pid_arg = 0;
 static int g_master_port_arg = 0;
 static char g_pid_file[256] = {0};
 static char g_commit_sock_path[512] = {0};
-static unsigned int g_slave_ip = 0;
-static int g_slave_port = 0;
 
-/* ---- 信号处理 ---- */
+/* ---- 基础工具 ---- */
 static void signal_handler(int sig) {
     (void)sig;
     g_shutdown = 1;
 }
 
-/* ---- 辅助函数 ---- */
 static int open_pinned_map(const char *name, int *fd_out) {
     char path[512];
     snprintf(path, sizeof(path), "%s/%s", g_pin_path, name);
@@ -631,7 +218,11 @@ static int read_client_ctl_u64(__u32 key, __u64 *val) {
     return bpf_map_lookup_elem(g_client_ctl_fd, &key, val);
 }
 
-/* 从 proxy_cfg hash map 读 u64 值 */
+static int write_client_ctl_u64(__u32 key, __u64 val) {
+    if (g_client_ctl_fd < 0) return -1;
+    return bpf_map_update_elem(g_client_ctl_fd, &key, &val, BPF_ANY);
+}
+
 static int read_proxy_cfg_u64(const char *key_str, __u64 *val) {
     char key[32] = {0};
     if (g_proxy_cfg_fd < 0) return -1;
@@ -639,118 +230,582 @@ static int read_proxy_cfg_u64(const char *key_str, __u64 *val) {
     return bpf_map_lookup_elem(g_proxy_cfg_fd, key, val);
 }
 
-/* 写 client_ctl */
-static int write_client_ctl_u64(__u32 key, __u64 val) {
-    if (g_client_ctl_fd < 0) return -1;
-    return bpf_map_update_elem(g_client_ctl_fd, &key, &val, BPF_ANY);
-}
-
-/* ---- proxy_stats（Master INFO 读取） ---- */
 static void write_proxy_stat_u64(__u32 key, __u64 val) {
     if (g_proxy_stats_fd < 0) return;
     bpf_map_update_elem(g_proxy_stats_fd, &key, &val, BPF_ANY);
 }
 
-static void proxy_stats_update(void) {
-    if (g_proxy_stats_fd < 0) return;
-    write_proxy_stat_u64(PST_FORWARDED_BYTES,
-        __atomic_load_n(&g_sent_bytes, __ATOMIC_RELAXED));
-    write_proxy_stat_u64(PST_ENQUEUED_BYTES,
-        __atomic_load_n(&g_enq_bytes, __ATOMIC_RELAXED));
-    /* 心跳线程不能阻塞：cache_flush 在慢 slave 上会长时间持锁，
-     * trylock 失败时本次跳过，避免 master 误判 proxy 失活。 */
-    if (pthread_mutex_trylock(&g_pfwd_lock) == 0) {
-        write_proxy_stat_u64(PST_FWDQ_BYTES, (__u64)g_pfwd_bytes);
-        pthread_mutex_unlock(&g_pfwd_lock);
+static void rb_meta_init(int rb_fd) {
+    long page = sysconf(_SC_PAGESIZE);
+    g_rb_meta = mmap(NULL, (size_t)page * 2, PROT_READ, MAP_SHARED, rb_fd, 0);
+    if (g_rb_meta == MAP_FAILED) {
+        fprintf(stderr, "ebpf-proxy: mmap ringbuf meta failed: %s\n", strerror(errno));
+        g_rb_meta = NULL;
     }
-    if (pthread_mutex_trylock(&g_cache_lock) == 0) {
-        write_proxy_stat_u64(PST_CACHE_BYTES, (__u64)g_cache.total_bytes);
-        write_proxy_stat_u64(PST_CACHE_OVER_HIGH, (__u64)(g_cache.over_high ? 1 : 0));
-        write_proxy_stat_u64(PST_CACHE_HARD_HIT, g_cache.hard_hit);
-        pthread_mutex_unlock(&g_cache_lock);
-    }
-    write_proxy_stat_u64(PST_DROPPED_BYTES, (__u64)g_dropped_bytes);
-    write_proxy_stat_u64(PST_RECONNECTS, (__u64)g_slave_reconnects);
-    write_proxy_stat_u64(PST_CAPTURE_DROP, (__u64)(g_capture_drop ? 1 : 0));
-
-    proxy_commit_stats_t cs;
-    proxy_commit_get_stats(&cs);
-    write_proxy_stat_u64(PST_COMMIT_DESC, (__u64)cs.descriptors);
-    write_proxy_stat_u64(PST_COMMIT_WRITES, (__u64)cs.writes);
-    write_proxy_stat_u64(PST_COMMIT_PENDING, (__u64)cs.pending);
-    write_proxy_stat_u64(PST_COMMIT_TIMEOUT, (__u64)cs.timeout);
-    write_proxy_stat_u64(PST_COMMIT_DESYNC, (__u64)cs.desync);
-    write_proxy_stat_u64(PST_COMMIT_GAP, (__u64)cs.gap);
-    write_proxy_stat_u64(PST_COMMIT_RECOVERY, (__u64)cs.recovery_bytes);
-    write_proxy_stat_u64(PST_COMMIT_NEXT_G, cs.next_global_seq);
-    write_proxy_stat_u64(PST_COMMIT_CHANNEL, (__u64)(cs.channel_connected ? 1 : 0));
-    write_proxy_stat_u64(PST_CONN_CTX, (__u64)cs.conn_ctx_count);
-    write_proxy_stat_u64(PST_PENDING_CMD, (__u64)cs.pending_cmd_count);
-    write_proxy_stat_u64(PST_OLDEST_PENDING, (__u64)cs.oldest_pending_ms);
-    write_proxy_stat_u64(PST_MEM_HARD_HIT, (__u64)cs.memory_hard_limit_count);
 }
 
-/* ---- Commit Gate：已提交命令的落地 + 故障回调 ----
- * 返回 0 表示已交付（入队/cache）；-1 表示未能交付，proxy_commit 必须 fail-closed，
- * 绝不能把未交付的数据当作成功转发。 */
-static int commit_emit(const unsigned char *buf, size_t len) {
+static size_t ringbuf_occupancy(void) {
+    if (!g_rb_meta || g_rb_meta == MAP_FAILED) return 0;
+    const __u64 *m = (const __u64 *)g_rb_meta;
+    __u64 prod = m[0];
+    __u64 cons = m[513];
+    return prod > cons ? (size_t)(prod - cons) : 0;
+}
+
+/* ---- FIFO ---- */
+static void replica_drop_fifo_locked(proxy_replica_t *r) {
+    proxy_repl_node_t *n = r->head;
+    r->head = r->tail = NULL;
+    r->bytes = 0;
+    r->nodes = 0;
+    while (n) {
+        proxy_repl_node_t *nx = n->next;
+        free(n);
+        n = nx;
+    }
+}
+
+static size_t replica_remaining(const proxy_repl_node_t *n) {
+    return n->len - n->off;
+}
+
+/* 需要持 lock。返回 0 成功；-1 超限/OOM（调用方隔离该副本）。 */
+static int replica_enqueue_locked(proxy_replica_t *r, const unsigned char *buf, size_t len) {
+    if (r->bytes + len > PROXY_REPL_QUEUE_MAX) return -1;
+    proxy_repl_node_t *n = (proxy_repl_node_t *)malloc(sizeof(*n) + len);
+    if (!n) return -1;
+    n->next = NULL;
+    n->off = 0;
+    n->len = len;
+    memcpy(n->data, buf, len);
+    if (r->tail) r->tail->next = n; else r->head = n;
+    r->tail = n;
+    r->bytes += len;
+    r->nodes++;
+    return 0;
+}
+
+/* 需要持 lock：隔离该副本，只影响该 slot。设备侧故障通知 Master（slot FAULT），
+ * Master 的 REPLACK 处理会拒绝该副本；Slave 重连后 gen 变化会重置本上下文。 */
+static void replica_isolate_locked(proxy_replica_t *r, int reason) {
+    if (r->failed) return;
+    r->failed = 1;
+    r->overflow_count++;
+    replica_drop_fifo_locked(r);
+    proxy_commit_set_replica((uint64_t)r->id, 0);
+    write_client_ctl_u64(KVS_CTL_SLOT_FAULT(r->id), 1);
+    pthread_cond_broadcast(&r->cond);
+    fprintf(stderr, "ebpf-proxy: replica slot %d isolated reason=%d "
+                    "(other replicas continue)\n", r->id, reason);
+}
+
+static size_t replicas_total_bytes(void) {
+    size_t total = 0;
+    for (int i = 0; i < PROXY_MAX_REPLICAS; i++) {
+        proxy_replica_t *r = &g_reps[i];
+        if (pthread_mutex_trylock(&r->lock) == 0) {
+            total += r->bytes;
+            pthread_mutex_unlock(&r->lock);
+        }
+    }
+    if (total > g_repl_bytes_peak) g_repl_bytes_peak = total;
+    return total;
+}
+
+/* ---- Commit Gate 落地：按副本 fan-out ----
+ * 返回 0 表示该副本已接收（入 LIVE FIFO 或由 Commit Gate 放入恢复缓冲）；
+ * 副本级失败（超限/OOM）就地隔离并返回 0，绝不让一个副本拖垮全局流。
+ * 只有 proxy 完全无法归属/捕获已关闭时才返回 -1（fail-closed）。 */
+static int commit_emit(uint64_t replica_id, uint64_t global_seq,
+                       const unsigned char *buf, size_t len) {
+    (void)global_seq;
+    if (replica_id >= PROXY_MAX_REPLICAS) return -1;
     if (g_capture_drop) { g_dropped_bytes += len; return -1; }
-    if (g_state == STATE_BUFFERING) {
-        int rc = cache_enq_wrap(buf, len);
-        if (rc == -2) commit_fault_cb(5);
-        return rc == 0 ? 0 : -1;
+
+    proxy_replica_t *r = &g_reps[replica_id];
+    pthread_mutex_lock(&r->lock);
+    if (!r->used) {
+        r->dropped_bytes += len;
+        pthread_mutex_unlock(&r->lock);
+        return 0;
     }
-    if (proxy_slave_is_connected(&g_slave)) {
-        return proxy_fwd_enqueue(buf, len);
+    if (r->failed) {
+        pthread_mutex_unlock(&r->lock);
+        return 0;
     }
-    /* 无 slave：这批已提交数据无法交付；返回失败让上层失效会话，
-     * 由 Slave 重连后的 backlog/快照补齐，而不是静默丢弃。 */
-    g_dropped_bytes += len;
-    return -1;
+    if (replica_enqueue_locked(r, buf, len) != 0) {
+        replica_isolate_locked(r, 1);
+        pthread_mutex_unlock(&r->lock);
+        return 0;
+    }
+    r->enq_bytes += len;
+    __atomic_fetch_add(&g_enq_bytes, len, __ATOMIC_RELAXED);
+    pthread_cond_signal(&r->cond);
+    pthread_mutex_unlock(&r->lock);
+    return 0;
+}
+
+/* Commit Gate 的 per-replica 恢复缓冲溢出：与 main FIFO 超限同样处理。 */
+static void commit_replica_fault_cb(uint64_t replica_id, int reason) {
+    (void)reason;
+    if (replica_id >= PROXY_MAX_REPLICAS) return;
+    proxy_replica_t *r = &g_reps[replica_id];
+    pthread_mutex_lock(&r->lock);
+    replica_isolate_locked(r, 5);
+    pthread_mutex_unlock(&r->lock);
 }
 
 static void commit_fault_cb(int reason) {
     if (g_shutdown) return;   /* 退出阶段通道 EOF 不算故障 */
-    g_commit_fault_code = reason;
+    g_commit_fault_code = (unsigned long long)reason;
     g_capture_drop = 1;
-    set_state(STATE_BUFFERING);
     write_client_ctl_u64(CLIENT_CTL_KEY_COMMIT_FAULT, (__u64)reason);
-    proxy_slave_disconnect(&g_slave);
     fprintf(stderr, "ebpf-proxy: commit gate fault reason=%d\n", reason);
 }
 
-/* 轮询等待 proxy_cfg["master_pid"] 非零 */
-static int wait_for_master_pid(int timeout_ms) {
-    __u64 val = 0;
-    int waited = 0;
-    while (waited < timeout_ms) {
-        if (read_proxy_cfg_u64("master_pid", &val) == 0 && val != 0) {
-            g_master_pid = (int)val;
-            return 0;
-        }
-        usleep(500000); /* 500ms */
-        waited += 500;
+/* RESUME：Commit Gate 已把该副本恢复缓冲中 <=marker 的记录丢弃，并把其余记录
+ * 经 commit_emit 放进 FIFO。在交付前把 phase 置 LIVE，保证发送线程按序送出。 */
+static void commit_resume_cb(uint64_t replica_id, uint64_t marker) {
+    if (replica_id >= PROXY_MAX_REPLICAS) return;
+    proxy_replica_t *r = &g_reps[replica_id];
+    pthread_mutex_lock(&r->lock);
+    if (r->used && !r->failed) {
+        r->phase = REPL_PHASE_LIVE;
+        r->resumed = 1;
+        pthread_cond_broadcast(&r->cond);
     }
-    return -1;
+    pthread_mutex_unlock(&r->lock);
+    fprintf(stderr, "ebpf-proxy: replica slot %llu RESUME marker=%llu -> LIVE\n",
+            (unsigned long long)replica_id, (unsigned long long)marker);
 }
 
-/* 从 proxy_cfg 读取 slave 地址 */
-static int read_slave_addr(void) {
-    __u64 addr = 0, port = 0;
-    if (read_proxy_cfg_u64("slave_addr", &addr) != 0) return -1;
-    if (read_proxy_cfg_u64("slave_port", &port) != 0) return -1;
-    g_slave_ip = (unsigned int)addr;
-    g_slave_port = (int)port;
-    return (g_slave_ip != 0 && g_slave_port > 0) ? 0 : -1;
+/* ---- 副本生命周期 ---- */
+static void replica_configure(proxy_replica_t *r, uint32_t addr, int port,
+                              unsigned long long gen) {
+    pthread_mutex_lock(&r->lock);
+    replica_drop_fifo_locked(r);
+    r->used = 1;
+    r->addr = addr;
+    r->port = port;
+    r->gen = gen;
+    r->conn_gen++;
+    r->phase = REPL_PHASE_RECOVERY;
+    r->resumed = 0;
+    r->failed = 0;
+    r->barrier_last = 0;
+    r->backoff_ms = 0;
+    proxy_commit_set_replica((uint64_t)r->id, 1);
+    proxy_commit_set_buffering((uint64_t)r->id, 1);
+    pthread_cond_broadcast(&r->cond);
+    pthread_mutex_unlock(&r->lock);
+    write_client_ctl_u64(KVS_CTL_SLOT_ACK(r->id), 0);
+    fprintf(stderr, "ebpf-proxy: replica slot %d configured %u.%u.%u.%u:%d gen=%llu\n",
+            r->id, addr & 0xFF, (addr >> 8) & 0xFF, (addr >> 16) & 0xFF,
+            (addr >> 24) & 0xFF, port, gen);
 }
 
-/* ---- capture gate ----
- * Master 在故障恢复（proxy 心跳过期 / BPF 截断 / REPLSYNC 追赶）期间关闭 capture。
- * proxy 收到后必须立刻停止把已捕获的增量送往 slave，并清空 ringbuf/转发队列/cache
- * —— 这些数据与 Master 即将通过 REPLSYNC backlog 重发的区间重叠或存在缺口，
- * 继续下送会造成重复/乱序。 */
+static void replica_deactivate(proxy_replica_t *r) {
+    pthread_mutex_lock(&r->lock);
+    replica_drop_fifo_locked(r);
+    r->used = 0;
+    r->gen = 0;
+    r->conn_gen++;
+    r->phase = REPL_PHASE_RECOVERY;
+    r->resumed = 0;
+    r->failed = 0;
+    r->barrier_last = 0;
+    pthread_cond_broadcast(&r->cond);
+    pthread_mutex_unlock(&r->lock);
+    proxy_commit_set_replica((uint64_t)r->id, 0);
+    fprintf(stderr, "ebpf-proxy: replica slot %d deactivated\n", r->id);
+}
+
+/* 扫描 proxy_cfg 的 per-slot 注册：replica_gen.<slot> 是提交点（最后写），
+ * gen=0/addr=0 表示注销。每次变化都重置该 slot 的本地状态。 */
+static void poll_replicas(void) {
+    for (int i = 0; i < PROXY_MAX_REPLICAS; i++) {
+        proxy_replica_t *r = &g_reps[i];
+        char key[32];
+        __u64 gen = 0, addr = 0, port = 0;
+
+        snprintf(key, sizeof(key), "replica_gen.%d", i);
+        if (read_proxy_cfg_u64(key, &gen) != 0) gen = 0;
+        snprintf(key, sizeof(key), "slave_addr.%d", i);
+        if (read_proxy_cfg_u64(key, &addr) != 0) addr = 0;
+        snprintf(key, sizeof(key), "slave_port.%d", i);
+        if (read_proxy_cfg_u64(key, &port) != 0) port = 0;
+
+        if (gen == 0 || addr == 0 || port == 0) {
+            /* 单副本兼容：老 Master 只写 slave_addr/slave_port。slot 0 回退读取。 */
+            if (i == 0 && gen == 0) {
+                __u64 laddr = 0, lport = 0;
+                if (read_proxy_cfg_u64("slave_addr", &laddr) == 0) addr = laddr;
+                if (read_proxy_cfg_u64("slave_port", &lport) == 0) port = lport;
+            }
+            if (addr != 0 && port != 0 && i == 0 && gen == 0) {
+                /* 兼容模式：用地址变化作为隐式 generation。 */
+                gen = ((unsigned long long)addr << 32) | (unsigned long long)port;
+            } else if (r->used) {
+                replica_deactivate(r);
+                continue;
+            } else {
+                continue;
+            }
+        }
+
+        if (r->used && r->gen == gen && r->addr == (uint32_t)addr &&
+            r->port == (int)port)
+            continue;
+        if ((uint32_t)addr == 0 || port == 0) {
+            if (r->used) replica_deactivate(r);
+            continue;
+        }
+        replica_configure(r, (uint32_t)addr, (int)port, gen);
+    }
+}
+
+/* ---- 发送线程：每副本独立连接/FIFO/退避 ---- */
+/* 发送一个批次；batch_gen 为取批次时的 barrier_gen。 */
+static void replica_send_batch(proxy_replica_t *r, proxy_repl_node_t **batch, int n,
+                               unsigned long long batch_gen) {
+    struct iovec iov[PROXY_REPL_BATCH_MAX];
+    size_t total = 0;
+    for (int i = 0; i < n; i++) {
+        iov[i].iov_base = batch[i]->data + batch[i]->off;
+        iov[i].iov_len = replica_remaining(batch[i]);
+        total += iov[i].iov_len;
+    }
+
+    size_t sent = 0;
+    int idx = 0;
+    int gave_up = 0;
+    while (idx < n && sent < total) {
+        ssize_t w = proxy_slave_writev(&r->slave, &iov[idx], n - idx);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                __atomic_fetch_add(&g_eagain_count, 1, __ATOMIC_RELAXED);
+                for (;;) {
+                    int sfd = proxy_slave_fd(&r->slave);
+                    if (sfd < 0) { gave_up = 1; break; }
+                    struct pollfd pfd = {.fd = sfd, .events = POLLOUT};
+                    __atomic_fetch_add(&g_poll_count, 1, __ATOMIC_RELAXED);
+                    int pr = poll(&pfd, 1, 200);
+                    if (pr < 0) {
+                        if (errno == EINTR) continue;
+                        gave_up = 1; break;
+                    }
+                    if (pr == 0) { __atomic_fetch_add(&g_poll_timeout, 1, __ATOMIC_RELAXED); continue; }
+                    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                        __atomic_fetch_add(&g_poll_err, 1, __ATOMIC_RELAXED);
+                        gave_up = 1; break;
+                    }
+                    __atomic_fetch_add(&g_poll_out, 1, __ATOMIC_RELAXED);
+                    break;
+                }
+                if (!gave_up) continue;
+            }
+            gave_up = 1;
+            break;
+        }
+        if (w == 0) { gave_up = 1; break; }
+        __atomic_fetch_add(&g_writev_calls, 1, __ATOMIC_RELAXED);
+        sent += (size_t)w;
+        __atomic_fetch_add(&g_sent_bytes, (unsigned long long)w, __ATOMIC_RELAXED);
+        ssize_t left = w;
+        while (idx < n && left >= (ssize_t)iov[idx].iov_len) {
+            left -= iov[idx].iov_len;
+            idx++;
+        }
+        if (idx < n && left > 0) {
+            iov[idx].iov_base = (char *)iov[idx].iov_base + left;
+            iov[idx].iov_len -= (size_t)left;
+            __atomic_fetch_add(&g_partial_write, 1, __ATOMIC_RELAXED);
+        }
+    }
+
+    /* 把 "已发送字节" 折算成节点状态：整节点释放，部分节点前移 off。 */
+    size_t consumed = sent;
+    int keep_from = n;
+    for (int i = 0; i < n; i++) {
+        size_t rem = replica_remaining(batch[i]);
+        if (consumed >= rem) {
+            consumed -= rem;
+            free(batch[i]);
+        } else {
+            batch[i]->off += consumed;
+            consumed = 0;
+            keep_from = i;
+            break;
+        }
+    }
+
+    pthread_mutex_lock(&r->lock);
+    r->in_flight = 0;
+    r->sent_bytes += sent;
+    /* 未发送部分：仅当期间没有新 barrier（数据仍属于当前 LIVE 流）时放回队首。
+     * barrier 之后到达的数据由 Commit Gate 的恢复缓冲承接，这里丢弃旧的即可。 */
+    int keep = (gave_up && keep_from < n && r->used && !r->failed &&
+                r->barrier_gen == batch_gen);
+    if (keep) {
+        proxy_repl_node_t *unsent = batch[keep_from];
+        for (int i = keep_from; i < n; i++) batch[i]->next = (i + 1 < n) ? batch[i + 1] : NULL;
+        /* 重新接到队首，保持原有顺序 */
+        if (n > keep_from) {
+            batch[n - 1]->next = r->head;
+            r->head = unsent;
+            if (!r->tail) r->tail = batch[n - 1];
+            size_t add = 0;
+            for (int i = keep_from; i < n; i++) add += replica_remaining(batch[i]);
+            r->bytes += add;
+            r->nodes += (unsigned long long)(n - keep_from);
+        }
+    } else {
+        for (int i = keep_from; i < n; i++) free(batch[i]);
+        if (gave_up) r->dropped_bytes += (unsigned long long)(total - sent);
+    }
+    pthread_cond_broadcast(&r->idle);
+    pthread_mutex_unlock(&r->lock);
+
+    if (gave_up) {
+        /* 真错误（非瞬态 EAGAIN）：摘掉 fd，主线程下一轮会重连。
+         * 数据已回退 FIFO（或 barrier 后丢弃），重连后按序继续。 */
+        proxy_slave_mark_down(&r->slave, "replica writev failed");
+        pthread_mutex_lock(&r->lock);
+        r->connected = 0;
+        pthread_mutex_unlock(&r->lock);
+        fprintf(stderr, "ebpf-proxy: replica slot %d send failed (sent=%zu/%zu), "
+                        "will reconnect\n", r->id, sent, total);
+    } else if (proxy_slave_drain(&r->slave) != 0) {
+        /* Slave 主端口作为数据通道时会为每个写命令回 +OK。proxy 不消费会
+         * 把 Slave out ring / socket buffer 塞满；这里顺手排空。对端关闭则重连。 */
+        proxy_slave_mark_down(&r->slave, "replica peer closed");
+        pthread_mutex_lock(&r->lock);
+        r->connected = 0;
+        pthread_mutex_unlock(&r->lock);
+    }
+}
+
+static void free_batch_nodes(proxy_repl_node_t **batch, int n) {
+    for (int i = 0; i < n; i++) free(batch[i]);
+}
+
+static void *replica_thread_main(void *arg) {
+    proxy_replica_t *r = (proxy_replica_t *)arg;
+    unsigned long long local_gen = 0;
+    uint32_t local_addr = 0;
+    int local_port = 0;
+    int connected = 0;
+    unsigned int backoff = PROXY_SLAVE_BACKOFF_INIT_MS;
+    proxy_repl_node_t *batch[PROXY_REPL_BATCH_MAX];
+
+    for (;;) {
+        pthread_mutex_lock(&r->lock);
+        /* 等待：需要连接/断开、或 LIVE 且有数据 */
+        for (;;) {
+            if (r->stop) break;
+            if (!r->used || r->failed) {
+                if (connected) break;                  /* 需要断开 */
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_nsec += 200L * 1000L * 1000L;
+                if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+                pthread_cond_timedwait(&r->cond, &r->lock, &ts);
+                continue;
+            }
+            if (r->conn_gen != local_gen || !connected) break;   /* 需要（重）连 */
+            if (r->phase == REPL_PHASE_LIVE && r->head) break;   /* 有数据 */
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_nsec += (long)PROXY_REPL_LINGER_US * 1000L;
+            if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+            pthread_cond_timedwait(&r->cond, &r->lock, &ts);
+        }
+        int stop = r->stop;
+        int used = r->used;
+        int failed = r->failed;
+        unsigned long long want_gen = r->conn_gen;
+        uint32_t want_addr = r->addr;
+        int want_port = r->port;
+        pthread_mutex_unlock(&r->lock);
+
+        if (stop) break;
+
+        if (connected && (!used || failed || want_gen != local_gen)) {
+            proxy_slave_disconnect(&r->slave);
+            connected = 0;
+            pthread_mutex_lock(&r->lock);
+            r->connected = 0;
+            pthread_mutex_unlock(&r->lock);
+        }
+        if (!used || failed) continue;
+        if (want_gen != local_gen) {
+            local_gen = want_gen;
+            backoff = PROXY_SLAVE_BACKOFF_INIT_MS;
+        }
+        if (!connected) {
+            char host[64];
+            if (want_addr != local_addr || want_port != local_port) {
+                snprintf(host, sizeof(host), "%u.%u.%u.%u",
+                         want_addr & 0xFF, (want_addr >> 8) & 0xFF,
+                         (want_addr >> 16) & 0xFF, (want_addr >> 24) & 0xFF);
+                proxy_slave_init(&r->slave, host, want_port);
+                local_addr = want_addr;
+                local_port = want_port;
+            }
+            if (proxy_slave_connect(&r->slave) == 0) {
+                connected = 1;
+                backoff = PROXY_SLAVE_BACKOFF_INIT_MS;
+                pthread_mutex_lock(&r->lock);
+                r->connected = 1;
+                r->reconnects++;
+                pthread_cond_broadcast(&r->cond);
+                pthread_mutex_unlock(&r->lock);
+                __atomic_fetch_add(&g_slave_reconnects, 1, __ATOMIC_RELAXED);
+            } else {
+                /* 连接退避不能等 r->cond：入队会持续 signal，退避会被数据
+                 * 唤醒变成热循环 connect。分片睡眠并在状态变化时提前退出。 */
+                unsigned int delay = backoff;
+                if (delay < PROXY_SLAVE_BACKOFF_INIT_MS) delay = PROXY_SLAVE_BACKOFF_INIT_MS;
+                for (unsigned int slept = 0; slept < delay && !g_shutdown; slept += 50) {
+                    usleep(50 * 1000);
+                    pthread_mutex_lock(&r->lock);
+                    int changed = (r->stop || !r->used || r->failed ||
+                                   r->conn_gen != local_gen);
+                    pthread_mutex_unlock(&r->lock);
+                    if (changed) break;
+                }
+                if (backoff < PROXY_SLAVE_BACKOFF_MAX_MS) backoff *= 2;
+                if (backoff > PROXY_SLAVE_BACKOFF_MAX_MS) backoff = PROXY_SLAVE_BACKOFF_MAX_MS;
+                continue;
+            }
+        }
+
+        /* 取一批数据（只在 LIVE 时发送） */
+        pthread_mutex_lock(&r->lock);
+        if (r->stop || !r->used || r->failed || r->conn_gen != local_gen ||
+            r->phase != REPL_PHASE_LIVE || !r->head) {
+            pthread_mutex_unlock(&r->lock);
+            continue;
+        }
+        unsigned long long batch_gen = r->barrier_gen;
+        int n = 0;
+        size_t bytes = 0;
+        while (n < PROXY_REPL_BATCH_MAX && r->head) {
+            size_t rem = replica_remaining(r->head);
+            if (n > 0 && bytes + rem > PROXY_REPL_BATCH_BYTES_MAX) break;
+            proxy_repl_node_t *node = r->head;
+            r->head = node->next;
+            if (!r->head) r->tail = NULL;
+            r->bytes -= rem;
+            r->nodes--;
+            node->next = NULL;
+            batch[n++] = node;
+            bytes += rem;
+        }
+        r->in_flight = 1;
+        pthread_mutex_unlock(&r->lock);
+
+        if (n > 0) replica_send_batch(r, batch, n, batch_gen);
+        else free_batch_nodes(batch, n);
+    }
+    if (connected) proxy_slave_disconnect(&r->slave);
+    return NULL;
+}
+
+/* ---- barrier 轮询 ----
+ * Master 写 slot BARRIER=<单调 seq> 后等待 slot ACK==seq。proxy 必须先把该副本
+ * 切到 RECOVERY（Commit Gate 开始按副本缓存）并等待在途 writev 结束，再回显
+ * seq 应答，保证应答之后不会再有 barrier 前数据流到 Slave。BARRIER=0 表示放行。 */
+static void replica_barrier_poll(proxy_replica_t *r) {
+    if (!r->used || r->failed) return;
+    __u64 v = 0;
+    if (read_client_ctl_u64(KVS_CTL_SLOT_BARRIER(r->id), &v) != 0) return;
+    int b = v ? 1 : 0;
+    if (v == r->barrier_last) return;
+
+    if (b) {
+        pthread_mutex_lock(&r->lock);
+        r->phase = REPL_PHASE_RECOVERY;
+        r->resumed = 0;
+        r->barrier_gen++;
+        replica_drop_fifo_locked(r);
+        proxy_commit_set_buffering((uint64_t)r->id, 1);
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec += PROXY_BARRIER_QUIESCE_MS / 1000;
+        deadline.tv_nsec += (long)(PROXY_BARRIER_QUIESCE_MS % 1000) * 1000000L;
+        if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+        int timed_out = 0;
+        while (r->in_flight && !r->stop) {
+            if (pthread_cond_timedwait(&r->idle, &r->lock, &deadline) == ETIMEDOUT) {
+                timed_out = 1;
+                break;
+            }
+        }
+        r->barrier_last = v;
+        if (timed_out) replica_isolate_locked(r, 2);
+        pthread_mutex_unlock(&r->lock);
+        if (timed_out)
+            proxy_slave_mark_down(&r->slave, "barrier quiesce timeout");
+        write_client_ctl_u64(KVS_CTL_SLOT_ACK(r->id), v);   /* ACK 回显 seq */
+        fprintf(stderr, "ebpf-proxy: replica slot %d barrier up seq=%llu (RECOVERY%s)\n",
+                r->id, (unsigned long long)v,
+                timed_out ? ", isolated after quiesce timeout" : "");
+    } else {
+        pthread_mutex_lock(&r->lock);
+        int was_resumed = r->resumed;
+        if (r->resumed) {
+            /* 正常路径：RESUME 已把恢复数据放行并把 phase 置 LIVE。 */
+            proxy_commit_set_buffering((uint64_t)r->id, 0);
+            r->phase = REPL_PHASE_LIVE;
+        } else {
+            /* barrier 在 RESUME 之前被清零（stale reset / 竞态）：**不能**释放
+             * 恢复缓冲，也不能切 LIVE。否则随后到达的 RESUME 无处可放行，或者
+             * 旧恢复记录会排在新 LIVE 数据之后（乱序）。保持恢复态，等 RESUME
+             * 或下一次 barrier up（up 会重置恢复缓冲）来推进。 */
+            replica_drop_fifo_locked(r);
+        }
+        r->resumed = 0;
+        r->barrier_last = 0;
+        pthread_cond_broadcast(&r->cond);
+        pthread_mutex_unlock(&r->lock);
+        write_client_ctl_u64(KVS_CTL_SLOT_ACK(r->id), 0);   /* 离开恢复态 */
+        fprintf(stderr, "ebpf-proxy: replica slot %d barrier down (%s)\n",
+                r->id, was_resumed ? "LIVE" : "still RECOVERY, awaiting RESUME");
+    }
+}
+
+static void poll_replica_barriers(void) {
+    for (int i = 0; i < PROXY_MAX_REPLICAS; i++)
+        replica_barrier_poll(&g_reps[i]);
+}
+
+/* ---- 副本集合级操作 ---- */
+/* 丢弃所有副本的 LIVE FIFO、断开数据通道、切回恢复态。用于 capture gate 关闭、
+ * session 失效/切换：旧 session 的数据绝不能跨 session 重放。 */
+static void replicas_reset_all(int rearm_buffering) {
+    for (int i = 0; i < PROXY_MAX_REPLICAS; i++) {
+        proxy_replica_t *r = &g_reps[i];
+        if (!r->used) continue;
+        pthread_mutex_lock(&r->lock);
+        replica_drop_fifo_locked(r);
+        r->phase = REPL_PHASE_RECOVERY;
+        r->resumed = 0;
+        r->failed = 0;
+        r->conn_gen++;          /* 强制发送线程断开重连 */
+        r->barrier_last = 0;
+        pthread_cond_broadcast(&r->cond);
+        pthread_mutex_unlock(&r->lock);
+        if (rearm_buffering) {
+            proxy_commit_set_replica((uint64_t)r->id, 1);
+            proxy_commit_set_buffering((uint64_t)r->id, 1);
+        }
+    }
+}
+
+/* ---- capture gate ---- */
 static void proxy_capture_drop_pending(void) {
-    set_state(STATE_BUFFERING);   /* 等当前 writev 批次结束，阻止新批次 */
     g_capture_drop = 1;
 
     /* 排空 ringbuf 并丢弃（回调此时直接 return） */
@@ -761,36 +816,25 @@ static void proxy_capture_drop_pending(void) {
         }
     }
 
-    /* 丢弃尚未发送的转发队列 */
-    pthread_mutex_lock(&g_pfwd_lock);
-    size_t qbytes = g_pfwd_bytes;
-    pthread_mutex_unlock(&g_pfwd_lock);
-    g_dropped_bytes += (unsigned long long)qbytes;
-    proxy_fwd_drain_to_cache_or_discard();
-
-    /* 丢弃 fullsync/慢路径缓存 */
-    pthread_mutex_lock(&g_cache_lock);
-    g_dropped_bytes += (unsigned long long)g_cache.total_bytes;
-    cache_destroy(&g_cache);
-    cache_init(&g_cache);
-    pthread_mutex_unlock(&g_cache_lock);
-
-    /* 断开 slave 数据连接：REPLSYNC 后由 Master 重新写 slave_addr，proxy 重连 */
-    proxy_slave_disconnect(&g_slave);
-
+    replicas_reset_all(0);
     /* Commit Gate：丢弃所有 per-cookie framing/pending/recovery 状态；
      * 重新打开时 Master 会先发 BASELINE 再 enable capture。 */
     proxy_commit_purge();
-
-    fprintf(stderr, "ebpf-proxy: capture gate closed, dropped %zu queued bytes\n", qbytes);
+    /* purge 清了恢复缓冲与 buffering 位：为仍注册的副本重新武装，
+     * 这样 barrier 建立前的提交也会进恢复缓冲而不是直接下送。 */
+    for (int i = 0; i < PROXY_MAX_REPLICAS; i++) {
+        proxy_replica_t *r = &g_reps[i];
+        if (!r->used) continue;
+        proxy_commit_set_replica((uint64_t)r->id, 1);
+        proxy_commit_set_buffering((uint64_t)r->id, 1);
+    }
+    fprintf(stderr, "ebpf-proxy: capture gate closed, all replica FIFOs dropped\n");
 }
 
 static void proxy_capture_resume(void) {
     g_capture_drop = 0;
     g_commit_fault_code = 0;
     g_commit_fault_handled = 0;
-    /* 不在这里置 FORWARDING：恢复期 client_ctl[3] 仍为 1（BUFFERING），
-     * 必须继续缓存增量，等 Master 在 ACK 追平/REPLDONE 后写 3=0 再 flush。 */
     fprintf(stderr, "ebpf-proxy: capture gate reopened\n");
 }
 
@@ -810,18 +854,10 @@ static void proxy_capture_gate_poll(void) {
 static int ringbuf_callback(void *ctx, void *data, size_t len) {
     (void)ctx;
     if (g_capture_drop) {
-        /* 竞态：Master 打开 capture 时，proxy 可能正在 ring_buffer__consume
-         * 中（尚未执行下一次 gate poll）。此时 g_capture_drop 仍为 1，若直接
-         * 丢弃，会丢掉新 session 的第一条 record（实测 50KB SET 的 32KB
-         * 首块被丢，尾部被误判为 inline 命令 → COMMIT_DESYNC）。
-         * 只记录到达时若 gate 已打开且没有 commit 故障，则接受并清除 drop。 */
         __u64 en = 0, ft = 0;
         int gate_on = (read_client_ctl_u64(CLIENT_CTL_KEY_CAPTURE_ENABLE, &en) == 0 && en == 1 &&
                        read_client_ctl_u64(CLIENT_CTL_KEY_CAPTURE_FAULT, &ft) == 0 && ft == 0);
         if (!gate_on || g_commit_fault_code) {
-            fprintf(stderr, "[commit] gate drop: en=%llu ft=%llu cf=%d len=%zu\n",
-                    (unsigned long long)en, (unsigned long long)ft,
-                    g_commit_fault_code, len);
             g_dropped_bytes += len;
             return 0;
         }
@@ -848,74 +884,165 @@ static int ringbuf_callback(void *ctx, void *data, size_t len) {
     return 0;
 }
 
-/* 轮询 master 下发的 replication session 状态（client_ctl[8]/[9]/[10]）。
+/* 轮询 master 下发的 replication session 状态（client_ctl[8]/[9]）。
  * session 变化 = 一次新的 REPLSYNC 建立（新 id）或旧 session 失效（valid=0）。
- * 两种情况都必须丢弃旧 cache：前者防跨 session 重放，后者是 NO_REPLICA 清理（§4.1/§7）。 */
+ * 两种情况都必须丢弃旧 FIFO：前者防跨 session 重放，后者是 session end 清理。 */
 static void poll_session_state(void) {
     if (g_client_ctl_fd < 0) return;
-    __u64 sid = 0, valid = 0, cinv = 0;
+    __u64 sid = 0, valid = 0;
     __u32 k;
     k = KVS_CTL_SESSION_ID;
     if (bpf_map_lookup_elem(g_client_ctl_fd, &k, &sid) != 0) return;
     k = KVS_CTL_SESSION_VALID;
     bpf_map_lookup_elem(g_client_ctl_fd, &k, &valid);
-    k = KVS_CTL_CACHE_INVALID;
-    bpf_map_lookup_elem(g_client_ctl_fd, &k, &cinv);
 
     int sid_changed = ((uint64_t)sid != g_session_id);
     int valid_changed = ((int)valid != g_session_valid);
-    int cinv_changed = ((int)cinv != g_cache_invalid_remote);
-    if (!sid_changed && !valid_changed && !cinv_changed) return;
+    if (!sid_changed && !valid_changed) return;
 
     if (sid_changed) {
-        fprintf(stderr, "ebpf-proxy: replication session change %llu -> %llu, "
-                "discarding previous session cache\n",
+        fprintf(stderr, "ebpf-proxy: replication session change %llu -> %llu\n",
                 (unsigned long long)g_session_id, (unsigned long long)sid);
         g_session_id = (uint64_t)sid;
-        /* 新 session：清数据 **并且** 解除 invalid。用 cache_clear_wrap 会留下
-         * invalid=1，导致一次 256MB 溢出之后整个进程再也不能 cache/flush（P0）。 */
-        if (sid != 0)
-            cache_reset_for_new_session_wrap();
-        else
-            cache_clear_wrap();
-        proxy_fwd_drain_to_cache_or_discard();
+        /* 新 session 只能由 REPLSYNC 驱动：每个 slot 会重新注册（gen 变化）并建立
+         * 新 barrier，由 configure/barrier-up 清理旧 FIFO。这里**不能**清恢复缓冲：
+         * barrier 已 ack、新 session 的第一批提交可能正被缓存，清掉就是静默丢数据。
+         * 只有 session 失效（valid=0）才无条件丢弃。 */
+        if (!valid) replicas_reset_all(1);
     }
     g_session_valid = (int)valid;
-    g_cache_invalid_remote = (int)cinv;
     if (!g_session_valid) {
-        /* 控制连接断开：旧 session 作废，cache 一律丢弃，禁止 flush（§8.2） */
-        fprintf(stderr, "ebpf-proxy: session invalidated by master, "
-                        "cache discarded (no flush)\n");
-        cache_clear_wrap();
-        proxy_fwd_drain_to_cache_or_discard();
-    } else if (cinv) {
-        /* master 判定本 session cache 已作废（proxy 溢出后重新武装） */
-        fprintf(stderr, "ebpf-proxy: cache marked invalid by master, discarding\n");
-        cache_clear_wrap();
+        fprintf(stderr, "ebpf-proxy: session invalidated by master, data discarded\n");
+        replicas_reset_all(1);
     }
 }
 
-/* 主循环 */
+/* ---- proxy_stats / client_stats ---- */
+static void proxy_stats_update(void) {
+    if (g_proxy_stats_fd < 0) return;
+    write_proxy_stat_u64(PST_FORWARDED_BYTES,
+        __atomic_load_n(&g_sent_bytes, __ATOMIC_RELAXED));
+    write_proxy_stat_u64(PST_ENQUEUED_BYTES,
+        __atomic_load_n(&g_enq_bytes, __ATOMIC_RELAXED));
+
+    size_t total = replicas_total_bytes();
+    unsigned long long nodes = 0, reconnects = 0, overflow = 0, dropped = 0;
+    for (int i = 0; i < PROXY_MAX_REPLICAS; i++) {
+        proxy_replica_t *r = &g_reps[i];
+        if (r->used) {
+            reconnects += r->reconnects;
+            nodes += r->nodes;
+            dropped += r->dropped_bytes;
+        }
+        overflow += r->overflow_count;
+    }
+    write_proxy_stat_u64(PST_FWDQ_BYTES, (__u64)total);
+    write_proxy_stat_u64(PST_CACHE_BYTES, (__u64)total);
+    write_proxy_stat_u64(PST_DROPPED_BYTES,
+        (__u64)(g_dropped_bytes + dropped));
+    write_proxy_stat_u64(PST_RECONNECTS,
+        (__u64)(__atomic_load_n(&g_slave_reconnects, __ATOMIC_RELAXED)));
+    write_proxy_stat_u64(PST_CAPTURE_DROP, (__u64)(g_capture_drop ? 1 : 0));
+    write_proxy_stat_u64(PST_CACHE_OVER_HIGH,
+        (__u64)((g_cache_bp_state == 1) ? 1 : 0));
+    write_proxy_stat_u64(PST_CACHE_HARD_HIT, (__u64)overflow);
+
+    proxy_commit_stats_t cs;
+    proxy_commit_get_stats(&cs);
+    write_proxy_stat_u64(PST_COMMIT_DESC, (__u64)cs.descriptors);
+    write_proxy_stat_u64(PST_COMMIT_WRITES, (__u64)cs.writes);
+    write_proxy_stat_u64(PST_COMMIT_PENDING, (__u64)cs.pending);
+    write_proxy_stat_u64(PST_COMMIT_TIMEOUT, (__u64)cs.timeout);
+    write_proxy_stat_u64(PST_COMMIT_DESYNC, (__u64)cs.desync);
+    write_proxy_stat_u64(PST_COMMIT_GAP, (__u64)cs.gap);
+    write_proxy_stat_u64(PST_COMMIT_RECOVERY, (__u64)cs.recovery_bytes);
+    write_proxy_stat_u64(PST_COMMIT_NEXT_G, cs.next_global_seq);
+    write_proxy_stat_u64(PST_COMMIT_CHANNEL, (__u64)(cs.channel_connected ? 1 : 0));
+    write_proxy_stat_u64(PST_CONN_CTX, (__u64)cs.conn_ctx_count);
+    write_proxy_stat_u64(PST_PENDING_CMD, (__u64)cs.pending_cmd_count);
+    write_proxy_stat_u64(PST_OLDEST_PENDING, (__u64)cs.oldest_pending_ms);
+    write_proxy_stat_u64(PST_MEM_HARD_HIT, (__u64)cs.memory_hard_limit_count);
+    (void)nodes;
+}
+
+static void publish_cache_stats(void) {
+    if (g_client_stats_fd < 0) return;
+    size_t total = replicas_total_bytes();
+    unsigned long long nodes = 0, dropped = 0, drop_bytes = 0, overflow = 0;
+    int invalid = 0;
+    for (int i = 0; i < PROXY_MAX_REPLICAS; i++) {
+        proxy_replica_t *r = &g_reps[i];
+        if (pthread_mutex_trylock(&r->lock) == 0) {
+            nodes += r->nodes;
+            dropped += r->dropped_bytes;
+            if (r->failed) invalid = 1;
+            pthread_mutex_unlock(&r->lock);
+        }
+        overflow += r->overflow_count;
+    }
+    drop_bytes = dropped;
+    __u64 vals[6];
+    vals[0] = (__u64)total;
+    vals[1] = (__u64)nodes;
+    vals[2] = dropped;
+    vals[3] = drop_bytes;
+    vals[4] = (__u64)g_repl_bytes_peak;
+    vals[5] = (__u64)(invalid || overflow > 0 ? 1 : 0);
+    for (__u32 i = 0; i < 6; i++) {
+        __u32 key = CSTAT_CACHE_BYTES + i;
+        bpf_map_update_elem(g_client_stats_fd, &key, &vals[i], BPF_ANY);
+    }
+}
+
+/* 聚合背压：只按所有副本总量发上游背压；单个慢副本由 per-replica FIFO 上限
+ * 隔离（slot FAULT → Master 只拒绝该副本）。 */
+static void backpressure_poll(void) {
+    size_t total = replicas_total_bytes();
+    size_t pending = total;
+    if (g_fwdq_bp_state == 0 && pending > PROXY_FWDQ_BP_HIGH) {
+        g_fwdq_bp_state = 1;
+        g_fwdq_bp_count++;
+        write_client_ctl_u64(KVS_CTL_FWDQ_BACKPRESSURE, 1);
+    } else if (g_fwdq_bp_state == 1 && pending < PROXY_FWDQ_BP_LOW) {
+        g_fwdq_bp_state = 0;
+        write_client_ctl_u64(KVS_CTL_FWDQ_BACKPRESSURE, 0);
+    }
+    if (g_cache_bp_state == 0 && total > PROXY_TOTAL_HIGH_BYTES) {
+        g_cache_bp_state = 1;
+        write_client_ctl_u64(KVS_CTL_CACHE_BACKPRESSURE, 1);
+        fprintf(stderr, "ebpf-proxy: total replica backlog over high watermark, "
+                        "signalling backpressure\n");
+    } else if (g_cache_bp_state == 1 && total < PROXY_TOTAL_LOW_BYTES) {
+        g_cache_bp_state = 0;
+        write_client_ctl_u64(KVS_CTL_CACHE_BACKPRESSURE, 0);
+    }
+}
+
+/* ---- 主循环 ---- */
 static void main_loop(void) {
     unsigned int stats_tick = 0;
+    unsigned int scan_tick = 0;
     while (!g_shutdown) {
-        /* Commit Gate 控制面必须先于 ringbuf 处理：BASELINE/IGNORE 决定
-         * 新捕获记录按哪条连接/从哪个 seq 开始重组；若先处理 ringbuf，
-         * replica 连接的 REPLSYNC 记录会在 IGNORE 到达前被当成客户端命令。 */
-        proxy_commit_poll(g_state == STATE_BUFFERING);
+        /* 1) 先发现 slot 注册，再处理该 slot 的 barrier（Master 等待 ACK）。 */
+        if (++scan_tick >= 10) {
+            scan_tick = 0;
+            poll_replicas();
+        }
+        proxy_capture_gate_poll();
+        poll_session_state();
+
+        /* 2) Commit Gate 控制面先于 ringbuf，且先于 barrier 边沿处理：
+         * Master 的 barrier down（slot BARRIER=0）在 RESUME 之后才写，先处理
+         * Commit Gate 才能保证 RESUME 已把恢复记录放行，随后 barrier down
+         * 的 set_buffering(0) 不会把这些记录丢弃。 */
+        proxy_commit_poll();
         if (g_commit_fault_code && !g_commit_fault_handled) {
             proxy_capture_drop_pending();
             g_commit_fault_handled = 1;
         }
-        if (proxy_commit_take_resume_event() && g_state == STATE_FORWARDING)
-            request_cache_flush();
+        poll_replica_barriers();
 
-        proxy_capture_gate_poll();
-
-        /* capture BPF 用 BPF_RB_NO_WAKEUP（省每 recv 的 self-IPI，占 master CPU2 25-27%）：
-         * producer 不发 eventfd 信号，ring_buffer__poll 只当 sleep（超时返回），
-         * 必须用 ring_buffer__consume 主动处理缓冲里已有的记录。
-         * 默认 wakeup 下 consume 幂等（poll 已处理则无剩余），向后兼容。 */
+        /* 3) capture BPF 用 BPF_RB_NO_WAKEUP：必须主动 consume。 */
         int rc = ring_buffer__poll(g_rb, 1 /* ms */);
         if (rc < 0 && !g_shutdown) {
             fprintf(stderr, "ebpf-proxy: ring_buffer__poll error: %d\n", rc);
@@ -926,152 +1053,126 @@ static void main_loop(void) {
             break;
         }
 
-        /* ringbuf 背压清除：BPF 只负责高水位置位（client_ctl[4]），此处由消费端
-         * 在 ringbuf 排空到低水位后清除——清除不依赖新 fexit（master 被停后无 fexit），
-         * 避免背压自锁。转发队列背压（client_ctl[6]）由入队/出队即时管理。 */
+        /* ringbuf 背压清除（低水位，由消费端负责，避免自锁） */
         if (ringbuf_occupancy() < RB_BACKPRESSURE_LOW) {
-            __u32 bp_key = CLIENT_CTL_KEY_BACKPRESSURE;
+            __u32 bp_key = KVS_CTL_RINGBUF_BACKPRESSURE;
             __u64 bp_now = 0;
-            bpf_map_lookup_elem(g_client_ctl_fd, &bp_key, &bp_now);
-            if (bp_now == 1) {
+            if (g_client_ctl_fd >= 0 &&
+                bpf_map_lookup_elem(g_client_ctl_fd, &bp_key, &bp_now) == 0 &&
+                bp_now == 1) {
                 g_rb_bp_count++;
-                write_client_ctl_u64(CLIENT_CTL_KEY_BACKPRESSURE, 0);
+                write_client_ctl_u64(KVS_CTL_RINGBUF_BACKPRESSURE, 0);
             }
         }
 
-        /* 注意：不再调用 batch_flush()。FORWARDING 数据已入转发队列，
-         * 由独立转发线程 writev 到 slave。*/
+        backpressure_poll();
 
-        /* replication session 边界（新 REPLSYNC / 控制连接断开）：作废旧 cache */
-        poll_session_state();
-
-        /* 把 proxy_cache 占用/丢弃统计发布给 master 的 INFO（~0.5s 一次） */
         if (++stats_tick >= 500) {
             stats_tick = 0;
             publish_cache_stats();
         }
-
-        /* proxy_cache 高水位 → 向上游发背压（client_ctl[11]），让 master 停手等待。
-         * 低水位清除。硬上限的作废由 cache_append 就地处理并经 CACHE_INVALID 上报。 */
-        {
-            int over_high = cache_over_high(&g_cache);
-            if (over_high && g_cache_bp_state == 0) {
-                g_cache_bp_state = 1;
-                write_client_ctl_u64(CLIENT_CTL_KEY_CACHE_BACKPRESSURE, 1);
-                fprintf(stderr, "ebpf-proxy: proxy_cache over high watermark, "
-                                "signalling backpressure\n");
-            } else if (!over_high && g_cache_bp_state == 1) {
-                g_cache_bp_state = 0;
-                write_client_ctl_u64(CLIENT_CTL_KEY_CACHE_BACKPRESSURE, 0);
-            }
-            /* 本地触发硬上限：上报 master（CACHE_INVALID），由 master 断开 replica 链路
-             * 强制重新同步。此处不静默丢数据继续复制（§12）。 */
-            if (cache_is_invalid(&g_cache)) {
-                write_client_ctl_u64(KVS_CTL_CACHE_INVALID, 1);
-            }
-        }
-
-        /* 检查 fullsync 状态变化
-         * client_ctl[3] 由 master 进程在 queue_snapshot/REPLDONE 时写入:
-         *   1 = 全量同步开始 → 切 BUFFERING
-         *   0 = 全量同步结束 → flush 缓存 → 切 FORWARDING */
-        /* client_ctl[3] 是 master 的"屏障请求"，全量同步和 partial resync 都用它。
-         * 按**边沿**处理（而不是按 g_state 变化）：
-         *   - 升沿 0→1：切 BUFFERING、丢弃边界前数据、置 [12]=1 应答 master
-         *   - 降沿 1→0：切 FORWARDING、置 [12]=0、flush 本 session 的 cache
-         * 必须按边沿而不是"状态不等"来应答 —— master 每次都先把 [12] 清零再拉 [3]，
-         * 若这里只在自己"没在 BUFFERING"时才应答，第二次屏障就会永远等不到确认。 */
-        __u64 fs_val = 0;
-        if (read_client_ctl_u64(KVS_CTL_FULLSYNC_STATE, &fs_val) == 0) {
-            fs_val = (fs_val != 0) ? 1 : 0;
-            if (fs_val == 1 && g_fs_req_seen == 0) {
-                g_fs_req_seen = 1;
-                set_state(STATE_BUFFERING);
-                /* 清空转发队列剩余增量，防其穿插进全量/追赶数据流 */
-                proxy_fwd_drain_to_cache_or_discard();
-                /* 边界前缓存的数据已由快照或 backlog replay 覆盖，留着再 flush 就是重复执行
-                 * （INCR/DEL 等非幂等命令致命）。同时解除 invalid：屏障本身就意味着
-                 * "catchup_end 之前的缺口会被补齐"，cache 从此可以重新开始累积。 */
-                cache_reset_for_new_session_wrap();
-                write_client_ctl_u64(CLIENT_CTL_KEY_PROXY_STATE, 1);  /* 应答：已 BUFFERING */
-                fprintf(stderr, "ebpf-proxy: barrier up (client_ctl[3]=1), "
-                        "state=BUFFERING, old cache discarded\n");
-            } else if (fs_val == 0 && g_fs_req_seen == 1) {
-                g_fs_req_seen = 0;
-                set_state(STATE_FORWARDING);
-                write_client_ctl_u64(CLIENT_CTL_KEY_PROXY_STATE, 0);
-                if (cache_flush_allowed()) {
-                    fprintf(stderr, "ebpf-proxy: barrier down (client_ctl[3]=0), "
-                            "requesting cache flush...\n");
-                    request_cache_flush();   /* fwd 线程（唯一 writer）刷 cache */
-                } else {
-                    fprintf(stderr, "ebpf-proxy: barrier down but session invalid — "
-                            "cache discarded, not flushed\n");
-                    cache_clear_wrap();
-                }
-            }
-        }
-
-        /* 检查 slave 连接 */
-        if (!proxy_slave_is_connected(&g_slave)) {
-            if (read_slave_addr() == 0) {
-                char host[64];
-                snprintf(host, sizeof(host), "%u.%u.%u.%u",
-                         g_slave_ip & 0xFF, (g_slave_ip >> 8) & 0xFF,
-                         (g_slave_ip >> 16) & 0xFF, (g_slave_ip >> 24) & 0xFF);
-                proxy_slave_init(&g_slave, host, g_slave_port);
-
-                /* 指数退避 */
-                for (int attempt = 1; !g_shutdown; attempt++) {
-                    if (proxy_slave_connect(&g_slave) == 0) {
-                        g_slave_reconnects++;
-                        /* 数据通道重连成功：只有控制面确认仍是同一个有效 session 时才允许
-                         * 刷残留 cache（§8.1/§9）；否则那是上个 session 的残余，必须丢弃。
-                         * 控制连接也断了（SESSION_BROKEN）时 cache 早已被 poll_session_state
-                         * 清掉，这里再刷等于跨 session 重放（§8.2）。 */
-                        if (cache_flush_allowed()) {
-                            request_cache_flush();   /* fwd 线程（唯一 writer）刷残留 cache */
-                        } else {
-                            fprintf(stderr, "ebpf-proxy: reconnected but session not "
-                                            "flushable — discarding residual cache\n");
-                            cache_clear_wrap();
-                        }
-                        break;
-                    }
-                    unsigned int delay = g_slave.backoff_ms;
-                    if (delay < PROXY_SLAVE_BACKOFF_INIT_MS)
-                        delay = PROXY_SLAVE_BACKOFF_INIT_MS;
-                    if (delay > 5000) delay = 5000;
-                    fprintf(stderr, "ebpf-proxy: reconnect attempt %d, "
-                            "sleeping %ums\n", attempt, delay);
-                    /* 在退避期间继续 poll ringbuf，并处理 Master 控制面：
-                     * 否则 REPLSYNC 期间 proxy 连不上 slave 会阻塞数秒，
-                     * 无法回执 BUFFERING，Master 会超时失效会话。 */
-                    int poll_iters = (int)(delay / 5);
-                    for (int i = 0; i < poll_iters && !g_shutdown; i++) {
-                        proxy_commit_poll(g_state == STATE_BUFFERING);
-                        proxy_capture_gate_poll();
-                        ring_buffer__poll(g_rb, 5);
-                        if (g_commit_fault_code && !g_commit_fault_handled) {
-                            proxy_capture_drop_pending();
-                            g_commit_fault_handled = 1;
-                        }
-                        if (proxy_commit_take_resume_event() && g_state == STATE_FORWARDING)
-                            request_cache_flush();
-                    }
-                    g_slave.backoff_ms *= 2;
-                    if (g_slave.backoff_ms > g_slave.backoff_max_ms)
-                        g_slave.backoff_ms = g_slave.backoff_max_ms;
-                }
-            }
-        }
-
-        /* 不再由主线程直接 flush cache：fwd 线程是 slave fd 的唯一 writer，
-         * cache flush 全部由其处理（消除主线程 send_full 与 fwd writev 的并发写竞态）。 */
     }
 }
 
-/* 退出清理 */
+/* ---- 心跳 / 诊断线程 ---- */
+static pthread_t g_hb_thread = 0;
+static void *heartbeat_thread_main(void *arg) {
+    (void)arg;
+    __u64 hb = 0;
+    while (!g_shutdown) {
+        hb++;
+        write_client_ctl_u64(KVS_CTL_PROXY_HEARTBEAT, hb);
+        proxy_stats_update();
+        usleep(100000);
+    }
+    return NULL;
+}
+
+static void *diag_thread_main(void *arg) {
+    (void)arg;
+    __u64 last_enq = 0, last_sent = 0;
+    unsigned long long last_us = 0;
+    while (!g_shutdown) {
+        usleep(1000000);
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        unsigned long long now_us = (unsigned long long)ts.tv_sec * 1000000ULL
+                                    + (unsigned long long)ts.tv_nsec / 1000ULL;
+        __u64 enq = __atomic_load_n(&g_enq_bytes, __ATOMIC_RELAXED);
+        __u64 sent = __atomic_load_n(&g_sent_bytes, __ATOMIC_RELAXED);
+        double dt = last_us ? (double)(now_us - last_us) / 1e6 : 1.0;
+        fprintf(stderr,
+                "ebpf-proxy: [diag] replicas=%d fwdq=%zuMB ringbuf=%zuMB "
+                "enq=%.1fMB/s sent=%.1fMB/s bp=%llu/%llu "
+                "wv=%llu eagain=%llu poll=%llu(pout=%llu,timeout=%llu,err=%llu) partial=%llu\n",
+                PROXY_MAX_REPLICAS,
+                replicas_total_bytes() / (1024 * 1024),
+                ringbuf_occupancy() / (1024 * 1024),
+                (enq - last_enq) / dt / (1024 * 1024),
+                (sent - last_sent) / dt / (1024 * 1024),
+                g_fwdq_bp_count, g_rb_bp_count,
+                __atomic_load_n(&g_writev_calls, __ATOMIC_RELAXED),
+                __atomic_load_n(&g_eagain_count, __ATOMIC_RELAXED),
+                __atomic_load_n(&g_poll_count, __ATOMIC_RELAXED),
+                __atomic_load_n(&g_poll_out, __ATOMIC_RELAXED),
+                __atomic_load_n(&g_poll_timeout, __ATOMIC_RELAXED),
+                __atomic_load_n(&g_poll_err, __ATOMIC_RELAXED),
+                __atomic_load_n(&g_partial_write, __ATOMIC_RELAXED));
+        last_enq = enq; last_sent = sent; last_us = now_us;
+    }
+    return NULL;
+}
+
+static void diag_start(void) {
+    if (getenv("EBPF_PROXY_DIAG") == NULL) return;
+    pthread_t t;
+    if (pthread_create(&t, NULL, diag_thread_main, NULL) != 0)
+        fprintf(stderr, "ebpf-proxy: failed to start diag thread\n");
+}
+
+static void heartbeat_start(void) {
+    if (pthread_create(&g_hb_thread, NULL, heartbeat_thread_main, NULL) != 0)
+        fprintf(stderr, "ebpf-proxy: failed to start heartbeat thread\n");
+}
+
+/* ---- 副本线程启动/停止 ---- */
+static void replicas_init(void) {
+    for (int i = 0; i < PROXY_MAX_REPLICAS; i++) {
+        proxy_replica_t *r = &g_reps[i];
+        memset(r, 0, sizeof(*r));
+        r->id = i;
+        pthread_mutex_init(&r->lock, NULL);
+        pthread_cond_init(&r->cond, NULL);
+        pthread_cond_init(&r->idle, NULL);
+        proxy_slave_init(&r->slave, NULL, 0);
+        r->backoff_ms = PROXY_SLAVE_BACKOFF_INIT_MS;
+    }
+}
+
+static void replicas_start(void) {
+    for (int i = 0; i < PROXY_MAX_REPLICAS; i++) {
+        if (pthread_create(&g_reps[i].tid, NULL, replica_thread_main, &g_reps[i]) != 0)
+            fprintf(stderr, "ebpf-proxy: failed to start replica thread %d\n", i);
+    }
+}
+
+static void replicas_stop(void) {
+    for (int i = 0; i < PROXY_MAX_REPLICAS; i++) {
+        proxy_replica_t *r = &g_reps[i];
+        pthread_mutex_lock(&r->lock);
+        r->stop = 1;
+        pthread_cond_broadcast(&r->cond);
+        pthread_cond_broadcast(&r->idle);
+        pthread_mutex_unlock(&r->lock);
+    }
+    for (int i = 0; i < PROXY_MAX_REPLICAS; i++)
+        pthread_join(g_reps[i].tid, NULL);
+    for (int i = 0; i < PROXY_MAX_REPLICAS; i++) {
+        proxy_replica_t *r = &g_reps[i];
+        replica_drop_fifo_locked(r);
+    }
+}
+
+/* ---- 退出清理 ---- */
 static void cleanup(void) {
     fprintf(stderr, "ebpf-proxy: shutting down...\n");
 
@@ -1080,12 +1181,11 @@ static void cleanup(void) {
     /* 0. 先 detach fexit — 停止新数据进入 ringbuf */
     if (g_fexit_link) { bpf_link__destroy(g_fexit_link); g_fexit_link = NULL; }
 
-    /* 1. 排空 ringbuf 到转发队列/缓存。转发线程此刻仍在运行，回调入队的数据
-     *    由 fwd_thread 继续转发到 slave；若在停线程之后再 drain，入队的数据会
-     *    积在已停的队列上被丢弃。 */
+    /* 1. 排空 ringbuf 到发送 FIFO。副本线程此刻仍在运行，会把已提交数据
+     *    继续发往各 Slave；若先停线程再 drain，入队数据会积在已停线程上。 */
     if (g_rb) {
         int drained = 0;
-        for (int i = 0; i < 50; i++) {  /* 最多 5s (50 × 100ms) */
+        for (int i = 0; i < 50; i++) {
             int n = ring_buffer__poll(g_rb, 100);
             if (n <= 0) break;
             drained += n;
@@ -1094,20 +1194,10 @@ static void cleanup(void) {
             fprintf(stderr, "ebpf-proxy: drained %d remaining ringbuf entries\n", drained);
     }
 
-    /* 2. 停转发线程：先请求最后一次 cache flush（fwd 线程是唯一 writer），
-     *    再 stop——fwd 线程刷完残留 cache 后才退出，避免关闭丢数据。 */
-    request_cache_flush();
-    proxy_fwd_stop();
+    /* 2. 停所有副本线程（各自尽力发完 FIFO） */
+    replicas_stop();
 
-    /* 3. 剩余缓存由 cache_destroy 释放（fwd 线程已尽力刷出；fd 故障时残留在此清理） */
-    pthread_mutex_lock(&g_cache_lock);
-    cache_destroy(&g_cache);
-    pthread_mutex_unlock(&g_cache_lock);
-
-    /* 4. 断开 slave */
-    proxy_slave_disconnect(&g_slave);
-
-    /* 5. 释放 BPF 资源 */
+    /* 3. 释放 BPF 资源 */
     if (g_rb) { ring_buffer__free(g_rb); g_rb = NULL; }
     if (g_bpf_obj) { bpf_object__close(g_bpf_obj); g_bpf_obj = NULL; }
     if (g_client_ctl_fd >= 0) { close(g_client_ctl_fd); g_client_ctl_fd = -1; }
@@ -1119,7 +1209,7 @@ static void cleanup(void) {
     fprintf(stderr, "ebpf-proxy: cleanup complete\n");
 }
 
-/* 加载并 attach BPF */
+/* ---- 加载并 attach BPF ---- */
 static int load_and_attach_bpf(void) {
     struct bpf_program *prog;
 
@@ -1134,7 +1224,6 @@ static int load_and_attach_bpf(void) {
         return -1;
     }
 
-    /* pin maps */
     struct bpf_map *map;
     bpf_object__for_each_map(map, g_bpf_obj) {
         const char *name = bpf_map__name(map);
@@ -1151,7 +1240,6 @@ static int load_and_attach_bpf(void) {
         }
     }
 
-    /* 打开自己的 pinned maps */
     if (open_pinned_map("client_ctl", &g_client_ctl_fd) != 0)
         fprintf(stderr, "ebpf-proxy: open client_ctl failed\n");
     if (open_pinned_map("proxy_cfg", &g_proxy_cfg_fd) != 0)
@@ -1161,7 +1249,6 @@ static int load_and_attach_bpf(void) {
     if (open_pinned_map("proxy_stats", &g_proxy_stats_fd) != 0)
         fprintf(stderr, "ebpf-proxy: open proxy_stats failed\n");
 
-    /* attach fexit（fexit-only：ctx[5] 取返回值，无 fentry） */
     prog = bpf_object__find_program_by_name(g_bpf_obj, "fexit_tcp_recvmsg");
     if (!prog) { fprintf(stderr, "ebpf-proxy: find fexit failed\n"); return -1; }
     g_fexit_link = bpf_program__attach(prog);
@@ -1170,7 +1257,6 @@ static int load_and_attach_bpf(void) {
         return -1;
     }
 
-    /* 创建 ringbuf reader：先 mmap 头页（双信号背压用 in-object fd），再创建 reader */
     struct bpf_map *rb_map = bpf_object__find_map_by_name(g_bpf_obj, "client_cache_ringbuf");
     if (!rb_map) { fprintf(stderr, "ebpf-proxy: find ringbuf map failed\n"); return -1; }
     int rb_fd = bpf_map__fd(rb_map);
@@ -1182,7 +1268,20 @@ static int load_and_attach_bpf(void) {
     return 0;
 }
 
-/* 打印使用说明 */
+static int wait_for_master_pid(int timeout_ms) {
+    __u64 val = 0;
+    int waited = 0;
+    while (waited < timeout_ms) {
+        if (read_proxy_cfg_u64("master_pid", &val) == 0 && val != 0) {
+            g_master_pid = (int)val;
+            return 0;
+        }
+        usleep(500000);
+        waited += 500;
+    }
+    return -1;
+}
+
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage: %s [options]\n"
@@ -1196,7 +1295,6 @@ static void usage(const char *prog) {
         prog);
 }
 
-/* 解析命令行 */
 static int parse_args(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
@@ -1243,16 +1341,13 @@ int main(int argc, char **argv) {
     signal(SIGTERM, signal_handler);
     signal(SIGPIPE, SIG_IGN);
 
-    /* 提高 memlock 限制 */
     struct rlimit rlim = { RLIM_INFINITY, RLIM_INFINITY };
     setrlimit(RLIMIT_MEMLOCK, &rlim);
 
-    cache_init(&g_cache);
+    replicas_init();
 
-    /* 确保 pin 目录存在 */
     mkdir(g_pin_path, 0755);
 
-    /* 加载 BPF 并 pin maps */
     if (load_and_attach_bpf() != 0) {
         fprintf(stderr, "ebpf-proxy: BPF init failed\n");
         return 1;
@@ -1262,11 +1357,11 @@ int main(int argc, char **argv) {
      * Master 一旦 connect 就会写 capture_enable=1；若 map 尚未 pin/随后被
      * unlink+repin，arm 会写进旧 map，BPF 永远收不到 enable。 */
     if (proxy_commit_init(g_commit_sock_path[0] ? g_commit_sock_path : "./kvstore.commit.sock",
-                          commit_emit, commit_fault_cb) != 0) {
+                          commit_emit, commit_fault_cb, commit_replica_fault_cb,
+                          commit_resume_cb) != 0) {
         fprintf(stderr, "ebpf-proxy: commit listener init failed (Commit Gate disabled)\n");
     }
 
-    /* master 由 Master spawn 时通过 argv 直接给出；手动启动才回退到 proxy_cfg 轮询 */
     if (g_master_pid_arg > 0) {
         g_master_pid = g_master_pid_arg;
         g_master_port = g_master_port_arg;
@@ -1285,29 +1380,20 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* 写 client_ctl（BPF kprobe 需要） */
     write_client_ctl_u64(1, (__u64)g_master_pid);
     write_client_ctl_u64(2, (__u64)g_master_port);
 
-    fprintf(stderr, "ebpf-proxy: master pid=%d port=%d\n",
-            g_master_pid, g_master_port);
+    fprintf(stderr, "ebpf-proxy: master pid=%d port=%d replicas_max=%d\n",
+            g_master_pid, g_master_port, PROXY_MAX_REPLICAS);
 
-    /* 尝试连接 slave */
-    if (read_slave_addr() == 0) {
-        char host[64];
-        snprintf(host, sizeof(host), "%u.%u.%u.%u",
-                 g_slave_ip & 0xFF, (g_slave_ip >> 8) & 0xFF,
-                 (g_slave_ip >> 16) & 0xFF, (g_slave_ip >> 24) & 0xFF);
-        proxy_slave_init(&g_slave, host, g_slave_port);
-        proxy_slave_connect(&g_slave);
-    }
+    /* 立即扫一次已注册的 slot（Master 可能已经写完 REPLSYNC 配置）。 */
+    poll_replicas();
 
-    /* 启动独立心跳线程 + 诊断线程 + 转发线程 */
     heartbeat_start();
     diag_start();
-    proxy_fwd_start();
+    replicas_start();
 
-    fprintf(stderr, "ebpf-proxy: entering main loop, state=FORWARDING\n");
+    fprintf(stderr, "ebpf-proxy: entering main loop\n");
     main_loop();
     cleanup();
     return 0;

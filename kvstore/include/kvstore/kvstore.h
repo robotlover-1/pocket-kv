@@ -307,6 +307,16 @@ typedef struct conn_s {
     int repl_draining;
     int repl_fullsync_pending;
     int repl_transport_kind;
+    /* ---- eBPF 多副本 fan-out slot（每个控制连接一份） ----
+     * -1 = 未注册到 ebpf-proxy。屏障/恢复状态必须是 per-connection 的：
+     * A 的 REPLACK 不能解除 B 的恢复屏障（见 docs/multi-slave-design.md §7.4）。 */
+    int repl_slot;
+    int repl_barrier_active;
+    int repl_barrier_ack_gated;
+    int repl_barrier_resume_valid;
+    unsigned long long repl_barrier_end_offset;    /* catchup_end */
+    unsigned long long repl_barrier_resume_global; /* RESUME marker */
+    long long repl_barrier_deadline_ms;
     /* eBPF 副本故障恢复：0=正常；1=fullsync 期间（capture 关闭）；
      * 2=backlog 追赶期（capture 已开，但 proxy 处于 BUFFERING，追平后 flush） */
     int repl_recovery_mode;
@@ -354,6 +364,7 @@ typedef struct {
 typedef struct {
     int role;
     int port;
+    int repl_proxy_port;            /* slave 侧 ebpf-proxy 数据监听端口；0=master_port+1 */
     char master_host[128];
     int master_port;
     char dump_path[256];
@@ -563,9 +574,10 @@ void repl_commit_flush(void);                  /* 批量发送描述符 */
 void repl_commit_baseline(conn_t *c);          /* 新连接/BASELINE */
 void repl_commit_ignore(conn_t *c);            /* 连接变为 replica */
 void repl_commit_forget(conn_t *c);            /* 连接关闭 */
-/* 恢复期结束：发送 RESUME(marker)。返回 0 成功；-1 表示通道不可用/发送失败，
- * 调用方必须 fail-closed（不得继续 flush recovery/cache）。 */
-int repl_commit_resume(uint64_t global_seq);
+/* 恢复期结束：向指定副本发送 RESUME(replica_id, marker)。返回 0 成功；
+ * -1 表示通道不可用/发送失败，调用方必须 fail-closed（不得继续 flush recovery/cache）。
+ * replica_id 即 ebpf-proxy 的 fan-out slot；每个副本独立丢弃 <=marker 的记录。 */
+int repl_commit_resume(uint64_t replica_id, uint64_t global_seq);
 uint64_t repl_commit_global_seq(void);
 unsigned long long repl_commit_descriptor_count(void);
 unsigned long long repl_commit_write_count(void);
@@ -582,12 +594,13 @@ int repl_handle_replica_send_failure(conn_t *c, conn_t **linkp);
 void repl_broadcast(const unsigned char *raw, size_t rawlen);
 /* ebpf-proxy 屏障（定义在 src/main/kvstore.c）：保证"绕过 proxy 直接补数据"的动作
  * （FULLRESYNC 快照 / partial resync replay）与 proxy 的实时转发不会跨两条 TCP 连接重排。
- *  - repl_barrier_pending(): 屏障是否仍立着
- *  - repl_barrier_tick():    周期兜底放行，由 reactor 的定时块调用
- *  - repl_barrier_note_applied(): Slave 的 REPLACK 反馈，追上 catchup_end 即放行 */
+ * 屏障是 per-replica 的：A 的 REPLACK 不能解除 B 的屏障。
+ *  - repl_barrier_pending(): 任一副本的屏障是否仍立着
+ *  - repl_barrier_tick():    周期检查，超时只拒绝该副本（fail-closed），不影响其他副本
+ *  - repl_barrier_note_applied(c,...): 该副本的 REPLACK 追上 catchup_end 即放行该副本 */
 int repl_barrier_pending(void);
 void repl_barrier_tick(void);
-void repl_barrier_note_applied(unsigned long long applied_offset);
+void repl_barrier_note_applied(conn_t *c, unsigned long long applied_offset);
 void repl_note_send_context(const char *stage, size_t len, unsigned long long offset, const unsigned char *buf);
 void repl_get_last_send_context(char *stage, size_t stage_cap, unsigned long long *len, unsigned long long *offset, char *preview, size_t preview_cap);
 int start_slave_thread(void);
@@ -811,6 +824,7 @@ int resp_integer(char *out, size_t cap, long long v);
 int resp_bulk(char *out, size_t cap, const char *s, size_t len);
 int resp_null_bulk(char *out, size_t cap);
 size_t resp_build_cmd4(unsigned char *out, size_t cap, const char *cmd, const char *a1, const char *a2, const char *a3);
+size_t resp_build_cmd5(unsigned char *out, size_t cap, const char *cmd, const char *a1, const char *a2, const char *a3, const char *a4);
 size_t resp_build_cmd3(unsigned char *out, size_t cap, const char *cmd, const char *a1, const char *a2);
 size_t resp_build_cmd2(unsigned char *out, size_t cap, const char *cmd, const char *a1);
 size_t resp_build_cmd1(unsigned char *out, size_t cap, const char *cmd);

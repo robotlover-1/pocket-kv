@@ -28,8 +28,22 @@ static int g_out_count = 0;
 
 static int g_fail_emit = 0;
 
-static int emit_cb(const unsigned char *buf, size_t len) {
+static uint64_t g_last_replica = ~0ull;
+static int g_multi_mode = 0;
+static int g_rid_count[64];
+static uint64_t g_rid_last_seq[64];
+
+static int emit_cb(uint64_t replica_id, uint64_t global_seq,
+                   const unsigned char *buf, size_t len) {
     if (g_fail_emit) return -1;
+    g_last_replica = replica_id;
+    if (g_multi_mode) {
+        if (replica_id < 64) {
+            g_rid_count[replica_id]++;
+            g_rid_last_seq[replica_id] = global_seq;
+        }
+        return 0;
+    }
     if (g_out_len + len <= sizeof(g_out)) {
         memcpy(g_out + g_out_len, buf, len);
         g_out_len += len;
@@ -40,6 +54,18 @@ static int emit_cb(const unsigned char *buf, size_t len) {
 
 static int g_fault_reason = 0;
 static void fault_cb(int reason) { g_fault_reason = reason; }
+
+static int g_replica_fault_count = 0;
+static void replica_fault_cb(uint64_t replica_id, int reason) {
+    (void)replica_id; (void)reason;
+    g_replica_fault_count++;
+}
+
+static int g_resume_count = 0;
+static void resume_cb(uint64_t replica_id, uint64_t marker) {
+    (void)replica_id; (void)marker;
+    g_resume_count++;
+}
 
 static uint64_t crc64(const unsigned char *b, size_t n) {
     uint64_t h = 1469598103934665603ull;
@@ -107,21 +133,24 @@ static void send_desc(uint64_t cookie, uint64_t seq, uint64_t global,
     CHECK(send(g_sock, buf, sizeof(buf), 0) == (ssize_t)sizeof(buf), "send desc");
 }
 
-static void send_resume(uint64_t marker) {
+static void send_resume_id(uint64_t replica_id, uint64_t marker) {
     repl_commit_msg_t m;
     memset(&m, 0, sizeof(m));
     m.magic = REPL_COMMIT_MAGIC; m.version = REPL_COMMIT_VERSION;
     m.type = REPL_COMMIT_MSG_RESUME; m.global_seq = marker; m.epoch = g_msg_epoch;
+    m.replica_id = replica_id;
     CHECK(send(g_sock, &m, sizeof(m), 0) == (ssize_t)sizeof(m), "send resume");
 }
 
-static void poll_once(int buffering) {
-    proxy_commit_poll(buffering);
+static void send_resume(uint64_t marker) { send_resume_id(0, marker); }
+
+static void poll_once(void) {
+    proxy_commit_poll();
     usleep(2000);
 }
 
 /* 让 proxy 接受连接 */
-static void wait_accept(void) { for (int i = 0; i < 50; ++i) { poll_once(0); usleep(2000); } }
+static void wait_accept(void) { for (int i = 0; i < 50; ++i) { poll_once(); usleep(2000); } }
 
 static void feed(uint64_t cookie, uint64_t seq, const char *data) {
     proxy_commit_on_record(cookie, seq, (const unsigned char *)data, strlen(data));
@@ -131,7 +160,9 @@ int main(void) {
     char path[256];
     snprintf(path, sizeof(path), "/tmp/kvs-commit-test-%d.sock", (int)getpid());
     unlink(path);
-    CHECK(proxy_commit_init(path, emit_cb, fault_cb) == 0, "init");
+    CHECK(proxy_commit_init(path, emit_cb, fault_cb, replica_fault_cb,
+                            resume_cb) == 0, "init");
+    proxy_commit_set_replica(0, 1);   /* 单副本 slot 0 */
 
     g_sock = connect_master(path);
     CHECK(g_sock >= 0, "connect listener");
@@ -141,11 +172,11 @@ int main(void) {
     reset_out();
     send_hello(1);
     send_baseline(1001, 1);
-    poll_once(0);
+    poll_once();
     const char *set = "*3\r\n$3\r\nSET\r\n$1\r\nx\r\n$1\r\n1\r\n";
     feed(1001, 1, set);
     send_desc(1001, 1, 1, (const unsigned char *)set, strlen(set), REPL_COMMIT_FLAG_WRITE, 0, 0);
-    poll_once(0);
+    poll_once();
     CHECK(g_fault_reason == 0, "array write no fault");
     CHECK(g_out_count == 1 && g_out_len == strlen(set) && memcmp(g_out, set, strlen(set)) == 0,
           "array write emitted");
@@ -154,25 +185,25 @@ int main(void) {
     reset_out();
     proxy_commit_purge();
     send_baseline(1002, 1);
-    poll_once(0);
+    poll_once();
     const char *ping = "PING\r\n";
     feed(1002, 1, ping);
     send_desc(1002, 1, 0, (const unsigned char *)ping, strlen(ping), REPL_COMMIT_FLAG_SKIP, 0, 0);
-    poll_once(0);
+    poll_once();
     CHECK(g_fault_reason == 0 && g_out_count == 0, "inline skip not emitted");
 
     /* 3. 半包：分两次到达 */
     reset_out();
     proxy_commit_purge();
     send_baseline(1003, 1);
-    poll_once(0);
+    poll_once();
     const char *cmd = "*3\r\n$4\r\nHSET\r\n$1\r\nk\r\n$1\r\nv\r\n";
     proxy_commit_on_record(1003, 1, (const unsigned char *)cmd, 10);
-    poll_once(0);
+    poll_once();
     CHECK(g_out_count == 0, "half packet not framed");
     proxy_commit_on_record(1003, 2, (const unsigned char *)cmd + 10, strlen(cmd) - 10);
     send_desc(1003, 1, 1, (const unsigned char *)cmd, strlen(cmd), REPL_COMMIT_FLAG_WRITE, 0, 0);
-    poll_once(0);
+    poll_once();
     if (!(g_fault_reason == 0 && g_out_count == 1 &&
           g_out_len == strlen(cmd) && memcmp(g_out, cmd, strlen(cmd)) == 0))
         fprintf(stderr, "  [half] fault=%d out_count=%d out_len=%zu want=%zu\n",
@@ -184,46 +215,46 @@ int main(void) {
     reset_out();
     proxy_commit_purge();
     send_baseline(1004, 1);
-    poll_once(0);
+    poll_once();
     feed(1004, 1, "+OK\r\n\r\n");
-    poll_once(0);
+    poll_once();
     CHECK(g_out_count == 0 && g_fault_reason == 0, "control/empty line skipped");
     const char *ping2 = "PING\r\n";
     feed(1004, 2, ping2);
     send_desc(1004, 1, 0, (const unsigned char *)ping2, strlen(ping2), REPL_COMMIT_FLAG_SKIP, 0, 0);
-    poll_once(0);
+    poll_once();
     CHECK(g_fault_reason == 0, "seq stays aligned after control lines");
 
     /* 5. 畸形 RESP 头被跳过不影响后续命令 */
     reset_out();
     proxy_commit_purge();
     send_baseline(1005, 1);
-    poll_once(0);
+    poll_once();
     feed(1005, 1, "*-1\r\n");
     const char *ping3 = "PING\r\n";
     feed(1005, 2, ping3);
     send_desc(1005, 1, 0, (const unsigned char *)ping3, strlen(ping3), REPL_COMMIT_FLAG_SKIP, 0, 0);
-    poll_once(0);
+    poll_once();
     CHECK(g_fault_reason == 0, "malformed header skipped, next seq aligned");
 
     /* 6. CRC 错误 → DESYNC */
     reset_out();
     proxy_commit_purge();
     send_baseline(1006, 1);
-    poll_once(0);
+    poll_once();
     feed(1006, 1, ping);
     send_desc(1006, 1, 0, (const unsigned char *)ping, strlen(ping), REPL_COMMIT_FLAG_SKIP, 0xdeadbeef, 1);
-    poll_once(0);
+    poll_once();
     CHECK(g_fault_reason == 2, "crc mismatch → desync");
 
     /* 7. recv_seq 缺口 → GAP */
     reset_out();
     proxy_commit_purge();
     send_baseline(1007, 1);
-    poll_once(0);
+    poll_once();
     proxy_commit_on_record(1007, 1, (const unsigned char *)ping, strlen(ping));
     proxy_commit_on_record(1007, 3, (const unsigned char *)ping, strlen(ping));
-    poll_once(0);
+    poll_once();
     CHECK(g_fault_reason == 3, "recv_seq gap → gap fault");
 
     /* 8. 全局序：先到 global=2，等到 global=1 后按序发出 */
@@ -231,23 +262,23 @@ int main(void) {
     proxy_commit_purge();
     send_baseline(2001, 1);
     send_baseline(2002, 1);
-    poll_once(0);
+    poll_once();
     const char *a = "*2\r\n$3\r\nDEL\r\n$1\r\na\r\n";
     const char *b = "*2\r\n$3\r\nDEL\r\n$1\r\nb\r\n";
     /* 先建立 global 基线（第一个 WRITE 的 global 被接受为起点） */
     feed(2001, 1, a);
     send_desc(2001, 1, 1, (const unsigned char *)a, strlen(a), REPL_COMMIT_FLAG_WRITE, 0, 0);
-    poll_once(0);
+    poll_once();
     CHECK(g_fault_reason == 0 && g_out_count == 1, "global baseline write emitted");
     /* global=3 先到，必须等 global=2 */
     feed(2002, 1, b);
     send_desc(2002, 1, 3, (const unsigned char *)b, strlen(b), REPL_COMMIT_FLAG_WRITE, 0, 0);
-    poll_once(0);
+    poll_once();
     CHECK(g_out_count == 1, "global 3 waits for 2");
     const char *c = "*2\r\n$3\r\nDEL\r\n$1\r\nc\r\n";
     feed(2002, 2, c);
     send_desc(2002, 2, 2, (const unsigned char *)c, strlen(c), REPL_COMMIT_FLAG_WRITE, 0, 0);
-    poll_once(0);
+    poll_once();
     CHECK(g_fault_reason == 0 && g_out_count == 3 &&
           memcmp(g_out + strlen(a), c, strlen(c)) == 0 &&
           memcmp(g_out + strlen(a) + strlen(c), b, strlen(b)) == 0,
@@ -257,30 +288,31 @@ int main(void) {
     reset_out();
     proxy_commit_purge();
     send_baseline(3001, 1);
-    poll_once(0);
-    poll_once(1);   /* buffering */
+    poll_once();
+    proxy_commit_set_buffering(0, 1);   /* barrier up */
     feed(3001, 1, a);
     send_desc(3001, 1, 10, (const unsigned char *)a, strlen(a), REPL_COMMIT_FLAG_WRITE, 0, 0);
     feed(3001, 2, b);
     send_desc(3001, 2, 11, (const unsigned char *)b, strlen(b), REPL_COMMIT_FLAG_WRITE, 0, 0);
-    poll_once(1);
+    poll_once();
     CHECK(g_out_count == 0, "buffering holds writes");
     send_resume(10);
-    poll_once(1);
+    poll_once();
     CHECK(g_fault_reason == 0 && g_out_count == 1 &&
           g_out_len == strlen(b) && memcmp(g_out, b, strlen(b)) == 0,
           "resume drops <=marker, emits >marker");
 
     /* 9b. 重复 RESUME 幂等；旧 marker 不应丢弃 >marker 的新写 */
     send_resume(10);
-    poll_once(1);
+    poll_once();
     CHECK(g_fault_reason == 0 && g_out_count == 1 && g_out_len == strlen(b),
           "duplicate RESUME is idempotent");
+    proxy_commit_set_buffering(0, 1);
     feed(3001, 3, c);
     send_desc(3001, 3, 12, (const unsigned char *)c, strlen(c), REPL_COMMIT_FLAG_WRITE, 0, 0);
-    poll_once(1);
+    poll_once();
     send_resume(10);   /* 旧 marker */
-    poll_once(1);
+    poll_once();
     CHECK(g_fault_reason == 0 && g_out_count == 2 &&
           memcmp(g_out + strlen(b), c, strlen(c)) == 0,
           "stale RESUME keeps newer writes");
@@ -290,24 +322,24 @@ int main(void) {
     proxy_commit_purge();
     g_msg_epoch = 0xE1;
     send_baseline(6001, 1);
-    poll_once(0);
-    poll_once(1);
+    poll_once();
+    proxy_commit_set_buffering(0, 1);
     feed(6001, 1, a);
     g_msg_epoch = 0xE2;
     send_desc(6001, 1, 20, (const unsigned char *)a, strlen(a), REPL_COMMIT_FLAG_WRITE, 0, 0);
-    poll_once(1);
+    poll_once();
     CHECK(g_fault_reason == 0, "stale epoch BATCH ignored");
     g_msg_epoch = 0xE1;
     send_desc(6001, 1, 20, (const unsigned char *)a, strlen(a), REPL_COMMIT_FLAG_WRITE, 0, 0);
-    poll_once(1);
+    poll_once();
     CHECK(g_fault_reason == 0 && g_out_count == 0, "current epoch BATCH buffered");
     g_msg_epoch = 0xE2;
     send_resume(19);
-    poll_once(1);
+    poll_once();
     CHECK(g_fault_reason == 0 && g_out_count == 0, "stale epoch RESUME ignored");
     g_msg_epoch = 0xE1;
     send_resume(19);
-    poll_once(1);
+    poll_once();
     CHECK(g_fault_reason == 0 && g_out_count == 1 &&
           g_out_len == strlen(a) && memcmp(g_out, a, strlen(a)) == 0,
           "current epoch RESUME drains recovery");
@@ -317,23 +349,25 @@ int main(void) {
     reset_out();
     proxy_commit_purge();
     send_baseline(7001, 1);
-    poll_once(0);
+    poll_once();
     feed(7001, 1, a);
     g_fail_emit = 1;
     send_desc(7001, 1, 30, (const unsigned char *)a, strlen(a), REPL_COMMIT_FLAG_WRITE, 0, 0);
-    poll_once(0);
+    poll_once();
     g_fail_emit = 0;
     CHECK(g_fault_reason == 1 && g_out_count == 0,
           "emit failure → timeout/fail-closed, nothing delivered");
+    CHECK(g_replica_fault_count >= 1, "emit failure isolates replica");
+    proxy_commit_set_replica(0, 1);   /* 重新注册，继续后续用例 */
 
     /* 9e. BASELINE 之前到达的首批记录必须保留（大 value 首条 record 不能丢） */
     reset_out();
     proxy_commit_purge();
     feed(8001, 1, a);                 /* ringbuf 记录先于 BASELINE 到达 */
     send_baseline(8001, 1);
-    poll_once(0);
+    poll_once();
     send_desc(8001, 1, 40, (const unsigned char *)a, strlen(a), REPL_COMMIT_FLAG_WRITE, 0, 0);
-    poll_once(0);
+    poll_once();
     CHECK(g_fault_reason == 0 && g_out_count == 1 &&
           g_out_len == strlen(a) && memcmp(g_out, a, strlen(a)) == 0,
           "pre-baseline captured bytes preserved");
@@ -342,20 +376,64 @@ int main(void) {
     reset_out();
     proxy_commit_purge();
     send_baseline(4001, 5);
-    poll_once(0);
+    poll_once();
     feed(4001, 1, ping);
     send_desc(4001, 5, 1, (const unsigned char *)ping, strlen(ping), REPL_COMMIT_FLAG_SKIP, 0, 0);
-    poll_once(0);
+    poll_once();
     CHECK(g_fault_reason == 0 && g_out_count == 0, "baseline next_seq=5 aligned");
 
     /* 11. pending 超时（2s） */
     reset_out();
     proxy_commit_purge();
     send_baseline(5001, 1);
-    poll_once(0);
+    poll_once();
     feed(5001, 1, ping);
-    for (int i = 0; i < 2200 && g_fault_reason == 0; ++i) poll_once(0);
+    for (int i = 0; i < 2200 && g_fault_reason == 0; ++i) poll_once();
     CHECK(g_fault_reason == 1, "pending timeout → timeout fault");
+
+    /* 12. 多副本 fan-out：A LIVE 时 B 的 barrier 只缓存 B，不阻塞 A；
+     *     RESUME(slot=1, marker) 只放行 B，重复 RESUME 幂等。 */
+    reset_out();
+    proxy_commit_purge();
+    g_multi_mode = 1;
+    memset(g_rid_count, 0, sizeof(g_rid_count));
+    memset(g_rid_last_seq, 0, sizeof(g_rid_last_seq));
+    proxy_commit_set_replica(0, 1);
+    proxy_commit_set_replica(1, 1);
+    send_baseline(9001, 1);
+    poll_once();
+
+    feed(9001, 1, a);
+    send_desc(9001, 1, 100, (const unsigned char *)a, strlen(a), REPL_COMMIT_FLAG_WRITE, 0, 0);
+    poll_once();
+    CHECK(g_fault_reason == 0 && g_rid_count[0] == 1 && g_rid_count[1] == 1,
+          "fan-out: both replicas receive live write");
+
+    proxy_commit_set_buffering(1, 1);   /* 只有 slot 1 进入恢复 */
+    feed(9001, 2, b);
+    send_desc(9001, 2, 101, (const unsigned char *)b, strlen(b), REPL_COMMIT_FLAG_WRITE, 0, 0);
+    poll_once();
+    CHECK(g_fault_reason == 0 && g_rid_count[0] == 2 && g_rid_count[1] == 1 &&
+          g_rid_last_seq[0] == 101,
+          "replica 1 barrier does not stall replica 0");
+
+    send_resume_id(1, 100);   /* marker 丢弃 <=100，放行 101 */
+    poll_once();
+    CHECK(g_fault_reason == 0 && g_rid_count[1] == 2 && g_rid_last_seq[1] == 101,
+          "RESUME slot=1 releases only replica 1");
+
+    send_resume_id(1, 100);   /* 重复 RESUME 幂等 */
+    poll_once();
+    CHECK(g_fault_reason == 0 && g_rid_count[1] == 2, "duplicate per-slot RESUME idempotent");
+
+    proxy_commit_set_buffering(1, 0);
+    proxy_commit_set_replica(1, 0);
+    feed(9001, 3, c);
+    send_desc(9001, 3, 102, (const unsigned char *)c, strlen(c), REPL_COMMIT_FLAG_WRITE, 0, 0);
+    poll_once();
+    CHECK(g_fault_reason == 0 && g_rid_count[0] == 3 && g_rid_count[1] == 2,
+          "deregistered replica no longer receives");
+    g_multi_mode = 0;
 
     proxy_commit_cleanup();
     if (g_sock >= 0) close(g_sock);
