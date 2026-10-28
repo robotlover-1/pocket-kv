@@ -1,9 +1,10 @@
-# eBPF 增量复制加固（阶段 1 + 2）
+# eBPF 增量复制加固（阶段 1–3）
 
-对应方案：`PocketKV_eBPF保留转发_优化实施方案.md` 的 **阶段 1（确定性 Bug）** 与
-**阶段 2（proxy 故障恢复）**。本阶段保留
-`tcp_recvmsg → ringbuf → ebpf-proxy → Slave` 数据面，只补齐正确性与可恢复性；
-阶段 3（Commit Gate / socket_cookie / Unix commit channel）尚未实现。
+对应方案：`PocketKV_eBPF保留转发_优化实施方案.md`。本文覆盖：
+**阶段 1（确定性 Bug）**、**阶段 2（proxy 故障恢复）**、**阶段 3（Commit Gate）**，
+以及 P1/P2 小项（zRPC busy、proxy cache 水位、SipHash/VSEARCH 指标）。
+数据面保持 `tcp_recvmsg → ringbuf → ebpf-proxy → Slave`；阶段 3 之后只有
+Master post-commit 的写命令会被转发（见第 10 节）。
 
 ---
 
@@ -33,11 +34,14 @@
 | 4 | ringbuf_backpressure | BPF 生产端高水位 (>32MB)，proxy 低水位 (<8MB) 清除 |
 | 5 | heartbeat | proxy 心跳，100ms 递增；2s 不推进视为失活 |
 | 6 | fwdq_backpressure | 转发队列背压 |
-| 7 | capture_disable | **1=停止捕获**（故障恢复/REPLSYNC 追赶期间） |
+| 7 | capture_enable | **1=允许捕获**（默认 0；BASELINE 握手后置 1） |
 | 8 | capture_fault | **1=捕获不可信（截断）**，fail-closed |
 | 9 | proxy_state | **proxy 回执**：0=FORWARDING，1=BUFFERING |
+| 10 | commit_fault | proxy → Master：commit gate 故障原因（1..5） |
+| 11 | cache_backpressure | cache 高水位（>192MB 置位，<128MB 清除） |
 
-BPF fexit 依次检查：pid → `capture_disable` → `capture_fault` → retval。
+BPF fexit 依次检查：pid → `capture_enable==1` → `capture_fault` →
+socket cookie 在 allowlist 中 → retval（按 int 解释）→ 输出 record。
 `retval > CLIENT_ENTRY_MAX_LEN` 时：
 
 ```text
@@ -47,7 +51,7 @@ ST_TRUNCATED++ → client_ctl[8]=1 → 丢弃该 record（不输出截断数据�
 master 健康线程观察到 fault 后：
 
 ```text
-capture_disable=1
+capture_enable=0
 → repl_session_invalidate(CAPTURE_TRUNCATED)
 → shutdown 所有 eBPF 副本控制连接
 → slave 重连 REPLSYNC
@@ -199,7 +203,8 @@ make kvstore ebpf-proxy
 make test_hash_ownership
 make test_vsync_protocol 2>/dev/null || make test_fullsync_protocol
 make check-kvstore
-make check-slave-crash-recovery     # 新增：Slave kill -9 重启恢复
+make check-slave-crash-recovery     # Slave kill -9 重启恢复
+make test_commit_gate               # Commit Gate framing/状态机单元测试
 ```
 
 `check-slave-crash-recovery` 覆盖：
@@ -266,11 +271,85 @@ sudo kill -9 $(cat <dump_path>.ebpfproxy.pid)
 
 - **单 slave 假设**：恢复期 capture gate 是全局的；多副本时一个副本重同步会
   让所有副本共用 BUFFERING 窗口（正确但吞吐下降）。
-- **阶段 3 未做**：capture 仍按"recv 原始字节流"转发，没有 Commit Gate；
-  读命令、失败命令仍会被 eBPF 捕获并转发（方案 §9/§25）。
-- **proxy cache**：仍是单阈值 256MB 淘汰；方案 §20 的 192/128MB 高低水位未做。
+- **Commit Gate 已实现（阶段3）**：见第 10 节；主从复制只转发 Master post-commit
+  的写命令，proxy 按 cookie 重组 RESP 并校验 seq/长度/CRC。
 - **eBPF 截断 fail-closed** 依赖 `repl_capture_active` 的三后端 recv 限流；
-  若绕过网络后端直接 recv（未来新路径），仍需自行限制到 32764。
+  若绕过网络后端直接 recv（未来新路径），仍需自行限制到 32744。
 - **partial sync 仍会尝试 RDMA**：Slave 混合分支在 REPLSYNC 后无条件后台连 RDMA，
   而 Master 对 partial 不会启动 RDMA listener，因此会打印连接失败/超时日志
   （不影响恢复，TCP 数据仍然正确）。后续可按 `+CONTINUE` 响应跳过 RDMA 尝试。
+
+
+---
+
+## 10. 阶段 3：Commit Gate
+
+### 10.1 数据面
+
+```text
+Client → tcp_recvmsg(fexit) → 24B record{cookie, recv_seq, len, flags} → ringbuf
+      → ebpf-proxy（按 cookie 重组 RESP）→ Master 的 WRITE/SKIP 描述符
+      → global_seq 有序队列 → Slave
+```
+
+- BPF 只捕获 **cookie allowlist** 中的客户端连接（accept 时注册、变 replica/关闭时移除），
+  避免副本控制/RDMA listener 等 socket 被捕获；返回码按 int 解释（EAGAIN 不误判）；
+  `recv_seq` 只在实际输出 record 时分配（缺口可检测 capture 丢失）。
+- Master 在每条命令 dispatch 前记录 `command_seq/raw_len/FNV-1a64`；写命令
+  `repl_broadcast` 成功后发布 `WRITE{global_seq}`，其余（读/失败）发布 `SKIP`；
+  批量 64 条经 Unix `SOCK_SEQPACKET` 发往 proxy。
+- proxy 为每条连接维护 RESP framer（复刻 Master client 路径：RESP array、inline、
+  `+` 控制行、空行、畸形头都按同一规则消费），命令 seq 从 BASELINE 开始；
+  descriptor 的 seq/长度/CRC 全部匹配后才进入 `global_seq` 有序队列。
+- 只有同时满足“完整命令 + 已提交 + global_seq 连续”才转发；任何缺口/错位/
+  超时（2s）/通道断开 → `client_ctl[10]` → Master 会话失效 + REPLSYNC。
+
+### 10.2 控制面协议（`<dump>.commit.sock`）
+
+```text
+HELLO{epoch}                 proxy 重置全部连接状态
+BASELINE{cookie,next_seq}    (重新)捕获时的 seq 对齐基准
+IGNORE/FORGET{cookie}        连接变 replica / 关闭
+DESC_BATCH{WRITE|SKIP[]}     每条命令的提交结果
+RESUME{marker}               恢复期结束：丢弃 global_seq<=marker，其余按序放出
+```
+
+### 10.3 恢复期对齐
+
+- 正常 REPLSYNC/fullsync **不再关闭 capture**（否则 framer 会从半包重启）：
+  BUFFERING 期间已提交写进入 recovery 缓冲；Master 在 backlog/快照发送后记录
+  `marker=global_seq`；Slave ACK 追平 / REPLDONE 后发 `RESUME{marker}`：
+  `<=marker` 的提交已由 backlog/快照覆盖而丢弃，`>marker` 的按序转发。
+- proxy 崩溃/重启后：Master 关闭 capture，等待所有 client 到达命令边界
+  （5s 超时则关闭半包连接），发 BASELINE 后再打开 capture；旧 proxy 的
+  framing 状态不参与新会话。
+
+### 10.4 可观测性（INFO）
+
+```text
+repl_commit_active / repl_commit_channel / repl_commit_global_seq
+repl_commit_descriptors / repl_commit_writes / repl_commit_skips
+repl_commit_pending_bytes / repl_commit_timeout / repl_commit_desync /
+repl_commit_gap / repl_commit_recovery_bytes / repl_commit_next_global_seq
+repl_commit_fault_reason
+repl_proxy_cache_over_high / repl_proxy_cache_hard_hit
+hash_lookups/hits/misses/probe_steps/max_chain/slots/entries/rehashing
+vsearch_queries/candidates/returned/total_us/max_us/topk_sum/dim_*
+```
+
+### 10.5 实测
+
+| 场景 | 结果 |
+|---|---|
+| 混合读写 + inline + 半包 + 100 条 pipeline（本地 root eBPF） | HSET/SET/GET 全部正确；`writes=105`、`skips=5`、`global_seq=105`；`gap/desync/timeout/truncated=0`；Slave `applied == master_offset` |
+| kill -9 ebpf-proxy | 1 次会话失效（`COMMIT_CHANNEL`）；proxy 自动重启；Slave REPLSYNC 追平，0 timeout/gap |
+| 单元测试 `test_commit_gate` | RESP/inline/控制行/空行/畸形/半包；CRC/seq/recv_seq 缺口；全局序；BASELINE 重定基；RESUME 丢弃/放行；pending 超时 — 全部 PASS |
+
+### 10.6 部署注意
+
+- `kvstore`、`ebpf-proxy`、`repl_client_capture.bpf.o` 必须**成对升级**（record 格式
+  与 client_ctl 语义已变），并先停掉旧 ebpf-proxy。
+- `<dump_path>.commit.sock` 所在目录需 Master/proxy 可写；手动启动 proxy 时需传
+  `--commit-sock` 与 Master 相同路径。
+- Commit Gate 故障按 fail-closed 处理：当前复制会话失效 + Slave REPLSYNC；
+  proxy 重启后的重新对齐阶段可能短暂关闭 capture（客户端保持连接即可）。
