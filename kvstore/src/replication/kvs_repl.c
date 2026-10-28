@@ -2523,11 +2523,14 @@ unsigned long long repl_session_begin(void) {
               ^ seq;
     } while (sid == 0);
     g_repl_session_id = sid;
+    /* Commit Gate：新 session 内已提交写按 session_id 过滤，并向所有客户端补 BASELINE。 */
+    repl_commit_session_begin(sid);
     return sid;
 }
 
 /* 最后一个 Slave 离开：作废 session（proxy 收到 SESSION_VALID=0 后丢弃其 cache）。 */
 void repl_session_end(void) {
+    repl_commit_session_end();
     g_repl_session_id = 0;
 }
 

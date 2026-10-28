@@ -31,6 +31,8 @@ static void close_conn_uring(conn_t *c) {
 
     if (c->is_replica) repl_remove_slave(c);
 
+    if (repl_commit_active_mode()) repl_commit_forget(c);
+    kvs_conn_unregister(c);
     repl_ebpf_unregister_fd(c->fd);
     close(c->fd);
 
@@ -85,7 +87,10 @@ static int submit_read(struct io_uring *ring, conn_t *c) {
         return -1;
     }
 
-    io_uring_prep_recv(sqe, c->fd, c->inbuf + c->in_len, INBUF_CAP - c->in_len, 0);
+    size_t want = INBUF_CAP - c->in_len;
+    if (repl_ebpf_capture_active() && want > KVS_EBPF_CAPTURE_MAX_RECV)
+        want = KVS_EBPF_CAPTURE_MAX_RECV;   /* 防捕获 BPF 32KB 截断 */
+    io_uring_prep_recv(sqe, c->fd, c->inbuf + c->in_len, want, 0);
     io_uring_sqe_set_data(sqe, req);
     return 0;
 }
@@ -196,6 +201,9 @@ int proactor_start(unsigned short port) {
                     c->inbuf = (unsigned char *)kvs_malloc(INBUF_CAP + OUT_RING_SIZE);
                     c->fd = cfd;
                     c->repl_transport_kind = KVS_REPL_TRANSPORT_TCP;
+                    (void)kvs_socket_cookie(cfd, &c->repl_socket_cookie);
+                    kvs_conn_register(c);
+                    if (repl_commit_active_mode()) repl_commit_baseline(c);
                     set_nonblock(cfd);
                     if (!c->inbuf) {
                         close_conn_uring(c);
@@ -247,6 +255,8 @@ int proactor_start(unsigned short port) {
 
         free_req(req);
         io_uring_cqe_seen(&ring, cqe);
+        (void)repl_commit_rearm_tick();
+        repl_commit_flush();
         persist_flush_pending();
         persist_reap_completions();
         io_uring_submit(&ring);

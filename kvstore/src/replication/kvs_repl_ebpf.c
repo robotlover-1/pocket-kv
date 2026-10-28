@@ -32,6 +32,7 @@ static int g_repl_ebpf_uses_pinned_maps = 0;
 static int g_repl_ebpf_print_initialized = 0;
 static int g_repl_ebpf_backpressure_fd = -1;
 static int g_repl_ebpf_client_stats_fd = -1;   /* proxy 的 client_stats（cache 统计） */
+static int g_repl_ebpf_proxy_stats_fd = -1;    /* proxy 的 proxy_stats（Commit Gate 统计） */
 static int g_repl_ebpf_backpressure_enabled = -1;   /* -1=未初始化, 0=off, 1=on */
 static __u64 g_repl_ebpf_last_hb = 0;
 static long long g_repl_ebpf_last_hb_ms = 0;
@@ -289,6 +290,10 @@ void repl_ebpf_cleanup(void) {
         close(g_repl_ebpf_client_stats_fd);
         g_repl_ebpf_client_stats_fd = -1;
     }
+    if (g_repl_ebpf_proxy_stats_fd >= 0) {
+        close(g_repl_ebpf_proxy_stats_fd);
+        g_repl_ebpf_proxy_stats_fd = -1;
+    }
     repl_ebpf_clear_fds();
 #endif
     g_repl_ebpf_initialized = 0;
@@ -460,7 +465,18 @@ int repl_ebpf_backpressure(void) {
 #define KVS_CSTAT_CACHE_DROP_BYTES 19
 #define KVS_CSTAT_CACHE_MAX_BYTES  20
 #define KVS_CSTAT_CACHE_INVALID    21
-#define KVS_CSTAT_CAPTURE_OFF      8   /* BPF ST_CAP_OFF */
+#define KVS_CSTAT_CAPTURE_OFF      12  /* BPF ST_CAP_OFF（8~11 留给捕获/序号统计） */
+
+/* proxy_stats map 的键位，与 src/ebpf_proxy/main.c 的 PST_* 保持一致。 */
+#define KVS_PST_COMMIT_DESC        7
+#define KVS_PST_COMMIT_WRITES      8
+#define KVS_PST_COMMIT_PENDING     9
+#define KVS_PST_COMMIT_TIMEOUT     10
+#define KVS_PST_COMMIT_DESYNC      11
+#define KVS_PST_COMMIT_GAP         12
+#define KVS_PST_COMMIT_RECOVERY    13
+#define KVS_PST_COMMIT_NEXT_G      14
+#define KVS_PST_COMMIT_CHANNEL     15
 
 int repl_ebpf_proxy_get_stats(kvs_ebpf_proxy_stats_t *stats) {
     if (!stats) return -1;
@@ -503,6 +519,29 @@ int repl_ebpf_proxy_get_stats(kvs_ebpf_proxy_stats_t *stats) {
         __u64 v = 0;
         if (bpf_map_lookup_elem(g_repl_ebpf_client_stats_fd, &koff, &v) == 0)
             stats->capture_off_count = v;
+    }
+    if (g_repl_ebpf_proxy_stats_fd < 0 && g_cfg.ebpf_pin_path[0]) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/proxy_stats", g_cfg.ebpf_pin_path);
+        g_repl_ebpf_proxy_stats_fd = bpf_obj_get(path);
+    }
+    if (g_repl_ebpf_proxy_stats_fd >= 0) {
+        const __u32 keys[9] = { KVS_PST_COMMIT_DESC, KVS_PST_COMMIT_WRITES,
+                                KVS_PST_COMMIT_PENDING, KVS_PST_COMMIT_TIMEOUT,
+                                KVS_PST_COMMIT_DESYNC, KVS_PST_COMMIT_GAP,
+                                KVS_PST_COMMIT_RECOVERY, KVS_PST_COMMIT_NEXT_G,
+                                KVS_PST_COMMIT_CHANNEL };
+        unsigned long long *out[8] = { &stats->commit_descriptors, &stats->commit_writes,
+                                       &stats->commit_pending, &stats->commit_timeout,
+                                       &stats->commit_desync, &stats->commit_gap,
+                                       &stats->commit_recovery_bytes, &stats->commit_next_global };
+        for (int i = 0; i < 9; i++) {
+            __u64 v = 0;
+            if (bpf_map_lookup_elem(g_repl_ebpf_proxy_stats_fd, &keys[i], &v) != 0)
+                continue;
+            if (i < 8) *out[i] = v;
+            else stats->commit_channel_connected = (int)v;
+        }
     }
 #endif
     return 0;

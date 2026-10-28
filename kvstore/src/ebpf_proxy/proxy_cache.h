@@ -12,6 +12,8 @@
 #define PROXY_CACHE_MAX_BYTES  (256UL * 1024 * 1024)
 /* 高水位：只是向上游发背压（让 master 停手等待），继续正常缓存。 */
 #define PROXY_CACHE_HIGH_BYTES (192UL * 1024 * 1024)
+/* 低水位：占用回落到该值以下才解除背压（迟滞，避免高水位附近反复抖动）。 */
+#define PROXY_CACHE_LOW_BYTES  (128UL * 1024 * 1024)
 
 /* cache_append 返回值 */
 #define CACHE_APPEND_OK        0
@@ -32,6 +34,7 @@ typedef struct {
     size_t node_count;
     unsigned long long dropped;        /* 丢弃的节点数（跨 session 作废 / 溢出作废） */
     unsigned long long drop_bytes;     /* 丢弃的字节数 */
+    unsigned long long hard_hit;       /* 达到硬上限的次数（fail-closed 触发） */
     size_t max_bytes;                  /* 峰值占用 */
     int over_high;                     /* 当前是否超高水位（背压去抖用） */
     int invalid;                       /* 本 session cache 已作废（硬上限触发） */

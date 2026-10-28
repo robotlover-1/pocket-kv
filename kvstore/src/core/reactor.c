@@ -7,10 +7,9 @@
 extern void repl_fwd_purge_conn(conn_t *c);
 
 #define MAX_READS_PER_EVENT 16
-/* 单次 recv 上限：对齐捕获 BPF 的 CLIENT_ENTRY_MAX_LEN=32764。若一次 recv 超过 32KB，
- * eBPF 捕获会截断尾部静默丢数据（增量复制丢失）。限制读大小后 BPF 永远捕获完整 recv；
+/* 单次 recv 上限：capture 生效时对齐 BPF 的 CLIENT_ENTRY_MAX_LEN（32764）。若一次 recv
+ * 超过该值，eBPF 捕获会丢数据（增量复制缺口）。限制读大小后 BPF 永远捕获完整 recv；
  * 大 value/大批量仍由多次 recv + parse_resp_stream 跨片拼接处理。 */
-#define MAX_RECV_BYTES 32764
 
 int g_epfd = -1;
 static conn_t *fdmap[65536];
@@ -86,6 +85,8 @@ void close_conn(conn_t *c) {
     /* 从转发线程队列 + 发送状态移除该 conn，避免 free 后转发线程仍解引用 conn_t（UAF）。
      * 必须在 free 之前调用。 */
     repl_fwd_purge_conn(c);
+    if (repl_commit_active_mode()) repl_commit_forget(c);
+    kvs_conn_unregister(c);
 
     repl_ebpf_unregister_fd(c->fd);
     epoll_ctl(g_epfd, EPOLL_CTL_DEL, c->fd, NULL);
@@ -138,6 +139,9 @@ static void on_accept(conn_t *lc) {
 
         c->fd = cfd;
         c->repl_transport_kind = KVS_REPL_TRANSPORT_TCP;
+        (void)kvs_socket_cookie(cfd, &c->repl_socket_cookie);
+        kvs_conn_register(c);
+        if (repl_commit_active_mode()) repl_commit_baseline(c);
         fdmap[cfd] = c;
 
         struct epoll_event ev;
@@ -169,7 +173,8 @@ static void on_read(conn_t *c) {
         }
 
         size_t want = INBUF_CAP - c->in_len;
-        if (want > MAX_RECV_BYTES) want = MAX_RECV_BYTES;   /* 防捕获 BPF 32KB 截断 */
+        if (repl_ebpf_capture_active() && want > KVS_EBPF_CAPTURE_MAX_RECV)
+            want = KVS_EBPF_CAPTURE_MAX_RECV;   /* 防捕获 BPF 32KB 截断 */
         ssize_t n = recv(c->fd, c->inbuf + c->in_len, want, 0);
         if (likely(n > 0)) {
             c->in_len += (size_t)n;
@@ -386,6 +391,11 @@ int reactor_start(void) {
                 on_write(c);
             }
         }
+
+        /* Commit Gate：proxy 重连后等命令边界→BASELINE→重开 capture；
+         * 同时发送本批 commit 描述符。 */
+        (void)repl_commit_rearm_tick();
+        repl_commit_flush();
 
         /* group-commit: flush + reap any completed batches */
         persist_flush_pending();

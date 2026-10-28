@@ -23,7 +23,11 @@ enum bpf_link_type;
 
 #include "proxy_cache.h"
 #include "proxy_slave.h"
+#include "proxy_commit.h"
 #include "kvstore/replication/client_ctl.h"
+
+/* Commit Gate 捕获记录头：cookie(8) + recv_seq(8) + payload_len(4) + flags(4) */
+#define CAPTURE_RECORD_HDR_SZ 24
 
 /* ---- 状态 ---- */
 typedef enum {
@@ -48,6 +52,42 @@ static int g_session_valid = 0;
 static int g_cache_invalid_remote = 0;   /* client_ctl[10] 的本地影子 */
 /* 上一次处理过的 client_ctl[3] 值：屏障按边沿应答，避免重复清 cache / 漏应答 */
 static __u64 g_fs_req_seen = 0;
+
+/* ---- Commit Gate ---- */
+#define CLIENT_CTL_KEY_CAPTURE_ENABLE  KVS_CTL_CAPTURE_ENABLE
+#define CLIENT_CTL_KEY_CAPTURE_FAULT   KVS_CTL_CAPTURE_FAULT
+#define CLIENT_CTL_KEY_COMMIT_FAULT    KVS_CTL_COMMIT_FAULT
+
+/* proxy_stats 键（与 repl_client_capture.bpf.c 的 map 定义对应） */
+#define PST_FORWARDED_BYTES  0
+#define PST_ENQUEUED_BYTES   1
+#define PST_FWDQ_BYTES       2
+#define PST_CACHE_BYTES      3
+#define PST_DROPPED_BYTES    4
+#define PST_RECONNECTS       5
+#define PST_CAPTURE_DROP     6
+#define PST_COMMIT_DESC      7
+#define PST_COMMIT_WRITES    8
+#define PST_COMMIT_PENDING   9
+#define PST_COMMIT_TIMEOUT   10
+#define PST_COMMIT_DESYNC    11
+#define PST_COMMIT_GAP       12
+#define PST_COMMIT_RECOVERY  13
+#define PST_COMMIT_NEXT_G    14
+#define PST_COMMIT_CHANNEL   15
+#define PST_CACHE_OVER_HIGH  16
+#define PST_CACHE_HARD_HIT   17
+
+/* capture gate：drop=1 时丢弃所有 ringbuf/队列/缓存中的增量数据，
+ * 等 Master 完成 REPLSYNC 后重新打开，避免残缺命令进入 slave。 */
+static volatile int g_capture_drop = 0;
+static unsigned long long g_dropped_bytes = 0;
+static unsigned long long g_slave_reconnects = 0;
+static volatile int g_commit_fault_code = 0;
+static int g_commit_fault_handled = 0;
+
+static void proxy_stats_update(void);
+static void commit_fault_cb(int reason);
 
 /* ---- 跨线程安全 ----
  * g_state 用 g_state_lock 保护（主线程 set_state 写、转发线程 proxy_fwd_send_one
@@ -491,6 +531,7 @@ static void *heartbeat_thread_main(void *arg) {
     while (!g_shutdown) {
         hb++;
         write_client_ctl_u64(CLIENT_CTL_KEY_HEARTBEAT, hb);
+        proxy_stats_update();
         usleep(100000);   /* 100ms 一跳，远低于 master 的 2s 过期窗口 */
     }
     return NULL;
@@ -543,6 +584,7 @@ static void heartbeat_start(void) {
 /* BPF map fds（g_client_ctl_fd 前向声明在上方，供心跳线程使用） */
 static int g_proxy_cfg_fd = -1;
 static int g_client_stats_fd = -1;
+static int g_proxy_stats_fd = -1;
 
 /* ringbuf */
 static struct bpf_object *g_bpf_obj = NULL;
@@ -556,6 +598,11 @@ static char g_pin_path[256] = "/sys/fs/bpf/kvstore_repl_sockmap";
 static char g_obj_path[256] = "build/replication/bpf/repl_client_capture.bpf.o";
 static int g_master_pid = 0;
 static int g_master_port = 0;
+/* Master spawn 时通过 argv 直接传入，省去 proxy_cfg 轮询（重启后也不会读到旧 pin）。 */
+static int g_master_pid_arg = 0;
+static int g_master_port_arg = 0;
+static char g_pid_file[256] = {0};
+static char g_commit_sock_path[512] = {0};
 static unsigned int g_slave_ip = 0;
 static int g_slave_port = 0;
 
@@ -563,22 +610,6 @@ static int g_slave_port = 0;
 static void signal_handler(int sig) {
     (void)sig;
     g_shutdown = 1;
-}
-
-/* 快速判断 payload 是否为复制控制命令（REPLSYNC/REPLACK/REPLDONE）。
- * 正常 RESP 命令以 '*'/'$'/':'/'+'/'-' 开头，首字节快速拒绝。 */
-static int is_repl_control_payload(const unsigned char *payload, size_t plen) {
-    if (plen < 7 || payload[0] != 'R')
-        return 0;
-
-    if (plen >= 8 && memcmp(payload, "REPLSYNC", 8) == 0)
-        return 1;
-    if (memcmp(payload, "REPLACK", 7) == 0)
-        return 1;
-    if (plen >= 8 && memcmp(payload, "REPLDONE", 8) == 0)
-        return 1;
-
-    return 0;
 }
 
 /* ---- 辅助函数 ---- */
@@ -608,6 +639,72 @@ static int write_client_ctl_u64(__u32 key, __u64 val) {
     return bpf_map_update_elem(g_client_ctl_fd, &key, &val, BPF_ANY);
 }
 
+/* ---- proxy_stats（Master INFO 读取） ---- */
+static void write_proxy_stat_u64(__u32 key, __u64 val) {
+    if (g_proxy_stats_fd < 0) return;
+    bpf_map_update_elem(g_proxy_stats_fd, &key, &val, BPF_ANY);
+}
+
+static void proxy_stats_update(void) {
+    if (g_proxy_stats_fd < 0) return;
+    write_proxy_stat_u64(PST_FORWARDED_BYTES,
+        __atomic_load_n(&g_sent_bytes, __ATOMIC_RELAXED));
+    write_proxy_stat_u64(PST_ENQUEUED_BYTES,
+        __atomic_load_n(&g_enq_bytes, __ATOMIC_RELAXED));
+    /* 心跳线程不能阻塞：cache_flush 在慢 slave 上会长时间持锁，
+     * trylock 失败时本次跳过，避免 master 误判 proxy 失活。 */
+    if (pthread_mutex_trylock(&g_pfwd_lock) == 0) {
+        write_proxy_stat_u64(PST_FWDQ_BYTES, (__u64)g_pfwd_bytes);
+        pthread_mutex_unlock(&g_pfwd_lock);
+    }
+    if (pthread_mutex_trylock(&g_cache_lock) == 0) {
+        write_proxy_stat_u64(PST_CACHE_BYTES, (__u64)g_cache.total_bytes);
+        write_proxy_stat_u64(PST_CACHE_OVER_HIGH, (__u64)(g_cache.over_high ? 1 : 0));
+        write_proxy_stat_u64(PST_CACHE_HARD_HIT, g_cache.hard_hit);
+        pthread_mutex_unlock(&g_cache_lock);
+    }
+    write_proxy_stat_u64(PST_DROPPED_BYTES, (__u64)g_dropped_bytes);
+    write_proxy_stat_u64(PST_RECONNECTS, (__u64)g_slave_reconnects);
+    write_proxy_stat_u64(PST_CAPTURE_DROP, (__u64)(g_capture_drop ? 1 : 0));
+
+    proxy_commit_stats_t cs;
+    proxy_commit_get_stats(&cs);
+    write_proxy_stat_u64(PST_COMMIT_DESC, (__u64)cs.descriptors);
+    write_proxy_stat_u64(PST_COMMIT_WRITES, (__u64)cs.writes);
+    write_proxy_stat_u64(PST_COMMIT_PENDING, (__u64)cs.pending);
+    write_proxy_stat_u64(PST_COMMIT_TIMEOUT, (__u64)cs.timeout);
+    write_proxy_stat_u64(PST_COMMIT_DESYNC, (__u64)cs.desync);
+    write_proxy_stat_u64(PST_COMMIT_GAP, (__u64)cs.gap);
+    write_proxy_stat_u64(PST_COMMIT_RECOVERY, (__u64)cs.recovery_bytes);
+    write_proxy_stat_u64(PST_COMMIT_NEXT_G, cs.next_global_seq);
+    write_proxy_stat_u64(PST_COMMIT_CHANNEL, (__u64)(cs.channel_connected ? 1 : 0));
+}
+
+/* ---- Commit Gate：已提交命令的落地 + 故障回调 ---- */
+static void commit_emit(const unsigned char *buf, size_t len) {
+    if (g_capture_drop) { g_dropped_bytes += len; return; }
+    if (g_state == STATE_BUFFERING) {
+        if (cache_enq_wrap(buf, len) == -2) commit_fault_cb(5);
+        return;
+    }
+    if (proxy_slave_is_connected(&g_slave)) {
+        proxy_fwd_enqueue(buf, len);
+        return;
+    }
+    /* 无 slave：不缓存，Master 的 backlog 会在重连/REPLSYNC 后补齐 */
+    g_dropped_bytes += len;
+}
+
+static void commit_fault_cb(int reason) {
+    if (g_shutdown) return;   /* 退出阶段通道 EOF 不算故障 */
+    g_commit_fault_code = reason;
+    g_capture_drop = 1;
+    set_state(STATE_BUFFERING);
+    write_client_ctl_u64(CLIENT_CTL_KEY_COMMIT_FAULT, (__u64)reason);
+    proxy_slave_disconnect(&g_slave);
+    fprintf(stderr, "ebpf-proxy: commit gate fault reason=%d\n", reason);
+}
+
 /* 轮询等待 proxy_cfg["master_pid"] 非零 */
 static int wait_for_master_pid(int timeout_ms) {
     __u64 val = 0;
@@ -633,42 +730,86 @@ static int read_slave_addr(void) {
     return (g_slave_ip != 0 && g_slave_port > 0) ? 0 : -1;
 }
 
-/* ---- ringbuf 回调 ---- */
+/* ---- capture gate ----
+ * Master 在故障恢复（proxy 心跳过期 / BPF 截断 / REPLSYNC 追赶）期间关闭 capture。
+ * proxy 收到后必须立刻停止把已捕获的增量送往 slave，并清空 ringbuf/转发队列/cache
+ * —— 这些数据与 Master 即将通过 REPLSYNC backlog 重发的区间重叠或存在缺口，
+ * 继续下送会造成重复/乱序。 */
+static void proxy_capture_drop_pending(void) {
+    set_state(STATE_BUFFERING);   /* 等当前 writev 批次结束，阻止新批次 */
+    g_capture_drop = 1;
+
+    /* 排空 ringbuf 并丢弃（回调此时直接 return） */
+    if (g_rb) {
+        for (int i = 0; i < 128; ++i) {
+            int n = ring_buffer__consume(g_rb);
+            if (n <= 0) break;
+        }
+    }
+
+    /* 丢弃尚未发送的转发队列 */
+    pthread_mutex_lock(&g_pfwd_lock);
+    size_t qbytes = g_pfwd_bytes;
+    pthread_mutex_unlock(&g_pfwd_lock);
+    g_dropped_bytes += (unsigned long long)qbytes;
+    proxy_fwd_drain_to_cache_or_discard();
+
+    /* 丢弃 fullsync/慢路径缓存 */
+    pthread_mutex_lock(&g_cache_lock);
+    g_dropped_bytes += (unsigned long long)g_cache.total_bytes;
+    cache_destroy(&g_cache);
+    cache_init(&g_cache);
+    pthread_mutex_unlock(&g_cache_lock);
+
+    /* 断开 slave 数据连接：REPLSYNC 后由 Master 重新写 slave_addr，proxy 重连 */
+    proxy_slave_disconnect(&g_slave);
+
+    /* Commit Gate：丢弃所有 per-cookie framing/pending/recovery 状态；
+     * 重新打开时 Master 会先发 BASELINE 再 enable capture。 */
+    proxy_commit_purge();
+
+    fprintf(stderr, "ebpf-proxy: capture gate closed, dropped %zu queued bytes\n", qbytes);
+}
+
+static void proxy_capture_resume(void) {
+    g_capture_drop = 0;
+    g_commit_fault_code = 0;
+    g_commit_fault_handled = 0;
+    /* 不在这里置 FORWARDING：恢复期 client_ctl[3] 仍为 1（BUFFERING），
+     * 必须继续缓存增量，等 Master 在 ACK 追平/REPLDONE 后写 3=0 再 flush。 */
+    fprintf(stderr, "ebpf-proxy: capture gate reopened\n");
+}
+
+/* capture gate：Master 写 client_ctl[7]=1 才捕获；[13]=1 表示截断/不可信。 */
+static void proxy_capture_gate_poll(void) {
+    __u64 gate_en = 0, gate_fault = 0;
+    read_client_ctl_u64(CLIENT_CTL_KEY_CAPTURE_ENABLE, &gate_en);
+    read_client_ctl_u64(CLIENT_CTL_KEY_CAPTURE_FAULT, &gate_fault);
+    int want_drop = (gate_en != 1 || gate_fault != 0);
+    if (want_drop && !g_capture_drop)
+        proxy_capture_drop_pending();
+    else if (!want_drop && g_capture_drop)
+        proxy_capture_resume();
+}
+
+/* ---- ringbuf 回调：解析 Commit Gate 记录头，交给 commit 模块 ---- */
 static int ringbuf_callback(void *ctx, void *data, size_t len) {
     (void)ctx;
-    if (len < 4) return 0;
+    if (g_capture_drop) return 0;
+    if (len < CAPTURE_RECORD_HDR_SZ) return 0;
 
-    __u32 payload_len;
-    memcpy(&payload_len, data, 4);
-    unsigned char *payload = (unsigned char *)data + 4;
-    size_t plen = (size_t)payload_len;
+    const unsigned char *p = (const unsigned char *)data;
+    uint64_t cookie, recv_seq;
+    uint32_t payload_len, flags;
+    memcpy(&cookie, p, 8);
+    memcpy(&recv_seq, p + 8, 8);
+    memcpy(&payload_len, p + 16, 4);
+    memcpy(&flags, p + 20, 4);
+    (void)flags;
+    if (payload_len == 0 || CAPTURE_RECORD_HDR_SZ + payload_len > len) return 0;
 
-    if (payload_len == 0xFFFFFFFF) {
-        /* magic flush signal: REPLDONE，切回 FORWARDING 并请求 fwd 线程刷 cache。
-         * 主线程不直接写 slave fd（fwd 线程是唯一 writer，避免并发写竞态）。 */
-        fprintf(stderr, "ebpf-proxy: REPLDONE detected, requesting cache flush...\n");
-        set_state(STATE_FORWARDING);
-        request_cache_flush();
-        return 0;
-    }
-
-    /* 过滤 slave→master 复制控制命令，防止回传 slave */
-    if (is_repl_control_payload(payload, plen)) {
-        return 0;
-    }
-
-    /* payload 指针只在回调期间有效，此处拷贝到稳定存储：
-     * FORWARDING → 转发队列（转发线程负责 writev）；
-     * 超大 payload → heap cache 慢路径；BUFFERING → cache 等 fullsync 结束 flush。 */
-    if (g_state == STATE_FORWARDING && proxy_slave_is_connected(&g_slave)) {
-        if (plen > PFWD_LARGE_SZ) {
-            cache_enq_wrap(payload, plen);   /* 超大 payload：走 heap cache 慢路径 */
-        } else {
-            proxy_fwd_enqueue(payload, plen);
-        }
-    } else {
-        cache_enq_wrap(payload, plen);
-    }
+    proxy_commit_on_record(cookie, recv_seq,
+                           p + CAPTURE_RECORD_HDR_SZ, payload_len);
     return 0;
 }
 
@@ -723,6 +864,19 @@ static void poll_session_state(void) {
 static void main_loop(void) {
     unsigned int stats_tick = 0;
     while (!g_shutdown) {
+        /* Commit Gate 控制面必须先于 ringbuf 处理：BASELINE/IGNORE 决定
+         * 新捕获记录按哪条连接/从哪个 seq 开始重组；若先处理 ringbuf，
+         * replica 连接的 REPLSYNC 记录会在 IGNORE 到达前被当成客户端命令。 */
+        proxy_commit_poll(g_state == STATE_BUFFERING);
+        if (g_commit_fault_code && !g_commit_fault_handled) {
+            proxy_capture_drop_pending();
+            g_commit_fault_handled = 1;
+        }
+        if (proxy_commit_take_resume_event() && g_state == STATE_FORWARDING)
+            request_cache_flush();
+
+        proxy_capture_gate_poll();
+
         /* capture BPF 用 BPF_RB_NO_WAKEUP（省每 recv 的 self-IPI，占 master CPU2 25-27%）：
          * producer 不发 eventfd 信号，ring_buffer__poll 只当 sleep（超时返回），
          * 必须用 ring_buffer__consume 主动处理缓冲里已有的记录。
@@ -835,6 +989,7 @@ static void main_loop(void) {
                 /* 指数退避 */
                 for (int attempt = 1; !g_shutdown; attempt++) {
                     if (proxy_slave_connect(&g_slave) == 0) {
+                        g_slave_reconnects++;
                         /* 数据通道重连成功：只有控制面确认仍是同一个有效 session 时才允许
                          * 刷残留 cache（§8.1/§9）；否则那是上个 session 的残余，必须丢弃。
                          * 控制连接也断了（SESSION_BROKEN）时 cache 早已被 poll_session_state
@@ -854,10 +1009,20 @@ static void main_loop(void) {
                     if (delay > 5000) delay = 5000;
                     fprintf(stderr, "ebpf-proxy: reconnect attempt %d, "
                             "sleeping %ums\n", attempt, delay);
-                    /* 在退避期间继续 poll ringbuf，防止 ringbuf 满丢数据 */
+                    /* 在退避期间继续 poll ringbuf，并处理 Master 控制面：
+                     * 否则 REPLSYNC 期间 proxy 连不上 slave 会阻塞数秒，
+                     * 无法回执 BUFFERING，Master 会超时失效会话。 */
                     int poll_iters = (int)(delay / 5);
                     for (int i = 0; i < poll_iters && !g_shutdown; i++) {
+                        proxy_commit_poll(g_state == STATE_BUFFERING);
+                        proxy_capture_gate_poll();
                         ring_buffer__poll(g_rb, 5);
+                        if (g_commit_fault_code && !g_commit_fault_handled) {
+                            proxy_capture_drop_pending();
+                            g_commit_fault_handled = 1;
+                        }
+                        if (proxy_commit_take_resume_event() && g_state == STATE_FORWARDING)
+                            request_cache_flush();
                     }
                     g_slave.backoff_ms *= 2;
                     if (g_slave.backoff_ms > g_slave.backoff_max_ms)
@@ -874,6 +1039,8 @@ static void main_loop(void) {
 /* 退出清理 */
 static void cleanup(void) {
     fprintf(stderr, "ebpf-proxy: shutting down...\n");
+
+    proxy_commit_cleanup();
 
     /* 0. 先 detach fexit — 停止新数据进入 ringbuf */
     if (g_fexit_link) { bpf_link__destroy(g_fexit_link); g_fexit_link = NULL; }
@@ -911,6 +1078,8 @@ static void cleanup(void) {
     if (g_client_ctl_fd >= 0) { close(g_client_ctl_fd); g_client_ctl_fd = -1; }
     if (g_proxy_cfg_fd >= 0) { close(g_proxy_cfg_fd); g_proxy_cfg_fd = -1; }
     if (g_client_stats_fd >= 0) { close(g_client_stats_fd); g_client_stats_fd = -1; }
+    if (g_proxy_stats_fd >= 0) { close(g_proxy_stats_fd); g_proxy_stats_fd = -1; }
+    if (g_pid_file[0]) unlink(g_pid_file);
 
     fprintf(stderr, "ebpf-proxy: cleanup complete\n");
 }
@@ -954,6 +1123,8 @@ static int load_and_attach_bpf(void) {
         fprintf(stderr, "ebpf-proxy: open proxy_cfg failed\n");
     if (open_pinned_map("client_stats", &g_client_stats_fd) != 0)
         fprintf(stderr, "ebpf-proxy: open client_stats failed\n");
+    if (open_pinned_map("proxy_stats", &g_proxy_stats_fd) != 0)
+        fprintf(stderr, "ebpf-proxy: open proxy_stats failed\n");
 
     /* attach fexit（fexit-only：ctx[5] 取返回值，无 fentry） */
     prog = bpf_object__find_program_by_name(g_bpf_obj, "fexit_tcp_recvmsg");
@@ -982,6 +1153,10 @@ static void usage(const char *prog) {
         "Usage: %s [options]\n"
         "  --pin-path PATH   BPF map pin path (default: /sys/fs/bpf/kvstore_repl_sockmap)\n"
         "  --obj-path PATH   BPF object path (default: build/replication/bpf/repl_client_capture.bpf.o)\n"
+        "  --master-pid PID  Master pid (skip proxy_cfg polling)\n"
+        "  --master-port P   Master port\n"
+        "  --pid-file PATH   Write own pid (for Master restart handling)\n"
+        "  --commit-sock P   Commit Gate Unix socket path (passed by Master spawn)\n"
         "  --help            Show this help\n",
         prog);
 }
@@ -995,6 +1170,14 @@ static int parse_args(int argc, char **argv) {
             snprintf(g_pin_path, sizeof(g_pin_path), "%s", argv[++i]);
         } else if (!strcmp(argv[i], "--obj-path") && i + 1 < argc) {
             snprintf(g_obj_path, sizeof(g_obj_path), "%s", argv[++i]);
+        } else if (!strcmp(argv[i], "--master-pid") && i + 1 < argc) {
+            g_master_pid_arg = (int)strtol(argv[++i], NULL, 10);
+        } else if (!strcmp(argv[i], "--master-port") && i + 1 < argc) {
+            g_master_port_arg = (int)strtol(argv[++i], NULL, 10);
+        } else if (!strcmp(argv[i], "--pid-file") && i + 1 < argc) {
+            snprintf(g_pid_file, sizeof(g_pid_file), "%s", argv[++i]);
+        } else if (!strcmp(argv[i], "--commit-sock") && i + 1 < argc) {
+            snprintf(g_commit_sock_path, sizeof(g_commit_sock_path), "%s", argv[++i]);
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             usage(argv[0]); return 1;
@@ -1003,9 +1186,23 @@ static int parse_args(int argc, char **argv) {
     return 0;
 }
 
+static void write_pid_file(void) {
+    if (!g_pid_file[0]) return;
+    FILE *f = fopen(g_pid_file, "w");
+    if (!f) {
+        fprintf(stderr, "ebpf-proxy: write pid file %s failed: %s\n",
+                g_pid_file, strerror(errno));
+        return;
+    }
+    fprintf(f, "%d\n", (int)getpid());
+    fclose(f);
+}
+
 int main(int argc, char **argv) {
     int rc = parse_args(argc, argv);
     if (rc != 0) return rc;
+
+    write_pid_file();
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
@@ -1026,18 +1223,31 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* 等待 master 写配置（持续重试，master 可能后启动） */
-    fprintf(stderr, "ebpf-proxy: waiting for master config...\n");
-    if (wait_for_master_pid(300000) != 0) {
-        fprintf(stderr, "ebpf-proxy: timeout waiting for master pid\n");
-        cleanup();
-        return 1;
+    /* Commit Gate listener 必须在 client_ctl 等 map pin 之后才 bind：
+     * Master 一旦 connect 就会写 capture_enable=1；若 map 尚未 pin/随后被
+     * unlink+repin，arm 会写进旧 map，BPF 永远收不到 enable。 */
+    if (proxy_commit_init(g_commit_sock_path[0] ? g_commit_sock_path : "./kvstore.commit.sock",
+                          commit_emit, commit_fault_cb) != 0) {
+        fprintf(stderr, "ebpf-proxy: commit listener init failed (Commit Gate disabled)\n");
     }
 
-    /* 读 master port */
-    __u64 port_val = 0;
-    if (read_proxy_cfg_u64("master_port", &port_val) == 0) {
-        g_master_port = (int)port_val;
+    /* master 由 Master spawn 时通过 argv 直接给出；手动启动才回退到 proxy_cfg 轮询 */
+    if (g_master_pid_arg > 0) {
+        g_master_pid = g_master_pid_arg;
+        g_master_port = g_master_port_arg;
+        fprintf(stderr, "ebpf-proxy: master config from argv (pid=%d port=%d)\n",
+                g_master_pid, g_master_port);
+    } else {
+        fprintf(stderr, "ebpf-proxy: waiting for master config...\n");
+        if (wait_for_master_pid(300000) != 0) {
+            fprintf(stderr, "ebpf-proxy: timeout waiting for master pid\n");
+            cleanup();
+            return 1;
+        }
+        __u64 port_val = 0;
+        if (read_proxy_cfg_u64("master_port", &port_val) == 0) {
+            g_master_port = (int)port_val;
+        }
     }
 
     /* 写 client_ctl（BPF kprobe 需要） */

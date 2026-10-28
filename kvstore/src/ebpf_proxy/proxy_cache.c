@@ -42,6 +42,7 @@ int cache_append(cache_ctx_t *ctx, const unsigned char *data, size_t len,
                 (unsigned long long)session_id);
         cache_clear(ctx);
         ctx->invalid = 1;
+        ctx->hard_hit++;
         return CACHE_APPEND_FULL;
     }
 
@@ -62,7 +63,10 @@ int cache_append(cache_ctx_t *ctx, const unsigned char *data, size_t len,
     ctx->total_bytes += len;
     ctx->node_count++;
     if (ctx->total_bytes > ctx->max_bytes) ctx->max_bytes = ctx->total_bytes;
-    if (ctx->total_bytes > PROXY_CACHE_HIGH_BYTES) ctx->over_high = 1;
+    if (!ctx->over_high && ctx->total_bytes >= PROXY_CACHE_HIGH_BYTES)
+        ctx->over_high = 1;
+    else if (ctx->over_high && ctx->total_bytes <= PROXY_CACHE_LOW_BYTES)
+        ctx->over_high = 0;
     return CACHE_APPEND_OK;
 }
 
@@ -151,7 +155,7 @@ int cache_flush(cache_ctx_t *ctx, int fd, uint64_t session_id) {
         ctx->total_bytes = 0;
         ctx->node_count = 0;
         ctx->over_high = 0;
-    } else if (ctx->total_bytes <= PROXY_CACHE_HIGH_BYTES) {
+    } else if (ctx->total_bytes <= PROXY_CACHE_LOW_BYTES) {
         ctx->over_high = 0;
     }
     return sent;

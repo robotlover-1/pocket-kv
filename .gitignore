@@ -37,6 +37,8 @@ kvstore.pid
 /kvstore/test_batch
 /kvstore/test_repl_gap
 /kvstore/tests/test_fullsync_protocol
+/kvstore/tests/test_commit_gate
+/kvstore/tests/test_hash_ownership
 /kvstore/tests/test_vsearch_runtime
 /kvstore/tests/test_repl_5w5w
 /kvstore/tools/ebpf/repl_ebpf_daemon

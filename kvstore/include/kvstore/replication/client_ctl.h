@@ -21,6 +21,8 @@ enum {
     KVS_CTL_CACHE_INVALID         = 10, /* master 写 1 表示旧 cache 作废；proxy 溢出时也置位 */
     KVS_CTL_CACHE_BACKPRESSURE    = 11, /* proxy 写：proxy_cache 超高水位 */
     KVS_CTL_PROXY_STATE           = 12, /* proxy 写：1=BUFFERING（master 等待全量边界确认） */
+    KVS_CTL_CAPTURE_FAULT         = 13, /* BPF 写：1=捕获截断/不可信，需 fail-closed */
+    KVS_CTL_COMMIT_FAULT          = 14, /* proxy 写：Commit Gate 故障原因（1=timeout 2=desync 3=gap 4=channel 5=cache_full） */
     KVS_CTL_KEY_MAX               = 16, /* 与 BPF client_ctl map max_entries 一致 */
 };
 
