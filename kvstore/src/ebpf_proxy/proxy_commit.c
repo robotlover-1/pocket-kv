@@ -519,10 +519,6 @@ void proxy_commit_on_record(uint64_t cookie, uint64_t recv_seq,
     }
     if (len) memcpy(ctx->buf + ctx->buf_len, payload, len);
     ctx->buf_len += len;
-    if (len > 4096)
-        fprintf(stderr, "[commit] record cookie=%llu seq=%llu len=%zu baseline=%d buf=%zu\n",
-                (unsigned long long)cookie, (unsigned long long)recv_seq, len,
-                ctx->baseline_set, ctx->buf_len);
 
     if (ctx->baseline_set) pc_frame_ctx(ctx);
     else pc_try_match(ctx);   /* 可能已有缓存的描述符 */

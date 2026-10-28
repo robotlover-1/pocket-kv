@@ -828,8 +828,6 @@ static int ringbuf_callback(void *ctx, void *data, size_t len) {
         g_capture_drop = 0;
         fprintf(stderr, "ebpf-proxy: capture gate opened mid-consume — accepting record\n");
     }
-    if (len > 30000)
-        fprintf(stderr, "[commit] ringbuf record len=%zu\n", len);
     if (len < CAPTURE_RECORD_HDR_SZ) return 0;
 
     const unsigned char *p = (const unsigned char *)data;
