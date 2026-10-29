@@ -3,7 +3,7 @@
 RV-01 回归：fullsync 本地持久化失败/崩溃必须 fail-closed，不得发送 REPLDONE。
 
 对 fullsync=tcp（不需要 RDMA）逐点注入：
-  FAIL_STEP:  fsync / replay / rename / patch / rebase / state
+  FAIL_STEP:  fsync / replay / rename / patch / rebase / state / state-write
   CRASH_STEP: after_marker / after_rename / after_rebase
 
 每个 case：
@@ -22,7 +22,7 @@ import sys
 import time
 from pathlib import Path
 
-FAIL_STEPS = ["fsync", "replay", "rename", "patch", "rebase", "state"]
+FAIL_STEPS = ["fsync", "replay", "rename", "patch", "rebase", "state", "state-write"]
 FAIL_LABELS = {
     "fsync": "fsync (injected)",
     "replay": "replay (injected)",
@@ -30,6 +30,9 @@ FAIL_LABELS = {
     "patch": "patch aof_offset (injected)",
     "rebase": "aof rebase (injected)",
     "state": "save replstate",
+    # state-write 在 repl_slave_state_write() 内部注入 ENOSPC，覆盖“commit 前
+    # 检查通过、真正写/replace replstate 时失败”的路径。
+    "state-write": "save replstate",
 }
 CRASH_STEPS = ["after_marker", "after_rename", "after_rebase"]
 
@@ -288,6 +291,76 @@ def run_case(bin_path, base_port, count, mode, step):
                     print("\n".join(p.read_text(errors="ignore").splitlines()[-20:]))
 
 
+def run_aof_disabled_case(bin_path, base_port, count):
+    """Slave 以 --aof-disable 部署：fullsync 必须按“仅 dump”语义完成，
+    且重启后从 dump 恢复全部 key（不回放 AOF、不残留 pending marker）。"""
+    wd = Path("/tmp/kvs-fs-aof-disabled")
+    shutil.rmtree(wd, ignore_errors=True)
+    wd.mkdir(parents=True, exist_ok=True)
+    mport = base_port
+    sport = base_port + 2
+    mlog = open(wd / "master.log", "wb")
+    slog = open(wd / "slave.log", "wb")
+    common = [bin_path, "--role", None, "--repl-transport", "tcp",
+              "--repl-fullsync-transport", "tcp", "--repl-realtime-transport", "tcp",
+              "--net", "reactor"]
+    master = slave = None
+    detail = ""
+    try:
+        master = subprocess.Popen(
+            common[:2] + ["master"] + common[3:] +
+            ["--port", str(mport), "--master-host", "127.0.0.1",
+             "--master-port", str(mport), "--dump", str(wd / "master.dump"),
+             "--aof", str(wd / "master.aof")],
+            stdout=mlog, stderr=subprocess.STDOUT, preexec_fn=os.setsid)
+        if not wait_ready("127.0.0.1", mport, "master"):
+            return False, "master not ready"
+        preload("127.0.0.1", mport, count)
+
+        def start_slave(log_fp):
+            return subprocess.Popen(
+                common[:2] + ["slave"] + common[3:] +
+                ["--port", str(sport), "--master-host", "127.0.0.1",
+                 "--master-port", str(mport), "--dump", str(wd / "slave.dump"),
+                 "--aof", str(wd / "slave.aof"), "--aof-disable"],
+                stdout=log_fp, stderr=subprocess.STDOUT, preexec_fn=os.setsid)
+
+        slave = start_slave(slog)
+        if not wait_ready("127.0.0.1", sport, "slave"):
+            return False, "slave not ready"
+        if not wait_keys("127.0.0.1", sport, count, timeout=60):
+            return False, "aof-disabled slave did not converge after fullsync"
+        text = (wd / "slave.log").read_text(errors="ignore")
+        if "fullsync commit FAILED" in text:
+            return False, "aof-disabled slave rejected fullsync baseline"
+        marker = Path(str(wd / "slave.dump") + ".fullsync_commit_pending")
+        if marker.exists():
+            return False, "commit marker was not removed"
+
+        # 重启：从新 dump 恢复，必须仍有全部 key。
+        stop(slave)
+        slog.close()
+        slog = open(wd / "slave2.log", "wb")
+        slave = start_slave(slog)
+        if not wait_ready("127.0.0.1", sport, "slave"):
+            return False, "restarted aof-disabled slave not ready"
+        if not wait_keys("127.0.0.1", sport, count, timeout=60):
+            return False, "restarted aof-disabled slave lost keys"
+        detail = "recovered"
+        return True, detail
+    finally:
+        stop(slave)
+        stop(master)
+        mlog.close()
+        slog.close()
+        if not detail:
+            for name in ("master.log", "slave.log", "slave2.log"):
+                p = wd / name
+                if p.exists():
+                    print(f"--- {name} tail ---")
+                    print("\n".join(p.read_text(errors="ignore").splitlines()[-20:]))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", default="./kvstore")
@@ -303,6 +376,10 @@ def main():
             print(f"{mode:5s} {step:14s} -> {'PASS' if ok else 'FAIL'} {detail}")
             if not ok:
                 fails += 1
+    ok, detail = run_aof_disabled_case(bin_path, port + 100, args.count)
+    print(f"{'AOF':5s} {'disabled':14s} -> {'PASS' if ok else 'FAIL'} {detail}")
+    if not ok:
+        fails += 1
     if fails:
         print(f"FULLSYNC_PERSISTENCE_FAULTS_FAIL ({fails} case(s))")
         return 1

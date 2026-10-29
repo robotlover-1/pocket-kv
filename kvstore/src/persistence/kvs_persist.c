@@ -923,21 +923,66 @@ void persist_aof_debug_state(kvs_aof_debug_t *out) {
     out->aof_outstanding = (int)atomic_load_explicit(&g_outstanding, memory_order_relaxed);
 }
 
+/* fsync 目录项：rename/truncate 之外，文件条目本身（新建/替换）也要落盘确认。 */
+static int persist_fsync_dir_of(const char *path) {
+    char dir[600];
+    int fd;
+    int rc;
+
+    if (!path || !*path) return -1;
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+        if (slash == dir) slash[1] = '\0';
+        else *slash = '\0';
+    } else {
+        snprintf(dir, sizeof(dir), ".");
+    }
+    fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    rc = fsync(fd);
+    close(fd);
+    return rc;
+}
+
 /* 全量同步完成后把 AOF 重定基线：drain 在途写 → 截断为 0 → 计数归零。
  * 语义：快照就是新的持久化基线，快照之前的 AOF 内容已被取代；留着不仅浪费空间，
  * 还会在恢复时把旧命令重放到快照之上（复活已删 key、非幂等命令双倍执行）。
  * 调用方（从机 fullsync 收尾）必须同步把 dump 头部的 aof_offset 也改成 0。 */
 int persist_aof_rebase(void) {
-    if (g_aof_disabled || g_aof_fd < 0) return -1;
+    if (g_aof_disabled) {
+        /* AOF 关闭：没有旧日志需要丢弃，dump 就是唯一基线。按“仅 dump”语义返回
+         * 成功，Slave 才能完成 fullsync；恢复路径也不会回放 AOF。 */
+        return 0;
+    }
+    if (g_aof_fd < 0) return -1;
     persist_drain_pending();                       /* 等在途批次落盘，之后才可安全截断 */
+    if (g_persist_fatal_error) {
+        /* AOF 线程已出现过写/fsync 失败：drain 返回不代表在途数据已经落盘。 */
+        fprintf(stderr, "persist: aof rebase rejected: AOF persist fatal error\n");
+        return -1;
+    }
     if (ftruncate(g_aof_fd, 0) != 0) {
         fprintf(stderr, "persist: aof rebase ftruncate failed errno=%d(%s)\n",
                 errno, strerror(errno));
         return -1;
     }
+    /* 截断已经发生：先让内存 offset 与文件长度一致，后续 O_APPEND 写入才不会
+     * 把旧 offset 当成回放基线（即使下面的 fsync 失败）。 */
     g_aof_write_offset = 0;
     g_aof_write_submitted = 0;
     g_cur_slot = NULL;
+    /* ftruncate 只改页缓存/元数据，必须显式 fsync 才能宣称新基线（长度）已持久化。 */
+    if (fsync(g_aof_fd) != 0) {
+        fprintf(stderr, "persist: aof rebase fsync failed errno=%d(%s)\n",
+                errno, strerror(errno));
+        return -1;
+    }
+    if (persist_fsync_dir_of(g_cfg.aof_path) != 0) {
+        fprintf(stderr, "persist: aof rebase dir fsync failed errno=%d(%s)\n",
+                errno, strerror(errno));
+        return -1;
+    }
     return 0;
 }
 

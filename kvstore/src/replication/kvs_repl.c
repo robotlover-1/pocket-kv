@@ -2,6 +2,7 @@
 #include "kvstore/kvstore.h"
 #include "kvstore/replication/repl_kprobe.h"
 #include "kvstore/replication/rdma_fullsync_mgr.h"
+#include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <string.h>
@@ -3285,6 +3286,7 @@ void repl_slave_set_sync_state(const char *replid, unsigned long long applied_of
 }
 
 static int repl_slave_send_repldone(void);
+static int repl_slave_state_save_fast(void);
 
 /* ---- fullsync 本地基线提交 ----
  * 严格 fail-closed：fsync/校验/rename/头部修正/AOF rebase/replstate 任一步失败都
@@ -3497,7 +3499,9 @@ void repl_slave_note_applied(size_t rawlen) {
         fprintf(stderr, "repl rdma: slave_apply - applied_before=%llu rawlen=%zu applied_after=%llu durable=%llu\n",
             before, rawlen, g_slave_repl_applied_offset, g_slave_repl_durable_offset);
 #endif
-        repl_slave_state_save();
+        /* 热路径：每条命令都会推进 applied offset，只做原子替换，不逐条 fsync。
+         * fullsync 提交点的持久化确认由 repl_slave_state_save()（durable）负责。 */
+        repl_slave_state_save_fast();
     } else {
         g_slave_fullsync_loaded_bytes += (unsigned long long)rawlen;
 #if KVS_ENABLE_RDMA
@@ -3520,7 +3524,7 @@ void repl_slave_note_durable(size_t rawlen) {
     }
     if (g_slave_repl_durable_offset < g_slave_repl_applied_offset) {
         g_slave_repl_durable_offset = g_slave_repl_applied_offset;
-        repl_slave_state_save();
+        repl_slave_state_save_fast();
     }
 #if KVS_ENABLE_RDMA
     if (repl_rdma_verbose_apply() &&
@@ -3680,17 +3684,69 @@ int repl_slave_state_load(void) {
     return 0;
 }
 
-int repl_slave_state_save(void) {
-    FILE *fp;
+/* replstate 原子落盘：先写 tmp，再 rename 覆盖正式文件，任何一步失败都不会留下
+ * 半截 replstate（旧 fopen(path,"w") 会在写入中途失败时把正式文件截成空）。
+ *
+ * durable=1：额外 fsync(file) 与 fsync(dir)，返回 0 即代表内容已确认落盘；
+ *   fullsync 提交等“返回 0 才能移除 marker / 发送 REPLDONE”的路径必须用它。
+ * durable=0：仅用于 applied/durable offset 前进的热路径（每条命令都会调用），
+ *   保持原子替换但不对每条命令做磁盘栅栏；崩溃最多让重启回到更早的 offset，
+ *   随后由 partial/full resync 补回，方向是重放而不是静默丢数据。 */
+static int repl_slave_state_write(int durable) {
+    char tmp[640];
+    char buf[128];
+    long long now;
+    int fd, n, rc = 0;
+    ssize_t w;
+    size_t off = 0;
+    static long long err_log_ms = 0;
+
     build_slave_state_path();
-    fp = fopen(g_slave_state_path, "w");
-    if (!fp) return -1;
-    fprintf(fp, "%s %llu %llu\n",
+    n = snprintf(buf, sizeof(buf), "%s %llu %llu\n",
         g_slave_master_replid[0] ? g_slave_master_replid : "?",
         g_slave_repl_applied_offset,
         g_slave_repl_durable_offset);
-    fclose(fp);
-    return 0;
+    if (n <= 0 || (size_t)n >= sizeof(buf)) return -1;
+
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", g_slave_state_path, (long)getpid());
+    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return -1;
+    if (repl_test_fail_step("state-write")) {
+        errno = ENOSPC;              /* 故障注入：模拟写入阶段 ENOSPC */
+        rc = -1;
+    }
+    while (rc == 0 && off < (size_t)n) {
+        w = write(fd, buf + off, (size_t)n - off);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            rc = -1;
+            break;
+        }
+        if (w == 0) { rc = -1; break; }
+        off += (size_t)w;
+    }
+    if (rc == 0 && durable && fsync(fd) != 0) rc = -1;
+    if (close(fd) != 0 && rc == 0) rc = -1;
+    if (rc == 0 && rename(tmp, g_slave_state_path) != 0) rc = -1;
+    if (rc == 0 && durable && repl_fsync_dir_of(g_slave_state_path) != 0) rc = -1;
+    if (rc != 0) {
+        unlink(tmp);
+        now = kvs_now_ms();
+        if (now - err_log_ms >= 5000) {   /* 热路径失败时避免逐命令刷日志 */
+            err_log_ms = now;
+            fprintf(stderr, "repl: save replstate failed (durable=%d): %s\n",
+                    durable, strerror(errno));
+        }
+    }
+    return rc;
+}
+
+int repl_slave_state_save(void) {
+    return repl_slave_state_write(1);
+}
+
+static int repl_slave_state_save_fast(void) {
+    return repl_slave_state_write(0);
 }
 
 /* partial resync 判定（§10）：除 offset 落在 backlog 区间外，还必须保证 backlog 历史
