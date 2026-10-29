@@ -40,6 +40,10 @@ int proxy_slave_fd(proxy_slave_ctx_t *ctx);
  * 返回 0 正常（含 EAGAIN），-1 表示对端关闭/连接错误（调用方应 mark_down）。 */
 int proxy_slave_drain(proxy_slave_ctx_t *ctx);
 
+/* 数据连接认证：发送 REPLDATA <token> 并等待 Slave 回 +OK。
+ * 返回 0 成功；-1 失败/超时/被拒绝（调用方必须把该 slot fail-closed）。 */
+int proxy_slave_handshake(proxy_slave_ctx_t *ctx, unsigned long long token);
+
 /* 在内部锁保护下向 slave writev。返回实际写入字节数；
  * 未连接或 writev 失败返回 -1（调用方回退 cache）。
  * 锁跨越“检查已连接 + writev”，保证 disconnect 不会在处理中途

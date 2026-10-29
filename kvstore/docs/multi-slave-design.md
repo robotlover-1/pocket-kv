@@ -296,3 +296,35 @@ slot 的 `< 8` 上限与 `KVS_MAX_REPLICA_SLOTS`、BPF `client_ctl/proxy_cfg` �
   唯一 Slave 离线期间 `g_replicas == NULL`，backlog 不喂入并标记不连续，
   重启只能 fullsync（既有行为）。per-replica 超时由 `check-multi-slave` 的
   silent-replica 场景覆盖。
+
+### 11.5 2026-10-29 评审整改
+
+按《PocketKV_多Slave_feature分支源码评审与改进方案》逐项处理：
+
+| 评审项 | 处理 |
+|---|---|
+| P0 数据通道断线后续发半条 RESP | `replica_send_batch()` 任何 `writev` 错误/peer EOF 都**不再回退 FIFO**：未发节点直接丢弃、`failed=1`、挂起 `fault_pending`；主线程 `poll_replica_faults()` 统一 `proxy_commit_set_replica(0)` + `SLOT_FAULT` + 断开。发送线程不直接改 Commit Gate 全局状态。Slave 必须重连 REPLSYNC。 |
+| P0 普通客户端可写 Slave | 新增 `REPLDATA <token>` 数据入口握手：Slave 进程级 64-bit 随机 token 随 REPLSYNC 第 6 参数上报，Master 经 `replica_token.<slot>` 交给 proxy；proxy 连接后先握手，Slave 校验后才置 `c->is_replication_data=1`。主端口与 rdma+ebpf-tcp 的专用 proxy listener **都**要求该握手。ROLE_SLAVE 下所有普通客户端一律 READONLY；错误 token 直接断开。 |
+| P1 复制 AOF/durable 路径不统一 | proxy 数据连接与 `from_replication` 共用同一段 apply → AOF prepare → applied → durable 逻辑；修正了“先 durable 后 applied 导致 durable 永久落后最后一条命令”的顺序问题。**durable 仍表示 AOF 写队列边界，不等于 fsync**；真实 fsync-durable offset 作为后续项。 |
+| P0/P1 fullsync 失败仍 release | `queue_snapshot()` 失败改为 `repl_barrier_cancel(c)`（绝不发 RESUME）、拒绝副本、复位 `g_repl_fullsync_in_progress/repl_fullsync_pending`，RDMA 配置下调用 stop/transfer cleanup。 |
+| P1 陈旧 RESUME 无 slot 代次 | `RESUME` 增加 `replica_gen` + `barrier_seq`；proxy 仅当二者与当前 slot 状态一致时才放行恢复缓冲，失配只记录并忽略（不得释放新缓冲）。单测新增“拒绝的 RESUME 不释放 recovery”。 |
+| P1 B fullsync 重置全局 backlog | `queue_snapshot()` 只在 `repl_backlog_contiguous()==0`（确实有历史缺口）时 reset；有 LIVE 副本保持连续时保留历史。新增测试：冻结 A 使 applied 落后于 B 快照边界，B fullsync 后 A 仍走 partial。 |
+| P2 故障通知依赖 REPLACK | owner 线程 `repl_barrier_tick()` 周期检查 `SLOT_FAULT` 并立即摘除该副本；REPLACK 检查保留作兜底。 |
+| P2 配置部分写入 | `slave_addr/slave_port/replica_token` 三键全部成功后才发布 `replica_gen`；任一失败撤销并拒绝该副本。 |
+| P2 测试加固 | 稳定 RNG（sha256 seed）、`WaitSynced` 要求 applied==master 且 durable==applied、普通客户端写 Slave 断言 READONLY、SET/DEL/MSET 交错 + 同长度覆盖、30KB value + kill B、B fullsync 后 A partial、silent replica 单独拒绝、精确 PID 清理。 |
+| P2 per-socket lock / INFO per-replica 明细 / 多副本 RDMA / 真 fsync durable | **未在本次修改**：按评审建议先做锁等待/性能采样再动 per-socket lock；INFO 明细和每副本 RDMA 属于后续阶段。 |
+
+回归（2026-10-29，本机 root+eBPF）：
+- `check-multi-slave`（40 keys/轮）：全部场景 PASS，含 security、mixed、30KB、PR-6 partial、proxy kill、silent replica。
+- `check-commit-gate-faults` 5 轮 PASS：mismatches=0、timeout/desync/gap=0、最终 offset=353936。
+- 跨机（128 6.1 Master + 129 5.15 远端 Slave）再次 PASS：REPLDATA 握手、partial resync、gen/seq RESUME 正常。
+- `check-slave-crash-recovery`、`test_commit_gate`、`test_hash_ownership`、`test_fullsync_protocol` PASS。
+
+仍存限制（明确不宣称已解决）：
+- `check-barrier-timeout` 的单副本 SIGSTOP 方案在本地仍只能 fullsync（无副本期间 backlog 不 feed），per-replica 超时由 multi-slave 的 silent-replica 场景覆盖。
+- `durable` 语义为 AOF 写队列边界；`aof_fsync=always + async group commit` 下崩溃窗口仍由 AOF group window 决定。
+- 多副本 RDMA、per-socket lock、50KB/1MB 单命令（>32KB capture 限制）、8 slot 压测未覆盖。
+- 数据通道“半条 RESP + RST”目前通过 30KB value + kill B 概率性覆盖；缺少确定性的
+  proxy 发送中途 RST 注入钩子（评审 PR-1 的专项验收仍建议补）。
+- RESUME 的跨通道错代竞态已做协议绑定与单测，但尚未构造“旧 RESUME 延迟送达”
+  的端到端故障注入。

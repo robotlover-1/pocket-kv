@@ -399,6 +399,11 @@ vsearch_queries/candidates/returned/total_us/max_us/topk_sum/dim_*
   REPLSYNC 第 5 参数上报该端口，不再依赖 `slave_port == master_port+1`。
 - **故障隔离**：proxy 单副本 FIFO/恢复缓冲超限时写 `SLOT_FAULT=1` 并断开该副本；
   Master 在 REPLACK 中只 `repl_reject_replica(c)`，不影响其他 LIVE 副本。
+- **2026-10-29 评审整改**：数据通道任何不可确定投递都 per-slot fail-closed（不跨连接续发半包）；
+  proxy 数据入口改为 `REPLDATA <token>` 握手，普通客户端写 Slave 一律 READONLY；
+  fullsync 失败走 cancel 而非 release；RESUME 绑定 `replica_gen+barrier_seq`；
+  B fullsync 在 backlog 连续时不重置全局历史；复制路径统一 apply/AOF/applied/durable 顺序。
+  详见 multi-slave-design.md §11.5。注意 `durable` 仍表示 AOF 写队列边界，不是 fsync。
 - **REPLACK 空闲心跳（本次修复）**：Slave 控制连接 `SO_RCVTIMEO=1s` 超时时也会
   发 REPLACK。原实现只在收到数据时 ACK；若 partial replay 最后一包之后没有新
   数据，Master 的 `applied >= catchup_end` 放行条件可能永远等不到，活跃副本

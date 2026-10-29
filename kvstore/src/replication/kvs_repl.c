@@ -3411,6 +3411,30 @@ const char *repl_slave_master_id(void) {
     return g_slave_master_replid;
 }
 
+/* proxy 数据入口 token：Slave 进程级随机值，随 REPLSYNC 上报给 Master，
+ * Master 再通过 proxy_cfg 交给 ebpf-proxy；proxy 在数据连接首条命令
+ * REPLDATA <token> 中回显。普通客户端无法伪造（64-bit 随机），也不再因为
+ * realtime=ebpf+tcp 就放行所有客户端写。不要打印到日志/INFO。 */
+static unsigned long long g_slave_data_token = 0;
+
+unsigned long long repl_slave_data_token(void) {
+    if (g_slave_data_token) return g_slave_data_token;
+    unsigned long long t = 0;
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (f) {
+        if (fread(&t, 1, sizeof(t), f) != sizeof(t)) t = 0;
+        fclose(f);
+    }
+    if (!t) {
+        t = ((unsigned long long)kvs_now_ms() << 32)
+            ^ ((unsigned long long)getpid() << 16)
+            ^ (unsigned long long)(uintptr_t)&g_slave_data_token;
+    }
+    if (!t) t = 1;
+    g_slave_data_token = t;
+    return t;
+}
+
 unsigned long long repl_slave_offset(void) {
     return g_slave_repl_applied_offset;
 }
@@ -3890,14 +3914,16 @@ static void *slave_thread(void *arg) {
 
                 {
                     unsigned char cmd[256];
-                    char offbuf[32], durablebuf[32], portbuf[16];
+                    char offbuf[32], durablebuf[32], portbuf[16], tokbuf[32];
                     snprintf(offbuf, sizeof(offbuf), "%llu", g_slave_repl_offset);
                     snprintf(durablebuf, sizeof(durablebuf), "%llu", g_slave_repl_durable_offset);
                     snprintf(portbuf, sizeof(portbuf), "%d", proxy_port);
-                    /* 第 5 参数告知 Master 本 Slave 的 proxy 数据端口，多 Slave
-                     * 可以部署在同一主机（各自不同端口）。 */
-                    size_t n = resp_build_cmd5(cmd, sizeof(cmd), "REPLSYNC",
-                        g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf, durablebuf, portbuf);
+                    snprintf(tokbuf, sizeof(tokbuf), "%llu", repl_slave_data_token());
+                    /* 第 5 参数=proxy 数据端口；第 6 参数=REPLDATA 握手 token。
+                     * 专用数据端口同样必须认证，避免任意客户端连接后注入复制写。 */
+                    size_t n = resp_build_cmd6(cmd, sizeof(cmd), "REPLSYNC",
+                        g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf,
+                        durablebuf, portbuf, tokbuf);
                     if (send(tcp_fd, cmd, n, 0) < 0) { close(tcp_fd); continue; }
                     fprintf(stderr, "repl ebpf-tcp: REPLSYNC sent over TCP (proxy_port=%d)\n",
                             proxy_port);
@@ -3931,6 +3957,44 @@ static void *slave_thread(void *arg) {
                         proxy_fd = accept(proxy_listen_fd, NULL, NULL);
                         if (proxy_fd >= 0) {
                             fprintf(stderr, "repl ebpf-tcp: proxy connected fd=%d\n", proxy_fd);
+                            /* 专用 proxy 数据端口也要求 REPLDATA <token> 握手：
+                             * 端口可达不代表可信，普通客户端不得注入复制写。 */
+                            struct timeval htv = { .tv_sec = 1, .tv_usec = 0 };
+                            setsockopt(proxy_fd, SOL_SOCKET, SO_RCVTIMEO, &htv, sizeof(htv));
+                            char hs[128];
+                            size_t hl = 0;
+                            int hs_ok = 0;
+                            while (hl < sizeof(hs) - 1) {
+                                ssize_t hn = recv(proxy_fd, hs + hl, sizeof(hs) - 1 - hl, 0);
+                                if (hn > 0) {
+                                    hl += (size_t)hn;
+                                    if (memchr(hs, '\n', hl)) break;
+                                    continue;
+                                }
+                                if (hn < 0 && errno == EINTR) continue;
+                                break;
+                            }
+                            hs[hl] = '\0';
+                            char *nl = strchr(hs, '\n');
+                            if (nl) *nl = '\0';
+                            nl = strchr(hs, '\r');
+                            if (nl) *nl = '\0';
+                            if (!strncmp(hs, "REPLDATA ", 9)) {
+                                unsigned long long tok = (unsigned long long)strtoull(hs + 9, NULL, 10);
+                                unsigned long long want = repl_slave_data_token();
+                                if (want != 0 && tok == want) hs_ok = 1;
+                            }
+                            if (!hs_ok) {
+                                fprintf(stderr, "repl ebpf-tcp: proxy REPLDATA handshake rejected\n");
+                                close(proxy_fd);
+                                proxy_fd = -1;
+                            } else {
+                                const char okline[] = "+OK\r\n";
+                                send(proxy_fd, okline, sizeof(okline) - 1, MSG_NOSIGNAL);
+                                struct timeval zero = { 0, 0 };
+                                setsockopt(proxy_fd, SOL_SOCKET, SO_RCVTIMEO, &zero, sizeof(zero));
+                                fprintf(stderr, "repl ebpf-tcp: proxy data channel authenticated\n");
+                            }
                         } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
                             fprintf(stderr, "repl ebpf-tcp: proxy accept error: %s\n", strerror(errno));
                         }
@@ -4291,11 +4355,12 @@ static void *slave_thread(void *arg) {
              * !from_replication 分支会推进 replicated offset）。把主端口作为第 5
              * 参数带给 Master：多 Slave 可部署在同一主机/任意端口，不再依赖
              * “Slave 端口 == Master 端口 + 1” 的隐式约定。 */
-            char portbuf[16];
+            char portbuf[16], tokbuf[32];
             snprintf(portbuf, sizeof(portbuf), "%d", g_cfg.port);
-            n = resp_build_cmd5(cmd, sizeof(cmd), "REPLSYNC",
+            snprintf(tokbuf, sizeof(tokbuf), "%llu", repl_slave_data_token());
+            n = resp_build_cmd6(cmd, sizeof(cmd), "REPLSYNC",
                 g_slave_master_replid[0] ? g_slave_master_replid : "?",
-                offbuf, durablebuf, portbuf);
+                offbuf, durablebuf, portbuf, tokbuf);
         } else {
             n = resp_build_cmd4(cmd, sizeof(cmd), "REPLSYNC",
                 g_slave_master_replid[0] ? g_slave_master_replid : "?",

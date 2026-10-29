@@ -311,11 +311,14 @@ typedef struct conn_s {
      * -1 = 未注册到 ebpf-proxy。屏障/恢复状态必须是 per-connection 的：
      * A 的 REPLACK 不能解除 B 的恢复屏障（见 docs/multi-slave-design.md §7.4）。 */
     int repl_slot;
+    int is_replication_data;      /* 已通过 REPLDATA(token) 认证的 proxy 数据连接 */
     int repl_barrier_active;
     int repl_barrier_ack_gated;
     int repl_barrier_resume_valid;
     unsigned long long repl_barrier_end_offset;    /* catchup_end */
     unsigned long long repl_barrier_resume_global; /* RESUME marker */
+    unsigned long long repl_barrier_gen;           /* 本次屏障对应 slot generation */
+    unsigned long long repl_barrier_seq;           /* 本次屏障的 BARRIER seq */
     long long repl_barrier_deadline_ms;
     /* eBPF 副本故障恢复：0=正常；1=fullsync 期间（capture 关闭）；
      * 2=backlog 追赶期（capture 已开，但 proxy 处于 BUFFERING，追平后 flush） */
@@ -577,7 +580,8 @@ void repl_commit_forget(conn_t *c);            /* 连接关闭 */
 /* 恢复期结束：向指定副本发送 RESUME(replica_id, marker)。返回 0 成功；
  * -1 表示通道不可用/发送失败，调用方必须 fail-closed（不得继续 flush recovery/cache）。
  * replica_id 即 ebpf-proxy 的 fan-out slot；每个副本独立丢弃 <=marker 的记录。 */
-int repl_commit_resume(uint64_t replica_id, uint64_t global_seq);
+int repl_commit_resume(uint64_t replica_id, uint64_t replica_gen,
+                       uint64_t barrier_seq, uint64_t global_seq);
 uint64_t repl_commit_global_seq(void);
 unsigned long long repl_commit_descriptor_count(void);
 unsigned long long repl_commit_write_count(void);
@@ -601,6 +605,9 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen);
 int repl_barrier_pending(void);
 void repl_barrier_tick(void);
 void repl_barrier_note_applied(conn_t *c, unsigned long long applied_offset);
+/* Slave 本进程的 proxy 数据入口 token（REPLSYNC 上报给 Master，再由 proxy 在
+ * REPLDATA 握手中回显）。0 表示尚未生成/非 Slave。 */
+unsigned long long repl_slave_data_token(void);
 void repl_note_send_context(const char *stage, size_t len, unsigned long long offset, const unsigned char *buf);
 void repl_get_last_send_context(char *stage, size_t stage_cap, unsigned long long *len, unsigned long long *offset, char *preview, size_t preview_cap);
 int start_slave_thread(void);
@@ -825,6 +832,7 @@ int resp_bulk(char *out, size_t cap, const char *s, size_t len);
 int resp_null_bulk(char *out, size_t cap);
 size_t resp_build_cmd4(unsigned char *out, size_t cap, const char *cmd, const char *a1, const char *a2, const char *a3);
 size_t resp_build_cmd5(unsigned char *out, size_t cap, const char *cmd, const char *a1, const char *a2, const char *a3, const char *a4);
+size_t resp_build_cmd6(unsigned char *out, size_t cap, const char *cmd, const char *a1, const char *a2, const char *a3, const char *a4, const char *a5);
 size_t resp_build_cmd3(unsigned char *out, size_t cap, const char *cmd, const char *a1, const char *a2);
 size_t resp_build_cmd2(unsigned char *out, size_t cap, const char *cmd, const char *a1);
 size_t resp_build_cmd1(unsigned char *out, size_t cap, const char *cmd);

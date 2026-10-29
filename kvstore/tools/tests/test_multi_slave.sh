@@ -9,7 +9,10 @@
 #   1. 两个 Slave 同时 fullsync 后都能收到增量，主/从内容一致
 #   2. B kill -9 期间 A 持续复制；B 重启（强制 fullsync）后追平，A 不受影响
 #   3. B 全量重同步期间继续写入：A 实时收到，B 完成后内容一致
-#   4. kill ebpf-proxy：自动拉起后 A/B 各自恢复，不跨 session 重放
+#   4. 普通客户端写 Slave 必须 READONLY；SET/DEL/MSET 交错与同长度覆盖一致
+#   5. 30KB value + B kill -9（数据通道可能断在半条命令）后 A 正常、B 自愈
+#   6. A 落后于 B 的快照边界时，B fullsync 不得重置全局 backlog（A 仍 partial）
+#   7. kill ebpf-proxy：自动拉起后 A/B 各自恢复，不跨 session 重放
 #
 # 用法：
 #   sudo tools/tests/test_multi_slave.sh [kvstore 二进制]
@@ -59,7 +62,7 @@ Cleanup() {
     if [ -f "$DIR/master.dump.ebpfproxy.pid" ]; then
         kill -9 "$(cat "$DIR/master.dump.ebpfproxy.pid" 2>/dev/null)" 2>/dev/null
     fi
-    pkill -9 -f "$PROXY_BIN" 2>/dev/null
+    pkill -9 -f "$PROXY_BIN --pin-path $PIN" 2>/dev/null
     wait 2>/dev/null
     if [ "$FAIL" -ne 0 ] && [ -d "$DIR" ]; then
         keep=/tmp/kvs-multi-slave-last
@@ -160,19 +163,149 @@ SlaveReady() { # <port>
     [ "$loading" = "0" ] && [ "$link" = "up" ]
 }
 
+SlaveSynced() { # <port>: link up + fullsync loaded + applied == master offset
+    local info minfo loading link applied durable moff
+    info=$(RespPy info "$1")
+    minfo=$(RespPy info "$MPORT")
+    loading=$(Field "$info" slave_fullsync_loading)
+    link=$(Field "$info" master_link)
+    applied=$(Field "$info" slave_repl_applied_offset)
+    durable=$(Field "$info" slave_repl_durable_offset)
+    moff=$(Field "$minfo" master_repl_offset)
+    [ "$loading" = "0" ] && [ "$link" = "up" ] && [ -n "$applied" ] && \
+        [ "$applied" = "$moff" ] && [ -n "$durable" ] && [ "$durable" = "$applied" ]
+}
+
 WaitSynced() { # <port> <tries>
     for _ in $(seq 1 "${2:-200}"); do
-        SlaveReady "$1" && return 0
+        SlaveSynced "$1" && return 0
         sleep 0.1
     done
     return 1
 }
 
+AttackSlave() { # <port>: 普通客户端写必须被 READONLY 拒绝，且 key 不存在
+    python3 - "$1" <<'PY'
+import socket, sys
+port = int(sys.argv[1])
+def enc(a):
+    return b"*%d\r\n" % len(a) + b"".join(b"$%d\r\n%s\r\n" % (len(x), x) for x in a)
+s = socket.create_connection(("127.0.0.1", port), timeout=5)
+s.settimeout(2)
+s.sendall(enc([b"SET", b"attack:key", b"1"]))
+try:
+    d = s.recv(256)
+except socket.timeout:
+    d = b""
+ok = d.startswith(b"-")
+try:
+    s.sendall(enc([b"GET", b"attack:key"]))
+    g = s.recv(256)
+except Exception:
+    g = b""
+s.close()
+if not ok or not g.startswith(b"$-1"):
+    sys.stderr.write("attack response=%r get=%r\n" % (d, g))
+    sys.exit(1)
+sys.exit(0)
+PY
+}
+
+WriteBig() { # <prefix> <count> <value_size>
+    python3 - "$MPORT" "$1" "$2" "$3" <<'PY' || return 1
+import socket, sys, time
+port, prefix, n, sz = int(sys.argv[1]), sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+s = socket.create_connection(("127.0.0.1", port), timeout=15)
+def enc(a):
+    return b"*%d\r\n" % len(a) + b"".join(b"$%d\r\n%s\r\n" % (len(x), x) for x in a)
+body = (prefix.encode() * ((sz // len(prefix)) + 2))[:sz]
+for i in range(n):
+    k = ("%s:%04d" % (prefix, i)).encode()
+    s.sendall(enc([b"SET", k, body])); time.sleep(0.005)
+s.settimeout(15); want = b"+OK\r\n" * n; got = b""
+while len(got) < len(want):
+    x = s.recv(65536)
+    if not x: break
+    got += x
+s.close(); sys.exit(0 if got.count(b"+OK\r\n") >= n else 1)
+PY
+}
+
+MixedRound() { # <n>: SET/DEL/MSET 交错 + 同长度不同值
+    python3 - "$MPORT" "$1" <<'PY' || return 1
+import socket, sys, time
+port, n = int(sys.argv[1]), int(sys.argv[2])
+s = socket.create_connection(("127.0.0.1", port), timeout=15)
+def enc(a):
+    return b"*%d\r\n" % len(a) + b"".join(b"$%d\r\n%s\r\n" % (len(x), x) for x in a)
+for i in range(n):
+    s.sendall(enc([b"SET", ("mix:k%04d" % i).encode(), ("mv%04d" % i).encode()]))
+    time.sleep(0.001)
+    if i > 0:
+        s.sendall(enc([b"DEL", ("mix:k%04d" % (i - 1)).encode()])); time.sleep(0.001)
+    s.sendall(enc([b"MSET", ("mix:a%04d" % i).encode(), b"A",
+                   ("mix:b%04d" % i).encode(), b"B"])); time.sleep(0.001)
+    s.sendall(enc([b"SET", ("mix:s%04d" % i).encode(), b"XXXXXXXX"])); time.sleep(0.001)
+    s.sendall(enc([b"SET", ("mix:s%04d" % i).encode(), b"YYYYYYYY"])); time.sleep(0.001)
+s.settimeout(5); end = time.time() + 5
+while time.time() < end:
+    try:
+        if not s.recv(65536): break
+    except socket.timeout:
+        break
+s.close(); sys.exit(0)
+PY
+}
+
+CheckMixed() { # <n>
+    python3 - "$MPORT" "$APORT" "$BPORT" "$1" <<'PY' || return 1
+import socket, sys
+mp, ap, bp, n = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+def enc(a):
+    return b"*%d\r\n" % len(a) + b"".join(b"$%d\r\n%s\r\n" % (len(x), x) for x in a)
+def get_all(port, keys):
+    s = socket.create_connection(("127.0.0.1", port), timeout=5); s.settimeout(5)
+    s.sendall(b"".join(enc([b"GET", k.encode()]) for k in keys))
+    out = []; buf = b""
+    while len(out) < len(keys):
+        x = s.recv(65536)
+        if not x: break
+        buf += x
+        while len(out) < len(keys):
+            if not buf.startswith(b"$"): return None
+            nl = buf.find(b"\r\n")
+            if nl < 0: break
+            ln = int(buf[1:nl])
+            if ln < 0:
+                out.append(None); buf = buf[nl + 2:]; continue
+            need = nl + 2 + ln + 2
+            if len(buf) < need: break
+            out.append(buf[nl + 2:nl + 2 + ln]); buf = buf[need:]
+    s.close(); return out
+keys = []
+for i in range(n):
+    keys += ["mix:k%04d" % i, "mix:a%04d" % i, "mix:b%04d" % i, "mix:s%04d" % i]
+a = get_all(mp, keys); b = get_all(ap, keys); c = get_all(bp, keys)
+if a is None or b is None or c is None:
+    print("mixed resp parse failed"); sys.exit(1)
+for i in range(n):
+    base = i * 4
+    want_k = None if i < n - 1 else ("mv%04d" % i).encode()
+    if a[base] != want_k or a[base + 1] != b"A" or a[base + 2] != b"B" or a[base + 3] != b"YYYYYYYY":
+        print("mixed master unexpected i=%d got=%r" % (i, a[base:base + 4])); sys.exit(1)
+    if b[base:base + 4] != a[base:base + 4] or c[base:base + 4] != a[base:base + 4]:
+        print("mixed replica mismatch i=%d master=%r A=%r B=%r" % (i, a[base:base + 4], b[base:base + 4], c[base:base + 4]))
+        sys.exit(1)
+sys.exit(0)
+PY
+}
+
 WriteKeys() { # <prefix> <count>
     python3 - "$MPORT" "$1" "$2" "$SEED" <<'PY' || return 1
-import random, socket, sys, time
+import hashlib, random, socket, sys, time
 port, prefix, n, seed = int(sys.argv[1]), sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
-rng = random.Random(seed ^ hash(prefix))
+stable = int.from_bytes(hashlib.sha256(prefix.encode()).digest()[:8], "big")
+rng = random.Random(seed ^ stable)
 s = socket.create_connection(("127.0.0.1", port), timeout=10)
 def enc(a):
     return b"*%d\r\n" % len(a) + b"".join(b"$%d\r\n%s\r\n" % (len(x), x) for x in a)
@@ -265,12 +398,28 @@ Info "wait both slaves initial fullsync"
 WaitSynced "$APORT" 300 || Fail "slave A did not become ready"
 WaitSynced "$BPORT" 300 || Fail "slave B did not become ready"
 
+Info "security: ordinary client writes to slaves must be READONLY"
+AttackSlave "$APORT" || Fail "slave A accepted a normal client write"
+AttackSlave "$BPORT" || Fail "slave B accepted a normal client write"
+WaitSynced "$APORT" 100 || Fail "slave A offset changed after rejected attack write"
+WaitSynced "$BPORT" 100 || Fail "slave B offset changed after rejected attack write"
+
+Info "mixed non-idempotent ops (SET/DEL/MSET, same-length overwrite)"
+MixedRound 24 || Fail "mixed write failed"
+WaitSynced "$APORT" 300 || Fail "A did not converge after mixed round"
+WaitSynced "$BPORT" 300 || Fail "B did not converge after mixed round"
+CheckMixed 24 || Fail "mixed round data mismatch"
+
 Info "round1: write $KEYS keys, both slaves live"
 WriteKeys r1 "$KEYS" || Fail "round1 write failed"
 sleep 1
 CheckKeys r1 "$KEYS" || Fail "round1 data mismatch"
 
-Info "B kill -9; A must keep replicating"
+Info "large values (30KB, within capture record limit) then B kill -9"
+WriteBig big 8 30000 || Fail "large-value write failed"
+sleep 1
+CheckKeys big 8 || Fail "large-value round1 mismatch"
+Info "B kill -9; A must keep replicating (may cut an in-flight 30KB command)"
 kill -9 "$BPID" 2>/dev/null; BPID=""
 WriteKeys r2 "$KEYS" || Fail "round2 write failed"
 sleep 1
@@ -287,19 +436,44 @@ sleep 1
 CheckKeys r3 "$KEYS" || Fail "round3 mismatch after B fullsync"
 CheckKeys r2 "$KEYS" || Fail "A/B round2 mismatch after B fullsync"
 
+Info "backlog preserved: A behind B fullsync must still partial (PR-6)"
+# 冻结 A，使它的 applied 落后于接下来 B fullsync 的快照边界
+kill -STOP "$APID" 2>/dev/null
+WriteKeys r5 "$KEYS" || Fail "r5 write failed"
+sleep 1
+# A 冻结期间强制 B fullsync（快照 base 已在 A 的 applied 之后）
+kill -9 "$BPID" 2>/dev/null; BPID=""
+rm -f "$DIR/slaveB.dump" "$DIR/slaveB.aof" "$DIR/slaveB.aof.replstate"
+BPID=$(StartSlave slaveB "$BPORT") || Fail "B restart (PR-6) failed"
+WaitSynced "$BPORT" 600 || Fail "B did not finish fullsync (PR-6)"
+# 在 A 仍冻结时 kill，保留其旧 replstate（pre-r5 offset）
+kill -9 "$APID" 2>/dev/null; APID=""
+ALINE=$(wc -l < "$DIR/master.log")
+APID=$(StartSlave slaveA "$APORT") || Fail "A restart (PR-6) failed"
+WaitSynced "$APORT" 600 || Fail "A did not recover (PR-6)"
+if tail -n +$((ALINE + 1)) "$DIR/master.log" | grep -q "partial resync replayed"; then
+    echo "   A recovered via partial resync"
+else
+    Fail "A was forced to fullsync after B fullsync (global backlog was reset)"
+fi
+CheckKeys r5 "$KEYS" || Fail "r5 mismatch after A/B recovery (PR-6)"
+CheckKeys r3 "$KEYS" || Fail "r3 mismatch after PR-6 recovery"
+
 Info "kill ebpf-proxy; auto respawn and per-replica recovery"
 PIDFILE="$DIR/master.dump.ebpfproxy.pid"
 if [ -f "$PIDFILE" ]; then
     kill -9 "$(cat "$PIDFILE")" 2>/dev/null
 else
-    pkill -9 -f "$PROXY_BIN" 2>/dev/null
+    pkill -9 -f "$PROXY_BIN --pin-path $PIN" 2>/dev/null
 fi
-sleep 1
-WriteKeys r4 "$KEYS" || Fail "round4 write failed (master unavailable?)"
-# 等心跳/重连/重新同步完成
+# 先等心跳过期 -> session invalid -> 自动拉起 proxy -> A/B 各自重同步完成，
+# 再写入 r4；否则写入会撞上 owner 线程的 barrier 握手/全量，10s 客户端超时。
+sleep 3
 WaitSynced "$APORT" 600 || Fail "A did not recover after proxy restart"
 WaitSynced "$BPORT" 600 || Fail "B did not recover after proxy restart"
-sleep 1
+WriteKeys r4 "$KEYS" || Fail "round4 write failed after proxy restart"
+WaitSynced "$APORT" 300 || Fail "A did not apply round4 after proxy restart"
+WaitSynced "$BPORT" 300 || Fail "B did not apply round4 after proxy restart"
 CheckKeys r4 "$KEYS" || Fail "round4 mismatch after proxy restart"
 
 Info "per-replica barrier timeout: silent replica must be rejected alone"
@@ -326,8 +500,8 @@ if [ -n "$RID" ] && [ -n "$BSTART" ]; then
     INV1=$(Field "$(RespPy info "$MPORT")" repl_session_invalid_count)
     [ "$GATE_OK" -eq 1 ] || Fail "silent partial replica did not hit per-replica barrier timeout"
     [ "$INV1" = "$INV0" ] || Fail "silent replica timeout invalidated whole session ($INV0 -> $INV1)"
-    SlaveReady "$APORT" || Fail "slave A lost link after silent-replica timeout"
-    SlaveReady "$BPORT" || Fail "slave B lost link after silent-replica timeout"
+    SlaveSynced "$APORT" || Fail "slave A not synced after silent-replica timeout"
+    SlaveSynced "$BPORT" || Fail "slave B not synced after silent-replica timeout"
     CheckKeys r4 "$KEYS" || Fail "data mismatch after silent-replica timeout"
 else
     Fail "could not read master replid/backlog for silent-replica scenario"

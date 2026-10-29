@@ -62,9 +62,13 @@ static void replica_fault_cb(uint64_t replica_id, int reason) {
 }
 
 static int g_resume_count = 0;
-static void resume_cb(uint64_t replica_id, uint64_t marker) {
-    (void)replica_id; (void)marker;
+static int g_resume_reject = 0;
+static int resume_cb(uint64_t replica_id, uint64_t replica_gen,
+                     uint64_t barrier_seq, uint64_t marker) {
+    (void)replica_id; (void)replica_gen; (void)barrier_seq; (void)marker;
+    if (g_resume_reject) return 0;
     g_resume_count++;
+    return 1;
 }
 
 static uint64_t crc64(const unsigned char *b, size_t n) {
@@ -138,7 +142,7 @@ static void send_resume_id(uint64_t replica_id, uint64_t marker) {
     memset(&m, 0, sizeof(m));
     m.magic = REPL_COMMIT_MAGIC; m.version = REPL_COMMIT_VERSION;
     m.type = REPL_COMMIT_MSG_RESUME; m.global_seq = marker; m.epoch = g_msg_epoch;
-    m.replica_id = replica_id;
+    m.replica_id = replica_id; m.replica_gen = 0; m.barrier_seq = 0;
     CHECK(send(g_sock, &m, sizeof(m), 0) == (ssize_t)sizeof(m), "send resume");
 }
 
@@ -390,6 +394,29 @@ int main(void) {
     feed(5001, 1, ping);
     for (int i = 0; i < 2200 && g_fault_reason == 0; ++i) poll_once();
     CHECK(g_fault_reason == 1, "pending timeout → timeout fault");
+
+    /* 9f. 陈旧/错代 RESUME 被 resume 回调拒绝时，不得释放当前恢复缓冲 */
+    reset_out();
+    proxy_commit_purge();
+    send_baseline(9101, 1);
+    poll_once();
+    proxy_commit_set_buffering(0, 1);
+    feed(9101, 1, a);
+    send_desc(9101, 1, 200, (const unsigned char *)a, strlen(a),
+              REPL_COMMIT_FLAG_WRITE, 0, 0);
+    poll_once();
+    CHECK(g_fault_reason == 0 && g_out_count == 0, "resume-case write buffered");
+    g_resume_reject = 1;
+    send_resume(199);
+    poll_once();
+    CHECK(g_fault_reason == 0 && g_out_count == 0,
+          "stale generation RESUME must not release recovery");
+    g_resume_reject = 0;
+    send_resume(199);
+    poll_once();
+    CHECK(g_fault_reason == 0 && g_out_count == 1 &&
+          g_out_len == strlen(a) && memcmp(g_out, a, strlen(a)) == 0,
+          "valid RESUME drains after stale one ignored");
 
     /* 12. 多副本 fan-out：A LIVE 时 B 的 barrier 只缓存 B，不阻塞 A；
      *     RESUME(slot=1, marker) 只放行 B，重复 RESUME 幂等。 */

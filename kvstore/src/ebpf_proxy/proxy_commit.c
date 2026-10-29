@@ -633,7 +633,8 @@ static void pc_on_baseline(uint64_t cookie, uint64_t next_seq) {
     pc_try_match(ctx);
 }
 
-static void pc_on_resume(uint64_t replica_id, uint64_t marker) {
+static void pc_on_resume(uint64_t replica_id, uint64_t replica_gen,
+                         uint64_t barrier_seq, uint64_t marker) {
     if (replica_id >= PROXY_COMMIT_MAX_REPLICAS) {
         fprintf(stderr, "ebpf-proxy: RESUME for unknown replica %llu ignored\n",
                 (unsigned long long)replica_id);
@@ -641,6 +642,16 @@ static void pc_on_resume(uint64_t replica_id, uint64_t marker) {
     }
     int id = (int)replica_id;
     uint64_t bit = 1ull << id;
+
+    /* 陈旧/错代 RESUME：同 session 内 slot 重注册后，旧 barrier 的 RESUME 可能
+     * 晚到。必须忽略，且绝不能释放新恢复缓冲（否则会丢数据/错放行）。 */
+    if (g_on_resume && !g_on_resume(replica_id, replica_gen, barrier_seq, marker)) {
+        fprintf(stderr, "ebpf-proxy: RESUME slot=%llu gen=%llu seq=%llu marker=%llu "
+                        "rejected (stale generation/barrier) — ignored\n",
+                (unsigned long long)replica_id, (unsigned long long)replica_gen,
+                (unsigned long long)barrier_seq, (unsigned long long)marker);
+        return;
+    }
 
     /* 每个副本独立丢弃 <= marker（已被该副本的 backlog/快照覆盖），其余按序交付。
      * 未注册/已隔离的副本没有恢复数据可放行。 */
@@ -651,7 +662,6 @@ static void pc_on_resume(uint64_t replica_id, uint64_t marker) {
     if (g_rec_bytes >= rec_bytes) g_rec_bytes -= rec_bytes;
     else g_rec_bytes = 0;
     g_replica_buffering &= ~bit;
-    if (g_on_resume) g_on_resume(replica_id, marker);
 
     if (!(g_replica_mask & bit)) {
         while (r) { pc_rec_t *nx = r->next; free(r); r = nx; }
@@ -758,7 +768,7 @@ static void pc_process_msg(const unsigned char *buf, size_t len) {
                     (unsigned long long)h.epoch, (unsigned long long)g_session_epoch);
             break;
         }
-        pc_on_resume(h.replica_id, h.global_seq);
+        pc_on_resume(h.replica_id, h.replica_gen, h.barrier_seq, h.global_seq);
         break;
     case REPL_COMMIT_MSG_BATCH: {
         if (pc_epoch_stale(h.epoch)) {

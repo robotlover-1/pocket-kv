@@ -18,9 +18,12 @@ typedef void (*proxy_commit_fault_fn)(int reason);
  * main 负责断开它的数据通道并置 client_ctl slot FAULT，让 Master 只重同步该副本。 */
 typedef void (*proxy_commit_replica_fault_fn)(uint64_t replica_id, int reason);
 
-/* 收到某副本的 RESUME：在把恢复记录交付给 emit 之前调用，main 据此把该副本
- * phase 切回 LIVE（发送线程随后按序送出刚放行的记录）。 */
-typedef void (*proxy_commit_resume_fn)(uint64_t replica_id, uint64_t marker);
+/* 收到某副本的 RESUME：在把恢复记录交付给 emit 之前调用。
+ * main 校验 (replica_id, replica_gen, barrier_seq) 是否与当前 slot 状态一致：
+ * 返回 1 = 接受，把 phase 切回 LIVE 并按序交出恢复记录；
+ * 返回 0 = 陈旧/错代 RESUME，忽略且**不得**释放当前恢复缓冲。 */
+typedef int (*proxy_commit_resume_fn)(uint64_t replica_id, uint64_t replica_gen,
+                                      uint64_t barrier_seq, uint64_t marker);
 
 #define PROXY_COMMIT_MAX_REPLICAS 64
 

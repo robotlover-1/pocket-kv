@@ -150,8 +150,12 @@ typedef struct {
     int phase;                       /* LIVE / RECOVERY（barrier 期只入 commit recovery） */
     int resumed;                     /* 收到该副本的 RESUME */
     int failed;                      /* 已隔离，等待 Master 重同步（slot FAULT=1） */
+    int fault_pending;               /* 发送线程发现不可确定投递，待主线程落控制面 */
+    int fault_reason;
     unsigned long long barrier_last; /* 上次观察到的 slot BARRIER seq（0=未立） */
     unsigned long long barrier_gen;  /* 每次 barrier up +1（在途批次据此判断是否过期） */
+    unsigned long long barrier_seq;  /* 已 ack 的 barrier seq（RESUME 代次校验用） */
+    unsigned long long token;        /* proxy 数据入口认证 token（0=旧协议/不认证） */
 
     proxy_slave_ctx_t slave;         /* 仅发送线程访问 */
     int connected;                   /* 仅发送线程写，持 lock 读 */
@@ -285,18 +289,45 @@ static int replica_enqueue_locked(proxy_replica_t *r, const unsigned char *buf, 
     return 0;
 }
 
-/* 需要持 lock：隔离该副本，只影响该 slot。设备侧故障通知 Master（slot FAULT），
- * Master 的 REPLACK 处理会拒绝该副本；Slave 重连后 gen 变化会重置本上下文。 */
-static void replica_isolate_locked(proxy_replica_t *r, int reason) {
+/* 需要持 lock：立即停止该 slot 的发送并标记故障。
+ * 不在发送线程里触碰 Commit Gate 全局状态（非线程安全）；主线程
+ * poll_replica_faults() 统一执行 proxy_commit_set_replica(0)/slot FAULT/断开。
+ * Master 会在 REPLACK 或周期 fault 检查中拒绝该副本，Slave 重连后 gen 变化
+ * 会重置本上下文。 */
+static void replica_mark_fault_locked(proxy_replica_t *r, int reason) {
     if (r->failed) return;
     r->failed = 1;
+    r->fault_pending = 1;
+    r->fault_reason = reason;
     r->overflow_count++;
     replica_drop_fifo_locked(r);
-    proxy_commit_set_replica((uint64_t)r->id, 0);
-    write_client_ctl_u64(KVS_CTL_SLOT_FAULT(r->id), 1);
     pthread_cond_broadcast(&r->cond);
+}
+
+/* 主线程：把 fault_pending 落到控制面。 */
+static void replica_apply_fault(proxy_replica_t *r) {
+    pthread_mutex_lock(&r->lock);
+    int pending = r->fault_pending;
+    int used = r->used;
+    int reason = r->fault_reason;
+    r->fault_pending = 0;
+    pthread_mutex_unlock(&r->lock);
+    if (!pending) return;
+    proxy_commit_set_replica((uint64_t)r->id, 0);
+    if (used) write_client_ctl_u64(KVS_CTL_SLOT_FAULT(r->id), 1);
+    proxy_slave_mark_down(&r->slave, "replica fault");
     fprintf(stderr, "ebpf-proxy: replica slot %d isolated reason=%d "
                     "(other replicas continue)\n", r->id, reason);
+}
+
+static void poll_replica_faults(void) {
+    for (int i = 0; i < PROXY_MAX_REPLICAS; i++) {
+        proxy_replica_t *r = &g_reps[i];
+        pthread_mutex_lock(&r->lock);
+        int pending = r->fault_pending;
+        pthread_mutex_unlock(&r->lock);
+        if (pending) replica_apply_fault(r);
+    }
 }
 
 static size_t replicas_total_bytes(void) {
@@ -334,7 +365,7 @@ static int commit_emit(uint64_t replica_id, uint64_t global_seq,
         return 0;
     }
     if (replica_enqueue_locked(r, buf, len) != 0) {
-        replica_isolate_locked(r, 1);
+        replica_mark_fault_locked(r, 1);
         pthread_mutex_unlock(&r->lock);
         return 0;
     }
@@ -351,7 +382,7 @@ static void commit_replica_fault_cb(uint64_t replica_id, int reason) {
     if (replica_id >= PROXY_MAX_REPLICAS) return;
     proxy_replica_t *r = &g_reps[replica_id];
     pthread_mutex_lock(&r->lock);
-    replica_isolate_locked(r, 5);
+    replica_mark_fault_locked(r, 5);
     pthread_mutex_unlock(&r->lock);
 }
 
@@ -365,34 +396,54 @@ static void commit_fault_cb(int reason) {
 
 /* RESUME：Commit Gate 已把该副本恢复缓冲中 <=marker 的记录丢弃，并把其余记录
  * 经 commit_emit 放进 FIFO。在交付前把 phase 置 LIVE，保证发送线程按序送出。 */
-static void commit_resume_cb(uint64_t replica_id, uint64_t marker) {
-    if (replica_id >= PROXY_MAX_REPLICAS) return;
+static int commit_resume_cb(uint64_t replica_id, uint64_t replica_gen,
+                            uint64_t barrier_seq, uint64_t marker) {
+    if (replica_id >= PROXY_MAX_REPLICAS) return 0;
     proxy_replica_t *r = &g_reps[replica_id];
+    int ok;
     pthread_mutex_lock(&r->lock);
-    if (r->used && !r->failed) {
+    /* 只接受当前 slot generation + 当前 barrier seq 的 RESUME。 */
+    ok = r->used && !r->failed && r->gen == replica_gen &&
+         r->barrier_seq == barrier_seq;
+    if (ok) {
         r->phase = REPL_PHASE_LIVE;
         r->resumed = 1;
         pthread_cond_broadcast(&r->cond);
     }
+    unsigned long long cur_gen = r->gen, cur_seq = r->barrier_seq;
     pthread_mutex_unlock(&r->lock);
-    fprintf(stderr, "ebpf-proxy: replica slot %llu RESUME marker=%llu -> LIVE\n",
-            (unsigned long long)replica_id, (unsigned long long)marker);
+    if (ok) {
+        fprintf(stderr, "ebpf-proxy: replica slot %llu RESUME gen=%llu seq=%llu "
+                        "marker=%llu -> LIVE\n", (unsigned long long)replica_id,
+                (unsigned long long)replica_gen, (unsigned long long)barrier_seq,
+                (unsigned long long)marker);
+    } else {
+        fprintf(stderr, "ebpf-proxy: replica slot %llu RESUME gen=%llu seq=%llu "
+                        "mismatch (current gen=%llu seq=%llu) — ignored\n",
+                (unsigned long long)replica_id, (unsigned long long)replica_gen,
+                (unsigned long long)barrier_seq, cur_gen, cur_seq);
+    }
+    return ok;
 }
 
 /* ---- 副本生命周期 ---- */
 static void replica_configure(proxy_replica_t *r, uint32_t addr, int port,
-                              unsigned long long gen) {
+                              unsigned long long gen, unsigned long long token) {
     pthread_mutex_lock(&r->lock);
     replica_drop_fifo_locked(r);
     r->used = 1;
     r->addr = addr;
     r->port = port;
     r->gen = gen;
+    r->token = token;
     r->conn_gen++;
     r->phase = REPL_PHASE_RECOVERY;
     r->resumed = 0;
     r->failed = 0;
+    r->fault_pending = 0;
+    r->fault_reason = 0;
     r->barrier_last = 0;
+    r->barrier_seq = 0;
     r->backoff_ms = 0;
     proxy_commit_set_replica((uint64_t)r->id, 1);
     proxy_commit_set_buffering((uint64_t)r->id, 1);
@@ -413,7 +464,11 @@ static void replica_deactivate(proxy_replica_t *r) {
     r->phase = REPL_PHASE_RECOVERY;
     r->resumed = 0;
     r->failed = 0;
+    r->fault_pending = 0;
+    r->fault_reason = 0;
     r->barrier_last = 0;
+    r->barrier_seq = 0;
+    r->token = 0;
     pthread_cond_broadcast(&r->cond);
     pthread_mutex_unlock(&r->lock);
     proxy_commit_set_replica((uint64_t)r->id, 0);
@@ -426,7 +481,7 @@ static void poll_replicas(void) {
     for (int i = 0; i < PROXY_MAX_REPLICAS; i++) {
         proxy_replica_t *r = &g_reps[i];
         char key[32];
-        __u64 gen = 0, addr = 0, port = 0;
+        __u64 gen = 0, addr = 0, port = 0, token = 0;
 
         snprintf(key, sizeof(key), "replica_gen.%d", i);
         if (read_proxy_cfg_u64(key, &gen) != 0) gen = 0;
@@ -434,6 +489,8 @@ static void poll_replicas(void) {
         if (read_proxy_cfg_u64(key, &addr) != 0) addr = 0;
         snprintf(key, sizeof(key), "slave_port.%d", i);
         if (read_proxy_cfg_u64(key, &port) != 0) port = 0;
+        snprintf(key, sizeof(key), "replica_token.%d", i);
+        if (read_proxy_cfg_u64(key, &token) != 0) token = 0;
 
         if (gen == 0 || addr == 0 || port == 0) {
             /* 单副本兼容：老 Master 只写 slave_addr/slave_port。slot 0 回退读取。 */
@@ -454,13 +511,13 @@ static void poll_replicas(void) {
         }
 
         if (r->used && r->gen == gen && r->addr == (uint32_t)addr &&
-            r->port == (int)port)
+            r->port == (int)port && r->token == (unsigned long long)token)
             continue;
         if ((uint32_t)addr == 0 || port == 0) {
             if (r->used) replica_deactivate(r);
             continue;
         }
-        replica_configure(r, (uint32_t)addr, (int)port, gen);
+        replica_configure(r, (uint32_t)addr, (int)port, gen, (unsigned long long)token);
     }
 }
 
@@ -468,6 +525,7 @@ static void poll_replicas(void) {
 /* 发送一个批次；batch_gen 为取批次时的 barrier_gen。 */
 static void replica_send_batch(proxy_replica_t *r, proxy_repl_node_t **batch, int n,
                                unsigned long long batch_gen) {
+    (void)batch_gen;   /* 不再跨连接续发：任何发送错误都直接隔离该 slot */
     struct iovec iov[PROXY_REPL_BATCH_MAX];
     size_t total = 0;
     for (int i = 0; i < n; i++) {
@@ -540,49 +598,35 @@ static void replica_send_batch(proxy_replica_t *r, proxy_repl_node_t **batch, in
         }
     }
 
+    /* 已发送字节折算后的节点：整节点已在上面 free；keep_from 起是未完整发送的
+     * 尾部。TCP 连接一旦出错，无法证明 Slave 对“半条 RESP”执行到了哪里，
+     * 因此**绝不能**把 off 跨新连接续发（新连接 parser 会从命令中间开始）。
+     * 直接丢弃该 slot 的全部未发数据并 fail-closed，由 Slave 重连后按已确认
+     * offset 走 REPLSYNC。 */
     pthread_mutex_lock(&r->lock);
     r->in_flight = 0;
     r->sent_bytes += sent;
-    /* 未发送部分：仅当期间没有新 barrier（数据仍属于当前 LIVE 流）时放回队首。
-     * barrier 之后到达的数据由 Commit Gate 的恢复缓冲承接，这里丢弃旧的即可。 */
-    int keep = (gave_up && keep_from < n && r->used && !r->failed &&
-                r->barrier_gen == batch_gen);
-    if (keep) {
-        proxy_repl_node_t *unsent = batch[keep_from];
-        for (int i = keep_from; i < n; i++) batch[i]->next = (i + 1 < n) ? batch[i + 1] : NULL;
-        /* 重新接到队首，保持原有顺序 */
-        if (n > keep_from) {
-            batch[n - 1]->next = r->head;
-            r->head = unsent;
-            if (!r->tail) r->tail = batch[n - 1];
-            size_t add = 0;
-            for (int i = keep_from; i < n; i++) add += replica_remaining(batch[i]);
-            r->bytes += add;
-            r->nodes += (unsigned long long)(n - keep_from);
-        }
+    for (int i = keep_from; i < n; i++) free(batch[i]);
+    if (gave_up) {
+        r->dropped_bytes += (unsigned long long)(total - sent);
+        replica_mark_fault_locked(r, 3);   /* 3 = 数据通道不可确定投递 */
     } else {
-        for (int i = keep_from; i < n; i++) free(batch[i]);
-        if (gave_up) r->dropped_bytes += (unsigned long long)(total - sent);
+        int drained = proxy_slave_drain(&r->slave);
+        if (drained != 0)
+            replica_mark_fault_locked(r, 4); /* 4 = 对端关闭/数据通道 EOF */
     }
+    r->connected = 0;
     pthread_cond_broadcast(&r->idle);
     pthread_mutex_unlock(&r->lock);
 
     if (gave_up) {
-        /* 真错误（非瞬态 EAGAIN）：摘掉 fd，主线程下一轮会重连。
-         * 数据已回退 FIFO（或 barrier 后丢弃），重连后按序继续。 */
-        proxy_slave_mark_down(&r->slave, "replica writev failed");
-        pthread_mutex_lock(&r->lock);
-        r->connected = 0;
-        pthread_mutex_unlock(&r->lock);
+        proxy_slave_mark_down(&r->slave, "replica writev indeterminate");
         fprintf(stderr, "ebpf-proxy: replica slot %d send failed (sent=%zu/%zu), "
-                        "will reconnect\n", r->id, sent, total);
-    } else if (proxy_slave_drain(&r->slave) != 0) {
-        /* Slave 主端口作为数据通道时会为每个写命令回 +OK。proxy 不消费会
-         * 把 Slave out ring / socket buffer 塞满；这里顺手排空。对端关闭则重连。 */
+                        "slot isolated — slave must resync\n", r->id, sent, total);
+    } else if (r->failed) {
         proxy_slave_mark_down(&r->slave, "replica peer closed");
-        pthread_mutex_lock(&r->lock);
-        r->connected = 0;
-        pthread_mutex_unlock(&r->lock);
+        fprintf(stderr, "ebpf-proxy: replica slot %d data channel closed by peer, "
+                        "slot isolated — slave must resync\n", r->id);
     }
 }
 
@@ -654,6 +698,22 @@ static void *replica_thread_main(void *arg) {
                 local_port = want_port;
             }
             if (proxy_slave_connect(&r->slave) == 0) {
+                /* 认证 proxy 数据入口：普通客户端无法得知 token。失败即该 slot
+                 * fail-closed（Master 会拒绝并让 Slave 重新 REPLSYNC）。 */
+                unsigned long long tok;
+                pthread_mutex_lock(&r->lock);
+                tok = r->token;
+                pthread_mutex_unlock(&r->lock);
+                if (tok != 0 && proxy_slave_handshake(&r->slave, tok) != 0) {
+                    fprintf(stderr, "ebpf-proxy: replica slot %d REPLDATA handshake "
+                                    "failed — slot isolated\n", r->id);
+                    pthread_mutex_lock(&r->lock);
+                    replica_mark_fault_locked(r, 6);
+                    pthread_mutex_unlock(&r->lock);
+                    proxy_slave_disconnect(&r->slave);
+                    connected = 0;
+                    continue;
+                }
                 connected = 1;
                 backoff = PROXY_SLAVE_BACKOFF_INIT_MS;
                 pthread_mutex_lock(&r->lock);
@@ -744,10 +804,10 @@ static void replica_barrier_poll(proxy_replica_t *r) {
             }
         }
         r->barrier_last = v;
-        if (timed_out) replica_isolate_locked(r, 2);
+        r->barrier_seq = v;
+        if (timed_out) replica_mark_fault_locked(r, 2);
         pthread_mutex_unlock(&r->lock);
-        if (timed_out)
-            proxy_slave_mark_down(&r->slave, "barrier quiesce timeout");
+        if (timed_out) replica_apply_fault(r);
         write_client_ctl_u64(KVS_CTL_SLOT_ACK(r->id), v);   /* ACK 回显 seq */
         fprintf(stderr, "ebpf-proxy: replica slot %d barrier up seq=%llu (RECOVERY%s)\n",
                 r->id, (unsigned long long)v,
@@ -1028,6 +1088,7 @@ static void main_loop(void) {
             scan_tick = 0;
             poll_replicas();
         }
+        poll_replica_faults();
         proxy_capture_gate_poll();
         poll_session_state();
 
