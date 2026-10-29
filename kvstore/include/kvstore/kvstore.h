@@ -307,6 +307,7 @@ typedef struct conn_s {
     int repl_draining;
     int repl_fullsync_pending;
     int repl_transport_kind;
+    int repl_fs_v2;               /* REPLSYNC 协商：对端支持 rdma-fullsync-v2（跨线程只读） */
     /* ---- eBPF 多副本 fan-out slot（每个控制连接一份） ----
      * -1 = 未注册到 ebpf-proxy。屏障/恢复状态必须是 per-connection 的：
      * A 的 REPLACK 不能解除 B 的恢复屏障（见 docs/multi-slave-design.md §7.4）。 */
@@ -393,6 +394,8 @@ typedef struct {
     int rdma_recv_slots;
     int rdma_chunk_size;
     int rdma_qp_wr_depth;
+    int rdma_fullsync_max_concurrent; /* 新并发 fullsync 路径：同时处于 RDMA_SENDING 的 job 上限 */
+    int rdma_fullsync_pause_us;       /* 新并发 fullsync 路径：每 WRITE chunk 间隔（µs），0=不限速 */
     int repl_rdma_write_buf_max_mb;   /* slave WRITE 目标大小上限（MB），超限拒绝 → sendfile 回退 */
     kvs_aof_fsync_policy_t aof_fsync;
     int aof_fsync_per_command;   /* 逐条刷盘：每条命令立即 write+fsync（实验，对齐 redis 行为） */
@@ -546,6 +549,8 @@ void repl_rdma_slave_start_fullsync_connect(void);
 int repl_rdma_slave_prepare_target(int tcp_fd, uint64_t transfer_id, size_t total_bytes);
 void repl_rdma_slave_target_cleanup(int remove_incomplete);
 void repl_rdma_slave_abort_target(uint64_t tid);
+/* 新并发 fullsync：记录 FULLRESYNC v2 的 (tid, epoch)，供后台 RDMA connect 组 CM hello。 */
+void repl_rdma_slave_set_pending_fullsync(uint64_t tid, uint64_t epoch);
 void repl_rdma_slave_finalize_signal(uint64_t tid);
 void repl_rdma_master_transfer_cleanup(conn_t *c);
 int repl_realtime_send(conn_t *c, const unsigned char *buf, size_t len);
@@ -604,6 +609,8 @@ void repl_broadcast(const unsigned char *raw, size_t rawlen);
  *  - repl_barrier_note_applied(c,...): 该副本的 REPLACK 追上 catchup_end 即放行该副本 */
 int repl_barrier_pending(void);
 void repl_barrier_tick(void);
+/* 多 Slave 并发 RDMA 全量同步：owner 线程周期 drain 后台 job 事件（WR_DONE/FAILED）。 */
+void repl_rdma_fs_tick(void);
 void repl_barrier_note_applied(conn_t *c, unsigned long long applied_offset);
 /* Slave 本进程的 proxy 数据入口 token（REPLSYNC 上报给 Master，再由 proxy 在
  * REPLDATA 握手中回显）。0 表示尚未生成/非 Slave。 */
@@ -833,6 +840,7 @@ int resp_null_bulk(char *out, size_t cap);
 size_t resp_build_cmd4(unsigned char *out, size_t cap, const char *cmd, const char *a1, const char *a2, const char *a3);
 size_t resp_build_cmd5(unsigned char *out, size_t cap, const char *cmd, const char *a1, const char *a2, const char *a3, const char *a4);
 size_t resp_build_cmd6(unsigned char *out, size_t cap, const char *cmd, const char *a1, const char *a2, const char *a3, const char *a4, const char *a5);
+size_t resp_build_cmd7(unsigned char *out, size_t cap, const char *cmd, const char *a1, const char *a2, const char *a3, const char *a4, const char *a5, const char *a6);
 size_t resp_build_cmd3(unsigned char *out, size_t cap, const char *cmd, const char *a1, const char *a2);
 size_t resp_build_cmd2(unsigned char *out, size_t cap, const char *cmd, const char *a1);
 size_t resp_build_cmd1(unsigned char *out, size_t cap, const char *cmd);

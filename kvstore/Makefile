@@ -38,6 +38,10 @@ REPL_RDMA_UNSUPPORTED_MASTER_PORT?=5210
 REPL_RDMA_UNSUPPORTED_SLAVE_PORT?=5211
 REPL_RDMA_SMOKE_MASTER_PORT?=5220
 REPL_RDMA_SMOKE_SLAVE_PORT?=5222
+REPL_MULTI_RDMA_MASTER_PORT?=5260
+REPL_MULTI_RDMA_SLAVE_A_PORT?=5262
+REPL_MULTI_RDMA_SLAVE_B_PORT?=5264
+REPL_MULTI_RDMA_PRELOAD?=30000
 REPL_RDMA_STRESS_MASTER_PORT?=5230
 REPL_RDMA_STRESS_SLAVE_PORT?=5232
 REPL_RDMA_STRESS_PRELOAD?=128
@@ -98,6 +102,8 @@ SRCS=$(SRC_DIR)/main/kvstore.c \
      $(SRC_DIR)/persistence/kvs_persist.c \
      $(SRC_DIR)/replication/kvs_repl.c \
      $(SRC_DIR)/replication/kvs_fullsync.c \
+     $(SRC_DIR)/replication/rdma_fullsync_mgr.c \
+     $(SRC_DIR)/replication/rdma_fullsync_transfer.c \
      $(SRC_DIR)/replication/kvs_repl_ebpf.c \
      $(SRC_DIR)/replication/kvs_repl_kprobe.c \
      $(SRC_DIR)/replication/kvs_sentinel.c \
@@ -171,6 +177,15 @@ $(TEST_FULLSYNC_BIN): $(TEST_FULLSYNC_SRC) src/replication/kvs_fullsync.c includ
 
 test_fullsync_protocol: $(TEST_FULLSYNC_BIN)
 	./$(TEST_FULLSYNC_BIN)
+
+# ---- 多 Slave 并发 RDMA 全量同步：hello/生命周期无硬件单测 ----
+TEST_MULTI_RDMA_SRC=tests/test_multi_rdma_fullsync.c
+TEST_MULTI_RDMA_BIN=tests/test_multi_rdma_fullsync
+$(TEST_MULTI_RDMA_BIN): $(TEST_MULTI_RDMA_SRC) src/replication/rdma_fullsync_mgr.c include/kvstore/replication/rdma_fullsync_mgr.h
+	$(CC) $(filter-out -DKVS_ENABLE_RDMA=1,$(CFLAGS)) -DKVS_ENABLE_RDMA=0 -I./include -o $@ $(TEST_MULTI_RDMA_SRC) src/replication/rdma_fullsync_mgr.c -lpthread
+
+test_multi_rdma_fullsync: $(TEST_MULTI_RDMA_BIN)
+	./$(TEST_MULTI_RDMA_BIN)
 
 # ---- VSEARCH 前缀参数 + 白名单校验单元测试（Task4）----
 TEST_VSEARCH_SRC=tests/test_vsearch.c
@@ -421,6 +436,10 @@ check-repl-rdma-smoke:
 	-sleep 0.5
 	ENABLE_RDMA=1 python3 ./tools/repl/run_repl_rdma_smoke.py --bin ./kvstore --master-port $(REPL_RDMA_SMOKE_MASTER_PORT) --slave-port $(REPL_RDMA_SMOKE_SLAVE_PORT) --rdma-dev $(RDMA_DEV)
 
+# ---- 两个 Slave 真正并发 RDMA 全量同步（非 root；需 siw/rxe 设备与可达 IP）----
+check-multi-rdma-fullsync: kvstore
+	python3 ./tools/repl/run_multi_rdma_fullsync.py --bin ./kvstore --host $(REPL_RDMA_SMOKE_HOST) --master-port $(REPL_MULTI_RDMA_MASTER_PORT) --slave-a-port $(REPL_MULTI_RDMA_SLAVE_A_PORT) --slave-b-port $(REPL_MULTI_RDMA_SLAVE_B_PORT) --rdma-dev $(RDMA_DEV) --preload $(REPL_MULTI_RDMA_PRELOAD)
+
 check-repl-rdma-stress:
 	-kill $$(lsof -ti:$(REPL_RDMA_STRESS_MASTER_PORT)) 2>/dev/null
 	-kill $$(lsof -ti:$(REPL_RDMA_STRESS_SLAVE_PORT)) 2>/dev/null
@@ -473,4 +492,4 @@ check-10w:
 
 check: check-resp check-ttl check-persist check-doc
 
-.PHONY: all clean build_dir check-kvstore check-slave-crash-recovery check-commit-gate-faults check-barrier-timeout check-multi-slave check-repl-5w5w test_persist_dump_demo test_persist_aof_demo test_vsearch check check-resp check-ttl check-persist check-doc check-bulk-1w check-all check-all-quick check-mass-ttl check-uring-persist check-mmap-recover check-repl check-repl-metrics check-repl-profile check-repl-ebpf check-repl-ebpf-env check-repl-ebpf-sync check-repl-ebpf-sync-required check-repl-ebpf-redirect check-repl-rdma-unsupported check-repl-rdma-smoke check-repl-rdma-stress check-repl-rdma-soak check-repl-rdma-soak-skip check-rdma-standalone-probe check-rdma-pingpong-smoke check-demo-full-dump check-demo-incr-aof check-demo-repl-sync test_uring_persist test_mmap_recover test_repl_basic check-uring-persist-c check-mmap-recover-c check-repl-basic check-persist-purge check-persist-save-frontier tools/ebpf/repl_ebpf_daemon ebpf-proxy client_capture_bpf
+.PHONY: all clean build_dir check-kvstore check-slave-crash-recovery check-commit-gate-faults check-barrier-timeout check-multi-slave check-repl-5w5w test_persist_dump_demo test_persist_aof_demo test_vsearch check check-resp check-ttl check-persist check-doc check-bulk-1w check-all check-all-quick check-mass-ttl check-uring-persist check-mmap-recover check-repl check-repl-metrics check-repl-profile check-repl-ebpf check-repl-ebpf-env check-repl-ebpf-sync check-repl-ebpf-sync-required check-repl-ebpf-redirect check-repl-rdma-unsupported check-repl-rdma-smoke check-multi-rdma-fullsync check-repl-rdma-stress check-repl-rdma-soak check-repl-rdma-soak-skip check-rdma-standalone-probe check-rdma-pingpong-smoke check-demo-full-dump check-demo-incr-aof check-demo-repl-sync test_uring_persist test_mmap_recover test_repl_basic check-uring-persist-c check-mmap-recover-c check-repl-basic check-persist-purge check-persist-save-frontier tools/ebpf/repl_ebpf_daemon ebpf-proxy client_capture_bpf

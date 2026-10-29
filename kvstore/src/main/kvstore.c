@@ -2,6 +2,7 @@
 #include "kvstore/kvstore.h"
 #include "kvstore/replication/repl_kprobe.h"
 #include "kvstore/replication/client_ctl.h"
+#include "kvstore/replication/rdma_fullsync_mgr.h"
 #include <bpf/bpf.h>
 #include <signal.h>
 #include <ctype.h>
@@ -82,6 +83,8 @@ kv_config_t g_cfg = {
     .rdma_recv_slots = 0,           /* 0 = use KVS_RDMA_RECV_SLOTS_DEFAULT (64) */
     .rdma_chunk_size = BUFFER_CAP * 4,
     .rdma_qp_wr_depth = 64,
+    .rdma_fullsync_max_concurrent = 2,
+    .rdma_fullsync_pause_us = 0,
     .repl_rdma_write_buf_max_mb = 256,
     .aof_fsync = KVS_AOF_FSYNC_ALWAYS,
     .aof_fsync_per_command = 0,   /* 0=批量；1=逐条 */
@@ -131,6 +134,7 @@ static size_t append_bulk(unsigned char *out, size_t pos, size_t cap, const char
 size_t resp_build_cmd4(unsigned char *out, size_t cap, const char *cmd, const char *a1, const char *a2, const char *a3) { size_t pos=0; pos += (size_t)snprintf((char*)out+pos, cap-pos, "*4\r\n"); pos=append_bulk(out,pos,cap,cmd); pos=append_bulk(out,pos,cap,a1); pos=append_bulk(out,pos,cap,a2); pos=append_bulk(out,pos,cap,a3); return pos; }
 size_t resp_build_cmd5(unsigned char *out, size_t cap, const char *cmd, const char *a1, const char *a2, const char *a3, const char *a4) { size_t pos=0; pos += (size_t)snprintf((char*)out+pos, cap-pos, "*5\r\n"); pos=append_bulk(out,pos,cap,cmd); pos=append_bulk(out,pos,cap,a1); pos=append_bulk(out,pos,cap,a2); pos=append_bulk(out,pos,cap,a3); pos=append_bulk(out,pos,cap,a4); return pos; }
 size_t resp_build_cmd6(unsigned char *out, size_t cap, const char *cmd, const char *a1, const char *a2, const char *a3, const char *a4, const char *a5) { size_t pos=0; pos += (size_t)snprintf((char*)out+pos, cap-pos, "*6\r\n"); pos=append_bulk(out,pos,cap,cmd); pos=append_bulk(out,pos,cap,a1); pos=append_bulk(out,pos,cap,a2); pos=append_bulk(out,pos,cap,a3); pos=append_bulk(out,pos,cap,a4); pos=append_bulk(out,pos,cap,a5); return pos; }
+size_t resp_build_cmd7(unsigned char *out, size_t cap, const char *cmd, const char *a1, const char *a2, const char *a3, const char *a4, const char *a5, const char *a6) { size_t pos=0; pos += (size_t)snprintf((char*)out+pos, cap-pos, "*7\r\n"); pos=append_bulk(out,pos,cap,cmd); pos=append_bulk(out,pos,cap,a1); pos=append_bulk(out,pos,cap,a2); pos=append_bulk(out,pos,cap,a3); pos=append_bulk(out,pos,cap,a4); pos=append_bulk(out,pos,cap,a5); pos=append_bulk(out,pos,cap,a6); return pos; }
 size_t resp_build_cmd3(unsigned char *out, size_t cap, const char *cmd, const char *a1, const char *a2) { size_t pos=0; pos += (size_t)snprintf((char*)out+pos, cap-pos, "*3\r\n"); pos=append_bulk(out,pos,cap,cmd); pos=append_bulk(out,pos,cap,a1); pos=append_bulk(out,pos,cap,a2); return pos; }
 size_t resp_build_cmd2(unsigned char *out, size_t cap, const char *cmd, const char *a1) { size_t pos=0; pos += (size_t)snprintf((char*)out+pos, cap-pos, "*2\r\n"); pos=append_bulk(out,pos,cap,cmd); pos=append_bulk(out,pos,cap,a1); return pos; }
 size_t resp_build_cmd1(unsigned char *out, size_t cap, const char *cmd) { size_t pos=0; pos += (size_t)snprintf((char*)out+pos, cap-pos, "*1\r\n"); pos=append_bulk(out,pos,cap,cmd); return pos; }
@@ -314,6 +318,12 @@ static int parse_args(int argc, char **argv) {
         else if (!strcmp(argv[i], "--rdma-qp-wr-depth") && i + 1 < argc) {
             g_cfg.rdma_qp_wr_depth = atoi(argv[++i]);
         }
+        else if (!strcmp(argv[i], "--rdma-fullsync-max-concurrent") && i + 1 < argc) {
+            g_cfg.rdma_fullsync_max_concurrent = atoi(argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--rdma-fullsync-pause-us") && i + 1 < argc) {
+            g_cfg.rdma_fullsync_pause_us = atoi(argv[++i]);
+        }
         else if (!strcmp(argv[i], "--repl-rdma-write-buf-max-mb") && i + 1 < argc) {
             g_cfg.repl_rdma_write_buf_max_mb = atoi(argv[++i]);
         }
@@ -458,6 +468,8 @@ static int apply_config_kv(const char *key, const char *value) {
     else if (!strcmp(key, "rdma_recv_slots")) g_cfg.rdma_recv_slots = atoi(value);
     else if (!strcmp(key, "rdma_chunk_size")) g_cfg.rdma_chunk_size = atoi(value);
     else if (!strcmp(key, "rdma_qp_wr_depth")) g_cfg.rdma_qp_wr_depth = atoi(value);
+    else if (!strcmp(key, "rdma_fullsync_max_concurrent")) g_cfg.rdma_fullsync_max_concurrent = atoi(value);
+    else if (!strcmp(key, "rdma_fullsync_pause_us")) g_cfg.rdma_fullsync_pause_us = atoi(value);
     else if (!strcmp(key, "repl_rdma_write_buf_max_mb")) g_cfg.repl_rdma_write_buf_max_mb = atoi(value);
     else if (!strcmp(key, "appendfsync")) {
         if (parse_appendfsync_policy(value, &policy) != 0) return -1;
@@ -1299,9 +1311,150 @@ void repl_barrier_tick(void) {
     }
 }
 
+static int send_control_line(int fd, const char *line, size_t len) {
+    size_t off = 0;
+    int spins = 0;
+    while (off < len && spins < 200) {
+        ssize_t w = send(fd, line + off, len - off, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (w > 0) { off += (size_t)w; continue; }
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            usleep(1000);
+            spins++;
+            continue;
+        }
+        break;
+    }
+    return off == len ? 0 : -1;
+}
+
+/*
+ * 新并发路径（fullsync=rdma + realtime=ebpf/tcp）：
+ *   owner 生成不可变快照 -> 登记 job -> 发送 FULLRESYNC(v2, 带 epoch) -> 返回事件循环。
+ * 真正的 RDMA 连接/远端 MR/数据发送由 rdma_fullsync_mgr 的后台 worker 完成。
+ * 与旧 queue_snapshot 的关键区别：不再在此线程同步建立 RDMA、等待 FULLRESYNCWR、
+ * 发送整个 dump —— 因此第二个 Slave 的 REPLSYNC 可以立即被处理。
+ */
+static int queue_snapshot_async(conn_t *c, unsigned long long snap_base_offset,
+                                int allow_rdma) {
+    char hdr[192];
+    char tmp_path[640];
+    int fd = -1;
+    size_t total_bytes = 0;
+    uint64_t tid = 0, epoch = 0;
+    int use_rdma = 0;
+    int n = 0;
+
+    /* backlog 边界语义与旧路径一致（见 §5.3）：历史连续时保留，不连续才 reset。 */
+    if (!repl_backlog_contiguous()) {
+        repl_backlog_reset(snap_base_offset);
+        fprintf(stderr, "master: fullsync boundary snap_base_offset=%llu "
+                        "backlog reset (discontinuous, async-rdma)\n", snap_base_offset);
+    } else {
+        fprintf(stderr, "master: fullsync boundary snap_base_offset=%llu "
+                        "backlog preserved (contiguous, async-rdma)\n", snap_base_offset);
+    }
+
+    /* 懒启动 CM listener：只在真正需要 RDMA 全量时绑定 rdma_port。
+     * 同机部署时 Slave 的 TCP 监听端口可能恰好等于 master_port+1（RDMA 端口），
+     * 启动时抢先绑定会让 Slave 起不来；这里失败则明确 TCP 回退（与旧路径一致）。 */
+    if (allow_rdma && rdma_fs_mgr_start() == 0
+        && rdma_fs_begin(c, (uint64_t)(uintptr_t)c, c->repl_slot,
+                                             c->repl_barrier_gen, c->repl_barrier_seq,
+                                             snap_base_offset, repl_commit_global_seq(),
+                                             &tid, &epoch) == 0) {
+        use_rdma = 1;
+        snprintf(tmp_path, sizeof(tmp_path), "%s.fullsync.tmp.%ld.%llu",
+                 g_cfg.dump_path, (long)getpid(), (unsigned long long)tid);
+    } else {
+        /* Manager 不可用：明确回退 TCP sendfile（tid=0，Slave 不建 RDMA 目标）。 */
+        tid = 0;
+        snprintf(tmp_path, sizeof(tmp_path), "%s.fullsync.tmp.%ld",
+                 g_cfg.dump_path, (long)getpid());
+        repl_rdma_log("queue_snapshot_async - manager unavailable, TCP fallback");
+    }
+
+    /* RDMA 路径用 transfer 唯一名 + O_EXCL；TCP 回退沿用进程级 tmp 名，
+     * 崩溃残留用 O_TRUNC 覆盖（本进程是唯一写者）。 */
+    int open_flags = O_RDWR | O_CREAT | O_CLOEXEC | (use_rdma ? O_EXCL : O_TRUNC);
+    fd = open(tmp_path, open_flags, 0666);
+    if (fd < 0) {
+        fprintf(stderr, "master: fullsync snapshot open %s failed: %s\n", tmp_path, strerror(errno));
+        goto fail;
+    }
+    if (kvs_dump_to_fd(fd, snap_base_offset) != 0) {
+        fprintf(stderr, "master: fullsync snapshot dump failed\n");
+        goto fail;
+    }
+    total_bytes = (size_t)lseek(fd, 0, SEEK_END);
+    if (total_bytes == 0) {
+        fprintf(stderr, "master: fullsync snapshot empty\n");
+        goto fail;
+    }
+
+    if (use_rdma) {
+        if (rdma_fs_snapshot_ready(tid, fd, tmp_path, total_bytes) != 0) {
+            fprintf(stderr, "master: fullsync job tid=%llu snapshot_ready failed\n",
+                    (unsigned long long)tid);
+            goto fail;
+        }
+        fd = -1;   /* 所有权移交给 job：完成/失败时由 manager close+unlink */
+        c->repl_transfer_id = tid;
+        n = snprintf(hdr, sizeof(hdr), "+FULLRESYNC %s %llu %zu %llu rdma-write-v2 %llu\r\n",
+                     repl_master_id(), snap_base_offset, total_bytes,
+                     (unsigned long long)tid, (unsigned long long)epoch);
+    } else {
+        c->repl_transfer_id = 0;
+        n = snprintf(hdr, sizeof(hdr), "+FULLRESYNC %s %llu %zu 0 rdma-write\r\n",
+                     repl_master_id(), snap_base_offset, total_bytes);
+    }
+    repl_note_send_context("fullsync-header-async", (size_t)n, snap_base_offset,
+                           (unsigned char *)hdr);
+
+    /* 控制连接写：当前实现中 ebpf/ebpf+tcp 实时路径不使用 repl_fwd 写该 fd，
+     * owner 在此直接写是单写者（与旧 queue_snapshot 行为一致）。 */
+    if (send_control_line(c->fd, hdr, (size_t)n) != 0) {
+        fprintf(stderr, "master: fullsync header send failed\n");
+        goto fail;
+    }
+
+    repl_note_fullsync(total_bytes);
+    c->repl_offset_sent = repl_master_offset();
+    c->repl_last_send_ms = kvs_now_ms();
+
+    if (use_rdma) {
+        /* 后台 worker 现在等待 CM/MR，然后与其他 Slave 的 job 并发 WRITE。 */
+        repl_rdma_log("queue_snapshot_async - tid=%llu bytes=%zu scheduled",
+                      (unsigned long long)tid, total_bytes);
+        return 0;
+    }
+
+    /* TCP 回退：同步 sendfile（仅 manager 不可用的异常路径）。 */
+    if (repl_fullsync_sendfile(c->fd, fd, total_bytes) != 0) {
+        fprintf(stderr, "master: fullsync TCP fallback sendfile failed\n");
+        goto fail;
+    }
+    close(fd);
+    unlink(tmp_path);
+    repl_rdma_log("queue_snapshot_async - TCP fallback complete bytes=%zu", total_bytes);
+    return 0;
+
+fail:
+    if (fd >= 0) {
+        close(fd);
+        unlink(tmp_path);
+    }
+    if (use_rdma && tid) rdma_fs_cancel(tid, RDMA_FS_REASON_SNAPSHOT);
+    return -1;
+}
+
 /* 生成快照并启动全量传输。snap_base_offset 由调用方在**屏障建立后**取好传入
  * （见 REPLSYNC handler）：屏障必须早于 CAPTURE_ENABLE，边界才干净。 */
 static int queue_snapshot(conn_t *c, unsigned long long snap_base_offset) {
+    if (rdma_fs_should_enable())
+        /* 未协商 v2 的旧 Slave 不能解释 CM hello：明确回退 TCP sendfile，
+         * 而不是让它在新的 CM listener 上失败重试。 */
+        return queue_snapshot_async(c, snap_base_offset, c->repl_fs_v2 ? 1 : 0);
+
     char hdr[128];
     char tmp_path[512];
     int fd;
@@ -1482,6 +1635,43 @@ static int queue_snapshot(conn_t *c, unsigned long long snap_base_offset) {
     repl_rdma_log("queue_snapshot - complete snapshot_bytes=%zu repl_offset=%llu", total, repl_master_offset());
 out:
     return ret;
+}
+
+/*
+ * Master owner 周期入口（reactor loop）：取后台 fullsync job 的结果并完成控制面动作。
+ *   - WR_DONE：所有 RDMA WRITE 已成功完成 → 发 FULLSYNCEND（等待该副本 REPLDONE）；
+ *   - FAILED：只对该副本 fail-closed（cancel 自己的 Barrier、拒绝该连接），
+ *     不影响其他 job / 其他副本的 QP 与发送进度。
+ */
+void repl_rdma_fs_tick(void) {
+#if KVS_ENABLE_RDMA
+    rdma_fs_event_t evs[8];
+    int n = rdma_fs_drain_events_owner(evs, 8);
+    for (int i = 0; i < n; i++) {
+        conn_t *c = (conn_t *)evs[i].owner_conn;
+        if (evs[i].type == RDMA_FS_EV_WR_DONE) {
+            repl_rdma_log("fs_tick - tid=%llu WR done bytes=%llu, send FULLSYNCEND",
+                          (unsigned long long)evs[i].tid,
+                          (unsigned long long)evs[i].bytes_completed);
+            if (c && c->fd >= 0) repl_fullsync_send_end(c->fd, evs[i].tid);
+        } else if (evs[i].type == RDMA_FS_EV_FAILED) {
+            fprintf(stderr, "master: fullsync job tid=%llu slot=%d failed "
+                            "(%s, bytes=%llu/%llu) — isolating this replica only\n",
+                    (unsigned long long)evs[i].tid, evs[i].slot,
+                    rdma_fs_reason_name(evs[i].reason),
+                    (unsigned long long)evs[i].bytes_completed,
+                    (unsigned long long)evs[i].bytes_total);
+            if (c && c->fd >= 0 && evs[i].tid)
+                repl_fullsync_abort_master(c->fd, evs[i].tid);
+            if (c) {
+                if (c->repl_transfer_id == evs[i].tid) c->repl_transfer_id = 0;
+                c->repl_fullsync_pending = 0;
+                repl_barrier_cancel(c);
+                repl_reject_replica(c);
+            }
+        }
+    }
+#endif
 }
 
 static int is_readonly_slave_blocked(const char *cmd) {
@@ -2062,6 +2252,10 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
          * 握手），新 Slave 一律携带；普通客户端无法得知该 token。 */
         unsigned long long req_data_token = argc >= 6
             ? (unsigned long long)strtoull(argv[5], NULL, 10) : 0;
+        /* 新并发 RDMA fullsync 能力协商：最后一个参数精确为 rdma-fs-v2。
+         * 旧 Slave 不带该参数 → 本副本回退 TCP sendfile（见 queue_snapshot）。 */
+        int req_fs_v2 = (argc >= 2 && !strcmp(argv[argc - 1], "rdma-fs-v2"));
+        if (c) c->repl_fs_v2 = req_fs_v2;
         /* Use req_offset for backlog check (data the slave needs).
          * req_durable may lag behind req_offset due to lazy AOF fsync,
          * but that doesn't prevent partial resync since the master
@@ -2144,10 +2338,13 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
                 repl_barrier_cancel(c);
                 repl_reject_replica(c);
                 c->repl_fullsync_pending = 0;
-                g_repl_fullsync_in_progress = 0;
-                if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma")) {
-                    repl_rdma_stop_fullsync();
-                    repl_rdma_master_transfer_cleanup(c);
+                c->repl_transfer_id = 0;
+                if (!rdma_fs_should_enable()) {
+                    g_repl_fullsync_in_progress = 0;
+                    if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma")) {
+                        repl_rdma_stop_fullsync();
+                        repl_rdma_master_transfer_cleanup(c);
+                    }
                 }
             }
         }
@@ -2205,10 +2402,35 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         return 0;
     }
     if (!strcmp(cmd, "REPLDONE")) {
-        /* Master 侧：slave 发来 REPLDONE 表示全量同步在 slave 侧已完成 */
+        /* Master 侧：slave 发来 REPLDONE 表示全量同步在 slave 侧已完成。
+         * 新并发路径的 REPLDONE 携带 transfer_id；必须按 tid/slot/gen 验证，
+         * 陈旧 REPLDONE 不得放行 Barrier 或影响其他副本。 */
+        unsigned long long done_tid = argc >= 2
+            ? (unsigned long long)strtoull(argv[1], NULL, 10) : 0;
         if (g_cfg.role == ROLE_MASTER && c && c->is_replica) {
+            int new_proto = (done_tid != 0 && rdma_fs_should_enable());
+            if (new_proto && c->repl_transfer_id != done_tid) {
+                /* 同一控制连接上旧 transfer 的重复/迟到 REPLDONE：不得放行新 Barrier。 */
+                fprintf(stderr, "master: stale REPLDONE tid=%llu != active=%llu — ignored\n",
+                        done_tid, (unsigned long long)c->repl_transfer_id);
+                return 0;
+            }
+            if (new_proto) {
+                int ok = rdma_fs_on_repldone(((uint64_t)done_tid), c,
+                                             c->repl_slot, c->repl_barrier_gen);
+                if (!ok) {
+                    fprintf(stderr, "master: stale/mismatched REPLDONE tid=%llu "
+                                    "(active=%llu slot=%d gen=%llu) — ignored\n",
+                            done_tid, (unsigned long long)c->repl_transfer_id,
+                            c->repl_slot, (unsigned long long)c->repl_barrier_gen);
+                    return 0;
+                }
+            }
             c->repl_fullsync_pending = 0;
-            g_repl_fullsync_in_progress = 0;
+            if (!new_proto) {
+                g_repl_fullsync_in_progress = 0;
+            }
+            c->repl_transfer_id = 0;
 
             /* Slave 确认快照已加载完成 → 放行屏障：proxy 切回 FORWARDING 并 flush
              * 全量期间攒下的 proxy_cache。放行必须由 Slave 的确认触发，这样 cache 里的
@@ -2252,9 +2474,12 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
                 }
             }
 
-            /* 从机已确认全量同步完成 — 关闭 RDMA，后续增量走 realtime transport */
-            repl_rdma_stop_fullsync();
-            repl_rdma_log("master_repldone - slave fullsync complete, RDMA stopped");
+            /* 旧单实例路径：从机确认全量完成后关闭 RDMA。
+             * 新并发路径由 rdma_fullsync_mgr 在 REPLDONE 后异步销毁该 job 的 QP/CQ，
+             * 不能调用全局 stop（会伤害其他 Slave 的 job）。 */
+            if (!new_proto) repl_rdma_stop_fullsync();
+            repl_rdma_log("master_repldone - slave fullsync complete tid=%llu (%s)",
+                          done_tid, new_proto ? "async job done" : "RDMA stopped");
             return 0;
         }
         /* Slave 侧兼容（旧代码路径，保留以防万一） */
@@ -2288,8 +2513,10 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         kvs_repl_ebpf_stats_t ebpf_stats;
         kvs_ebpf_proxy_stats_t proxy_stats;
         kvs_repl_kprobe_stats_t kprobe_stats;
+        rdma_fs_stats_t fs_stats;
         int recover_n = persist_build_recover_text(recover, sizeof(recover));
         persist_aof_debug_state(&aof_dbg);
+        rdma_fs_get_stats(&fs_stats);
         repl_ebpf_get_stats(&ebpf_stats);
         repl_ebpf_proxy_get_stats(&proxy_stats);
         repl_kprobe_rdma_get_stats(&kprobe_stats);
@@ -2335,6 +2562,16 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             "repl_partialsync_err_count:%llu\n"
             "repl_broadcast_bytes:%llu\n"
             "repl_snapshot_bytes:%llu\n"
+            "rdma_fs_active_jobs:%u\n"
+            "rdma_fs_sending_jobs:%u\n"
+            "rdma_fs_waiting_jobs:%u\n"
+            "rdma_fs_total_started:%llu\n"
+            "rdma_fs_total_completed:%llu\n"
+            "rdma_fs_total_failed:%llu\n"
+            "rdma_fs_cm_rejects:%llu\n"
+            "rdma_fs_cq_errors:%llu\n"
+            "rdma_fs_registered_bytes:%llu\n"
+            "rdma_fs_max_concurrency_seen:%u\n"
             "repl_backlog_size:%llu\n"
             "repl_backlog_histlen:%llu\n"
             "repl_backlog_start_offset:%llu\n"
@@ -2446,6 +2683,16 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             repl_partialsync_err_count(),
             repl_broadcast_bytes(),
             repl_snapshot_bytes(),
+            fs_stats.active_jobs,
+            fs_stats.sending_jobs,
+            fs_stats.waiting_jobs,
+            fs_stats.total_started,
+            fs_stats.total_completed,
+            fs_stats.total_failed,
+            fs_stats.cm_rejects,
+            fs_stats.cq_errors,
+            fs_stats.registered_bytes,
+            fs_stats.max_concurrency_seen,
             repl_backlog_size(),
             repl_backlog_histlen(),
             repl_backlog_start_offset(),
@@ -3223,23 +3470,39 @@ int parse_resp_stream(conn_t *c, unsigned char *buf, size_t *len, int from_repli
                         fprintf(stderr, "repl rdma: +FULLRESYNCWR tid=%llu addr=0x%llx rkey=%llu cap=%llu\n",
                                 tid, addr, rkey, cap);
                         if (g_cfg.role == ROLE_MASTER) {
-                            repl_rdma_set_remote_write_mr_info(tid, (uint64_t)addr,
-                                                               (uint32_t)rkey, cap);
+                            /* 先尝试新并发路径的 job；无匹配才走旧单实例路径。
+                             * 控制连接绑定：只有 owner_conn==c 的 job 接受该 MR。 */
+                            if (!rdma_fs_on_remote_mr(tid, c, (uint64_t)addr,
+                                                      (uint32_t)rkey, cap)) {
+                                repl_rdma_set_remote_write_mr_info(tid, (uint64_t)addr,
+                                                                   (uint32_t)rkey, cap);
+                            }
                         }
                     } else if (from_replication && argc >= 4 && !strcmp(argv[0], "FULLRESYNC")) {
                         unsigned long long fullsync_target = strtoull(argv[3], NULL, 10);
                         unsigned long long transfer_id = strtoull(argv[4], NULL, 10);
+                        /* v2（并发多 Slave）额外携带 master epoch，用于 CM hello 匹配。
+                         * 旧 master 不带 epoch → 0，Slave 不发送 private_data，兼容旧 listener。 */
+                        unsigned long long fs_epoch = (argc >= 7) ? strtoull(argv[6], NULL, 10) : 0;
                         repl_slave_set_sync_state(argv[1], (unsigned long long)strtoull(argv[2], NULL, 10), (unsigned long long)strtoull(argv[2], NULL, 10), 1, fullsync_target);
-                        repl_rdma_log("slave_parse - FULLRESYNC replid=%s offset=%s target=%s tid=%llu", argv[1], argv[2], argv[3], transfer_id);
-                        /* 只有确认是全量才建立 RDMA 通道（partial 的 +CONTINUE 不建连）。 */
-                        if (g_cfg.role == ROLE_SLAVE)
+                        repl_rdma_log("slave_parse - FULLRESYNC replid=%s offset=%s target=%s tid=%llu epoch=%llu",
+                                      argv[1], argv[2], argv[3], transfer_id, fs_epoch);
+                        /* 只有确认是全量且 master 给了 transfer_id 才建立 RDMA 通道
+                         * （tid=0 表示 master 明确走 TCP sendfile 回退）。 */
+                        if (g_cfg.role == ROLE_SLAVE && transfer_id != 0) {
+                            repl_rdma_slave_set_pending_fullsync(transfer_id, fs_epoch);
                             repl_rdma_slave_start_fullsync_connect();
+                        }
                         /* 尝试 One-Sided WRITE: 准备 file-backed 目标 + 注册 MR + 发 FULLRESYNCWR */
-                        if (fullsync_target > 0) {
+                        if (transfer_id != 0 && fullsync_target > 0) {
                             extern int g_slave_fd;
                             if (repl_rdma_slave_prepare_target(g_slave_fd, transfer_id, (size_t)fullsync_target) != 0) {
                                 repl_rdma_log("slave_parse - WRITE target setup failed, will fall back");
                             }
+                        } else if (transfer_id == 0) {
+                            /* Master 明确 TCP 回退：清掉上一次残留的 file-backed 目标，
+                             * 否则 KVSD 拦截可能写进旧映射而不是 legacy tmp。 */
+                            repl_rdma_slave_target_cleanup(1);
                         }
                     } else if (from_replication && argc >= 2 && !strcmp(argv[0], "FULLSYNCABORT")) {
                         /* Slave 侧: master 放弃 WRITE 目标，丢弃残留（含未完成临时文件） */
@@ -3909,6 +4172,8 @@ int main(int argc, char **argv) {
                 "  --rdma-recv-slots N     接收槽位数 (默认 64)\n"
                 "  --rdma-chunk-size SIZE  分块大小 (默认 262144)\n"
                 "  --rdma-qp-wr-depth N    QP 队列深度 (默认 64)\n"
+                "  --rdma-fullsync-max-concurrent N  并发 RDMA 全量 job 上限 (默认 2)\n"
+                "  --rdma-fullsync-pause-us N        每个 WRITE chunk 间隔 µs (默认 0)\n"
                 "  --appendfsync always|off  AOF fsync 策略 (默认 always)\n"
                 "  --ebpf-enabled          启用 eBPF sockmap\n"
                 "  --ebpf-obj PATH         eBPF 对象文件路径\n"

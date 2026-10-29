@@ -341,6 +341,9 @@ int reactor_start(void) {
             repl_barrier_tick();
             g_last_expire = now;
         }
+        /* 并发 RDMA 全量同步：后台 worker 的完成/失败事件必须在 owner 线程处理
+         * （发 FULLSYNCEND / 只拒绝失败副本）。每轮都 drain，空闲时开销是一次空遍历。 */
+        repl_rdma_fs_tick();
 
         if (n < 0) {
             if (errno == EINTR) continue;

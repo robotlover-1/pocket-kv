@@ -1,6 +1,7 @@
 #define _GNU_SOURCE   /* sendfile(2) 需要 */
 #include "kvstore/kvstore.h"
 #include "kvstore/replication/repl_kprobe.h"
+#include "kvstore/replication/rdma_fullsync_mgr.h"
 #include <fcntl.h>
 #include <poll.h>
 #include <string.h>
@@ -616,6 +617,18 @@ static uint64_t g_slave_fullsync_aborted_tid = 0;
 /* One-Sided WRITE: 是否已收到最终 WRITE_WITH_IMM（= g_slave_fullsync_target.imm_received 别名） */
 #endif
 
+/* Slave: 新并发路径 FULLRESYNC v2 携带的 transfer_id / master epoch。
+ * RDMA connect 在后台线程执行，握手时用它们填充 CM private_data hello。
+ * epoch==0 表示旧 master（或 TCP 回退），不发送 private_data，保持旧 listener 兼容。 */
+static uint64_t g_slave_pending_fullsync_tid = 0;
+static uint64_t g_slave_pending_fullsync_epoch = 0;
+
+void repl_rdma_slave_set_pending_fullsync(uint64_t tid, uint64_t epoch) {
+    g_slave_pending_fullsync_tid = tid;
+    g_slave_pending_fullsync_epoch = epoch;
+    if (tid && !epoch) g_slave_pending_fullsync_epoch = 0;
+}
+
 typedef struct repl_transport_ops_s {
     const char *name;
     int supported;
@@ -1118,7 +1131,18 @@ static int repl_rdma_connect_handshake(void) {
     if (!g_repl_rdma_ctx.id || !g_repl_rdma_ctx.qp_ready) return -1;
     repl_rdma_log("connect", "issuing rdma_connect");
     repl_rdma_set_state(REPL_RDMA_STATE_CONNECTING, "rdma_connect");
-    if (rdma_connect(g_repl_rdma_ctx.id, NULL) != 0) {
+    /* 新并发 fullsync listener 需要 hello(tid, epoch) 把连接派发给正确的 job。
+     * 旧 master/纯 RDMA 实时路径不带 epoch → 不发送 private_data。 */
+    struct rdma_conn_param param;
+    memset(&param, 0, sizeof(param));
+    unsigned char hello[RDMA_FS_CM_HELLO_LEN];
+    if (g_slave_pending_fullsync_tid != 0 && g_slave_pending_fullsync_epoch != 0) {
+        rdma_fs_cm_hello_encode(hello, g_slave_pending_fullsync_tid,
+                                g_slave_pending_fullsync_epoch);
+        param.private_data = hello;
+        param.private_data_len = (uint8_t)sizeof(hello);
+    }
+    if (rdma_connect(g_repl_rdma_ctx.id, &param) != 0) {
         repl_rdma_log("connect", "rdma_connect failed");
         return -1;
     }
@@ -2880,6 +2904,9 @@ void repl_rdma_slave_target_cleanup(int remove_incomplete) {
 /* Master: 幂等清理全量同步 transfer 状态。不关闭共享 RDMA 连接。
  * 在传输完成、失败、超时、owner 连接断开时调用。 */
 void repl_rdma_master_transfer_cleanup(conn_t *c) {
+    /* 新并发路径：owner 连接关闭/被拒绝时取消其所有 job，之后 manager 不再把
+     * 任何事件指向该 conn（防 UAF）。旧路径没有 job，这里是无害的空遍历。 */
+    rdma_fs_cancel_owner(c);
     if (c) {
         c->repl_transfer_id = 0;
         c->repl_fullsync_state = KVS_FULLSYNC_ST_IDLE;
@@ -3185,7 +3212,16 @@ void repl_slave_set_sync_state(const char *replid, unsigned long long applied_of
     g_slave_fullsync_target_bytes = fullsync_loading ? fullsync_target_bytes : 0;
     g_slave_fullsync_loaded_bytes = 0;
     /* 新一次 fullsync（同进程内多次重连）：允许再次 finalize。 */
-    if (fullsync_loading) g_slave_fullsync_finish_done = 0;
+    if (fullsync_loading) {
+        g_slave_fullsync_finish_done = 0;
+        /* 清掉上一次的 transfer 身份：TCP 回退（tid=0）或 v1 协议不得把旧 tid
+         * 带进 REPLDONE；prepare_target 会在新 transfer 中重新设置。 */
+        g_slave_pending_fullsync_tid = 0;
+        g_slave_pending_fullsync_epoch = 0;
+#if KVS_ENABLE_RDMA
+        g_slave_fullsync_target.transfer_id = 0;
+#endif
+    }
 #if KVS_ENABLE_RDMA
     if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma") || !strcasecmp(g_cfg.repl_transport_backend, "rdma"))
         fprintf(stderr, "repl rdma: slave_sync_state - replid=%s applied_offset=%llu durable_offset=%llu fullsync_loading=%d target_bytes=%llu\n",
@@ -3389,11 +3425,26 @@ static int repl_slave_send_repldone(void) {
 
     if (g_slave_fd < 0) return -1;
 
-    n = resp_build_cmd1(cmd, sizeof(cmd), "REPLDONE");
+    /* v2（并发多 Slave）必须回传 transfer_id，Master 才能把完成绑定到正确 job；
+     * 旧 master（epoch==0）保持 *1 REPLDONE，避免旧解析路径被多参数打乱。 */
+#if KVS_ENABLE_RDMA
+    uint64_t repldone_tid = g_slave_pending_fullsync_epoch
+        ? g_slave_fullsync_target.transfer_id : 0;
+#else
+    uint64_t repldone_tid = 0;
+#endif
+    if (repldone_tid != 0) {
+        char idbuf[32];
+        snprintf(idbuf, sizeof(idbuf), "%llu", (unsigned long long)repldone_tid);
+        n = resp_build_cmd2(cmd, sizeof(cmd), "REPLDONE", idbuf);
+    } else {
+        n = resp_build_cmd1(cmd, sizeof(cmd), "REPLDONE");
+    }
 
     ssize_t sent = send(g_slave_fd, cmd, n, 0);
     if (sent == (ssize_t)n) {
-        fprintf(stderr, "repl: slave sent REPLDONE to master\n");
+        fprintf(stderr, "repl: slave sent REPLDONE to master (tid=%llu)\n",
+                (unsigned long long)repldone_tid);
         return 0;
     }
     fprintf(stderr, "repl: slave REPLDONE send failed: %s\n", strerror(errno));
@@ -3763,8 +3814,9 @@ static void *slave_thread(void *arg) {
                 char offbuf[32], durablebuf[32];
                 snprintf(offbuf, sizeof(offbuf), "%llu", g_slave_repl_offset);
                 snprintf(durablebuf, sizeof(durablebuf), "%llu", g_slave_repl_durable_offset);
-                size_t n = resp_build_cmd4(cmd, sizeof(cmd), "REPLSYNC",
-                    g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf, durablebuf);
+                size_t n = resp_build_cmd5(cmd, sizeof(cmd), "REPLSYNC",
+                    g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf,
+                    durablebuf, "rdma-fs-v2");
                 if (send(tcp_fd, cmd, n, 0) < 0) { close(tcp_fd); continue; }
                 fprintf(stderr, "kprobe rdma: REPLSYNC sent over TCP immediately\n");
             }
@@ -3921,9 +3973,9 @@ static void *slave_thread(void *arg) {
                     snprintf(tokbuf, sizeof(tokbuf), "%llu", repl_slave_data_token());
                     /* 第 5 参数=proxy 数据端口；第 6 参数=REPLDATA 握手 token。
                      * 专用数据端口同样必须认证，避免任意客户端连接后注入复制写。 */
-                    size_t n = resp_build_cmd6(cmd, sizeof(cmd), "REPLSYNC",
+                    size_t n = resp_build_cmd7(cmd, sizeof(cmd), "REPLSYNC",
                         g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf,
-                        durablebuf, portbuf, tokbuf);
+                        durablebuf, portbuf, tokbuf, "rdma-fs-v2");
                     if (send(tcp_fd, cmd, n, 0) < 0) { close(tcp_fd); continue; }
                     fprintf(stderr, "repl ebpf-tcp: REPLSYNC sent over TCP (proxy_port=%d)\n",
                             proxy_port);
@@ -4139,8 +4191,9 @@ static void *slave_thread(void *arg) {
                 char offbuf[32], durablebuf[32];
                 snprintf(offbuf, sizeof(offbuf), "%llu", g_slave_repl_offset);
                 snprintf(durablebuf, sizeof(durablebuf), "%llu", g_slave_repl_durable_offset);
-                size_t n = resp_build_cmd4(cmd, sizeof(cmd), "REPLSYNC",
-                    g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf, durablebuf);
+                size_t n = resp_build_cmd5(cmd, sizeof(cmd), "REPLSYNC",
+                    g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf,
+                    durablebuf, "rdma-fs-v2");
                 if (send(tcp_fd, cmd, n, 0) < 0) break;
                 fprintf(stderr, "repl: REPLSYNC sent over TCP immediately\n");
             }
@@ -4266,7 +4319,7 @@ static void *slave_thread(void *arg) {
             repl_rdma_set_state(REPL_RDMA_STATE_SYNCING, "slave_replsync_sent");
             snprintf(offbuf, sizeof(offbuf), "%llu", g_slave_repl_offset);
             snprintf(durablebuf, sizeof(durablebuf), "%llu", g_slave_repl_durable_offset);
-            n = resp_build_cmd4(cmd, sizeof(cmd), "REPLSYNC", g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf, durablebuf);
+            n = resp_build_cmd5(cmd, sizeof(cmd), "REPLSYNC", g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf, durablebuf, "rdma-fs-v2");
             if (repl_transport_send_on_slave_link(cmd, n) != 0) {
                 repl_rdma_log("slave_loop", "link down because initial REPLSYNC send failed");
                 repl_transport_ops()->disconnect_slave(fd);
@@ -4358,13 +4411,13 @@ static void *slave_thread(void *arg) {
             char portbuf[16], tokbuf[32];
             snprintf(portbuf, sizeof(portbuf), "%d", g_cfg.port);
             snprintf(tokbuf, sizeof(tokbuf), "%llu", repl_slave_data_token());
-            n = resp_build_cmd6(cmd, sizeof(cmd), "REPLSYNC",
+            n = resp_build_cmd7(cmd, sizeof(cmd), "REPLSYNC",
                 g_slave_master_replid[0] ? g_slave_master_replid : "?",
-                offbuf, durablebuf, portbuf, tokbuf);
+                offbuf, durablebuf, portbuf, tokbuf, "rdma-fs-v2");
         } else {
-            n = resp_build_cmd4(cmd, sizeof(cmd), "REPLSYNC",
+            n = resp_build_cmd5(cmd, sizeof(cmd), "REPLSYNC",
                 g_slave_master_replid[0] ? g_slave_master_replid : "?",
-                offbuf, durablebuf);
+                offbuf, durablebuf, "rdma-fs-v2");
         }
         if (send(fd, cmd, n, 0) < 0) {
             repl_transport_mark_active("tcp");
