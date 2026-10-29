@@ -82,6 +82,8 @@ int g_rdma_fs_sending = 0;
 int g_rdma_fs_max_concurrent = 2;
 unsigned g_rdma_fs_max_seen = 0;
 static int g_rdma_fs_repldone_timeout_ms = 60000;
+static int g_rdma_fs_max_connected = 4;
+static unsigned long long g_rdma_fs_max_registered_bytes = 64ULL * 1024 * 1024;
 
 enum fs_cmd_op {
     FS_CMD_DESTROY = 1,
@@ -111,6 +113,7 @@ static struct {
     unsigned long long cm_rejects;
     unsigned long long cq_errors;
     unsigned long long registered_bytes;
+    unsigned long long resource_rejects;
 } g_mgr = { .cmd_pipe = { -1, -1 } };
 
 static const char *fs_fullsync_transport_name(void) {
@@ -199,6 +202,36 @@ static int fs_handle_connect_request(struct rdma_cm_id *id, uint64_t tid, uint64
         rdma_destroy_id(id);
         return -1;
     }
+    /* 资源预算：连接数 + 注册发送 buffer 总量。超额在分配 PD/CQ/QP/MR 之前拒绝，
+     * 并把该 job 置 FAILED，让 owner 尽快 fail-closed 该副本并触发重试。 */
+    unsigned connected = 0;
+    unsigned long long reg = 0;
+    for (rdma_fs_job_t *j = g_mgr.jobs; j; j = j->next) {
+        if (j->cm_setup || (j->needs_destroy && !j->resources_destroyed)) {
+            connected++;
+            reg += (unsigned long long)j->slot_count * j->chunk_size;
+        }
+    }
+    int est_slots = 0;
+    uint64_t est_bytes = 0;
+    rdma_fs_estimate_resources(&est_slots, &est_bytes);
+    if (connected >= (unsigned)g_rdma_fs_max_connected
+        || reg + est_bytes > g_rdma_fs_max_registered_bytes) {
+        g_mgr.resource_rejects++;
+        job->cancel = 1;
+        job->cancel_reason = RDMA_FS_REASON_RESOURCE;
+        job->state = RDMA_FS_ST_FAILED;
+        pthread_cond_broadcast(&g_rdma_fs_cv);
+        pthread_mutex_unlock(&g_rdma_fs_mu);
+        fprintf(stderr, "repl rdma-fs: tid=%llu rejected by resource budget "
+                        "(connected=%u/%d reg=%llu+%llu>%llu)\n",
+                (unsigned long long)tid, connected, g_rdma_fs_max_connected,
+                reg, (unsigned long long)est_bytes, g_rdma_fs_max_registered_bytes);
+        rdma_reject(id, NULL, 0);
+        rdma_destroy_id(id);
+        return -1;
+    }
+
     job->id = id;
     id->context = job;
     job->needs_destroy = 1;
@@ -509,6 +542,13 @@ int rdma_fs_mgr_start(void) {
     g_rdma_fs_repldone_timeout_ms = g_cfg.rdma_fullsync_repldone_timeout_ms;
     if (g_rdma_fs_repldone_timeout_ms < 1000) g_rdma_fs_repldone_timeout_ms = 1000;
     if (g_rdma_fs_repldone_timeout_ms > 600000) g_rdma_fs_repldone_timeout_ms = 600000;
+    g_rdma_fs_max_connected = g_cfg.rdma_fullsync_max_connected;
+    if (g_rdma_fs_max_connected < 1) g_rdma_fs_max_connected = 1;
+    if (g_rdma_fs_max_connected > RDMA_FS_MAX_JOBS) g_rdma_fs_max_connected = RDMA_FS_MAX_JOBS;
+    int reg_mb = g_cfg.rdma_fullsync_max_registered_mb;
+    if (reg_mb < 1) reg_mb = 1;
+    if (reg_mb > 65536) reg_mb = 65536;
+    g_rdma_fs_max_registered_bytes = (unsigned long long)reg_mb * 1024ULL * 1024ULL;
 
     g_mgr.epoch = ((uint64_t)getpid() << 32) ^ (uint64_t)time(NULL) ^ (uint64_t)kvs_now_ms();
     if (g_mgr.epoch == 0) g_mgr.epoch = 1;
@@ -523,8 +563,10 @@ int rdma_fs_mgr_start(void) {
         goto fail;
     }
     fprintf(stderr, "repl rdma-fs: manager listening on RDMA port %d (epoch=%llu, "
-                    "max_concurrent=%d)\n", port,
-            (unsigned long long)g_mgr.epoch, g_rdma_fs_max_concurrent);
+                    "max_concurrent=%d, max_connected=%d, max_registered=%lluMB)\n",
+            port, (unsigned long long)g_mgr.epoch, g_rdma_fs_max_concurrent,
+            g_rdma_fs_max_connected,
+            (unsigned long long)(g_rdma_fs_max_registered_bytes >> 20));
     return 0;
 
 fail:
@@ -656,7 +698,7 @@ int rdma_fs_begin(void *owner_conn, uint64_t owner_conn_id, int slot,
     job->barrier_seq = barrier_seq;
     job->snapshot_offset = snapshot_offset;
     job->barrier_global_seq = barrier_global_seq;
-    job->state = RDMA_FS_ST_NEW;
+    job->state = RDMA_FS_ST_WAIT_HEADER;
     job->snap_fd = -1;
     job->resources_destroyed = 1;
     job->t_begin_ms = kvs_now_ms();
@@ -691,6 +733,30 @@ int rdma_fs_snapshot_ready(uint64_t tid, int fd, const char *path, uint64_t size
     snprintf(job->snap_path, sizeof(job->snap_path), "%s", path);
     job->snap_size = size;
     job->snap_ready = 1;
+    job->t_snap_ready_ms = kvs_now_ms();
+    pthread_cond_broadcast(&g_rdma_fs_cv);
+    pthread_mutex_unlock(&g_rdma_fs_mu);
+    return 0;
+}
+
+int rdma_fs_header_sent(uint64_t tid) {
+    pthread_mutex_lock(&g_rdma_fs_mu);
+    rdma_fs_job_t *job = fs_find_locked(tid);
+    if (!job || job->cancel) {
+        pthread_mutex_unlock(&g_rdma_fs_mu);
+        return -1;
+    }
+    if (job->header_sent) {
+        pthread_mutex_unlock(&g_rdma_fs_mu);
+        return 0;   /* 幂等 */
+    }
+    if (job->state != RDMA_FS_ST_WAIT_HEADER) {
+        pthread_mutex_unlock(&g_rdma_fs_mu);
+        return -1;
+    }
+    job->header_sent = 1;
+    job->t_header_sent_ms = kvs_now_ms();
+    job->state = RDMA_FS_ST_WAIT_ESTABLISHED;
     pthread_cond_broadcast(&g_rdma_fs_cv);
     pthread_mutex_unlock(&g_rdma_fs_mu);
     return 0;
@@ -763,6 +829,7 @@ int rdma_fs_on_repldone(uint64_t tid, void *owner_conn, int slot,
         return 0;
     }
     job->state = RDMA_FS_ST_DONE;
+    job->t_repldone_ms = kvs_now_ms();
     job->notified = 1;
     job->cancel = 1;
     job->cancel_reason = RDMA_FS_REASON_CANCELLED;
@@ -819,9 +886,48 @@ int rdma_fs_mark_fullsyncend_sent(uint64_t tid) {
         return -1;
     }
     job->state = RDMA_FS_ST_WAIT_REPLDONE;
-    job->wait_deadline_ms = kvs_now_ms() + g_rdma_fs_repldone_timeout_ms;
+    job->t_end_sent_ms = kvs_now_ms();
+    job->wait_deadline_ms = job->t_end_sent_ms + g_rdma_fs_repldone_timeout_ms;
     pthread_mutex_unlock(&g_rdma_fs_mu);
     return 0;
+}
+
+int rdma_fs_format_jobs(char *out, size_t cap) {
+    if (!out || cap == 0) return 0;
+    out[0] = '\0';
+    size_t pos = 0;
+    pthread_mutex_lock(&g_rdma_fs_mu);
+    for (rdma_fs_job_t *j = g_mgr.jobs; j; j = j->next) {
+        long long snap_ms = j->t_snap_ready_ms ? j->t_snap_ready_ms - j->t_begin_ms : -1;
+        long long header_ms = j->t_header_sent_ms ? j->t_header_sent_ms - j->t_begin_ms : -1;
+        long long cm_ms = (j->t_established_ms && j->t_header_sent_ms)
+            ? j->t_established_ms - j->t_header_sent_ms : -1;
+        long long mr_ms = (j->t_mr_ms && j->t_established_ms)
+            ? j->t_mr_ms - j->t_established_ms : -1;
+        long long token_ms = (j->t_send_start_ms && j->t_mr_ms)
+            ? j->t_send_start_ms - j->t_mr_ms : -1;
+        long long send_ms = (j->t_done_ms && j->t_send_start_ms)
+            ? j->t_done_ms - j->t_send_start_ms : -1;
+        long long end_ms = (j->t_end_sent_ms && j->t_done_ms)
+            ? j->t_end_sent_ms - j->t_done_ms : -1;
+        long long ack_ms = (j->t_repldone_ms && j->t_end_sent_ms)
+            ? j->t_repldone_ms - j->t_end_sent_ms : -1;
+        int n = snprintf(out + pos, cap - pos,
+                         "%stid=%llu slot=%d gen=%llu state=%d posted=%llu "
+                         "completed=%llu snap_ms=%lld header_ms=%lld cm_ms=%lld "
+                         "mr_ms=%lld token_ms=%lld send_ms=%lld end_ms=%lld ack_ms=%lld",
+                         pos ? ";" : "",
+                         (unsigned long long)j->tid, j->slot,
+                         (unsigned long long)j->replica_gen, j->state,
+                         (unsigned long long)j->posted_bytes,
+                         (unsigned long long)j->completed_bytes,
+                         snap_ms, header_ms, cm_ms, mr_ms, token_ms, send_ms,
+                         end_ms, ack_ms);
+        if (n < 0 || (size_t)n >= cap - pos) break;
+        pos += (size_t)n;
+    }
+    pthread_mutex_unlock(&g_rdma_fs_mu);
+    return (int)pos;
 }
 
 int rdma_fs_drain_events_owner(rdma_fs_event_t *out, int max) {
@@ -951,7 +1057,8 @@ int rdma_fs_drain_events_owner(rdma_fs_event_t *out, int max) {
     for (rdma_fs_job_t *j = g_mgr.jobs; j; j = j->next) {
         active++;
         if (j->state == RDMA_FS_ST_WAIT_TOKEN || j->state == RDMA_FS_ST_WAIT_MR
-            || j->state == RDMA_FS_ST_NEW || j->state == RDMA_FS_ST_CM_SETUP
+            || j->state == RDMA_FS_ST_NEW || j->state == RDMA_FS_ST_WAIT_HEADER
+            || j->state == RDMA_FS_ST_CM_SETUP
             || j->state == RDMA_FS_ST_WAIT_ESTABLISHED)
             waiting++;
         if (j->state == RDMA_FS_ST_SENDING) { sending++; conc++; }
@@ -966,15 +1073,31 @@ void rdma_fs_get_stats(rdma_fs_stats_t *out) {
     if (!out) return;
     memset(out, 0, sizeof(*out));
     pthread_mutex_lock(&g_rdma_fs_mu);
+    unsigned connected = 0;
+    unsigned long long reg = 0;
     for (rdma_fs_job_t *j = g_mgr.jobs; j; j = j->next) {
         out->active_jobs++;
-        if (j->state == RDMA_FS_ST_SENDING) out->sending_jobs++;
-        else if (j->state == RDMA_FS_ST_NEW || j->state == RDMA_FS_ST_CM_SETUP
+        if (j->state == RDMA_FS_ST_SENDING) {
+            out->sending_jobs++;
+            if (j->posted_bytes > 0) out->sending_posted_jobs++;
+        }
+        if (j->posted_bytes > out->max_posted_bytes)
+            out->max_posted_bytes = j->posted_bytes;
+        else if (j->state == RDMA_FS_ST_NEW || j->state == RDMA_FS_ST_WAIT_HEADER
+                 || j->state == RDMA_FS_ST_CM_SETUP
                  || j->state == RDMA_FS_ST_WAIT_ESTABLISHED
                  || j->state == RDMA_FS_ST_WAIT_MR || j->state == RDMA_FS_ST_WAIT_TOKEN)
             out->waiting_jobs++;
-        out->registered_bytes += (unsigned long long)j->slot_count * j->chunk_size;
+        if (j->cm_setup || (j->needs_destroy && !j->resources_destroyed)) {
+            connected++;
+            reg += (unsigned long long)j->slot_count * j->chunk_size;
+        }
     }
+    out->registered_bytes = reg;
+    out->connected_jobs = connected;
+    out->resource_rejects = g_mgr.resource_rejects;
+    out->max_connected = (unsigned)g_rdma_fs_max_connected;
+    out->max_registered_bytes = g_rdma_fs_max_registered_bytes;
     out->total_started = g_mgr.total_started;
     out->total_completed = g_mgr.total_completed;
     out->total_failed = g_mgr.total_failed;
@@ -1002,6 +1125,7 @@ int rdma_fs_begin(void *owner_conn, uint64_t owner_conn_id, int slot,
 int rdma_fs_snapshot_ready(uint64_t tid, int fd, const char *path, uint64_t size) {
     (void)tid; (void)fd; (void)path; (void)size; return -1;
 }
+int rdma_fs_header_sent(uint64_t tid) { (void)tid; return -1; }
 int rdma_fs_on_remote_mr(uint64_t tid, void *owner_conn, uint64_t addr,
                          uint32_t rkey, uint64_t capacity) {
     (void)tid; (void)owner_conn; (void)addr; (void)rkey; (void)capacity; return 0;
@@ -1014,6 +1138,10 @@ void rdma_fs_cancel_owner(void *owner_conn) { (void)owner_conn; }
 void rdma_fs_cancel(uint64_t tid, int reason) { (void)tid; (void)reason; }
 int rdma_fs_mark_fullsyncend_sent(uint64_t tid) { (void)tid; return -1; }
 
+int rdma_fs_format_jobs(char *out, size_t cap) {
+    if (out && cap) out[0] = '\0';
+    return 0;
+}
 int rdma_fs_drain_events_owner(rdma_fs_event_t *out, int max) { (void)out; (void)max; return 0; }
 void rdma_fs_get_stats(rdma_fs_stats_t *out) { if (out) memset(out, 0, sizeof(*out)); }
 

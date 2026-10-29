@@ -271,6 +271,10 @@ def main():
                     help="RDMA 设备缺失时返回失败而不是 SKIP（CI 门禁用）")
     ap.add_argument("--kill-b", action="store_true",
                     help="故障注入：两个 job 开始发送后 kill -9 Slave B，验证 A 不受影响")
+    ap.add_argument("--max-connected", type=int, default=0,
+                    help="覆盖 rdma-fullsync-max-connected（资源预算）")
+    ap.add_argument("--expect-resource-rejects", action="store_true",
+                    help="断言至少发生一次资源预算拒绝（配合 --max-connected 小值）")
     ap.add_argument("--work-dir", default="./artifacts/repl/multi-rdma-fullsync")
     args = ap.parse_args()
 
@@ -301,6 +305,8 @@ def main():
         "--rdma-fullsync-pause-us", str(args.pause_us),
         "--rdma-port", str(args.rdma_port),
     ]
+    if args.max_connected > 0:
+        common += ["--rdma-fullsync-max-connected", str(args.max_connected)]
 
     def log(name):
         return open(wd / f"{name}.log", "wb")
@@ -339,34 +345,36 @@ def main():
             print("MULTI_RDMA_FULLSYNC_FAIL: slave not ready")
             return 1
 
+        max_observed_posted = 0
+        observed_jobs = ""
         if args.kill_b:
-            print("[3/5] wait both jobs then kill -9 Slave B")
-            started = False
+            print("[3/5] wait both jobs posting WR, then kill -9 Slave B")
+            killed = False
             deadline = time.time() + args.wait_seconds
-            kill_deadline = None
             while time.time() < deadline:
                 info = master_info(args.host, args.master_port)
                 try:
-                    n_started = int(info.get("rdma_fs_total_started", "0"))
-                    sending = int(info.get("rdma_fs_sending_jobs", "0"))
+                    posted = int(info.get("rdma_fs_sending_posted_jobs", "0") or 0)
                 except ValueError:
-                    n_started = sending = 0
-                if sending >= 2:
-                    started = True
+                    posted = 0
+                if info.get("rdma_fs_jobs"):
+                    observed_jobs = info.get("rdma_fs_jobs")
+                max_observed_posted = max(max_observed_posted, posted)
+                # 必须同时有 2 个 job 处于 SENDING 且 posted_bytes>0 才注入故障；
+                # 否则这不是“RDMA WRITE 在途时崩溃”测试，直接 FAIL。
+                if posted >= 2:
+                    print("  two jobs with in-flight WR:", observed_jobs)
+                    slave_b.send_signal(signal.SIGKILL)
+                    killed = True
+                    print("  killed Slave B pid", slave_b.pid)
                     break
-                if n_started >= 2:
-                    started = True
-                    if kill_deadline is None:
-                        # 给 B 一点时间进入真实 RDMA_SENDING（仍在其传输窗口内）
-                        kill_deadline = time.time() + 2.0
-                    if time.time() >= kill_deadline:
-                        break
                 time.sleep(0.02)
-            if started:
-                slave_b.send_signal(signal.SIGKILL)
-                print("  killed Slave B pid", slave_b.pid)
-            else:
-                print("  could not observe two started jobs before timeout")
+            if not killed:
+                print("MULTI_RDMA_FULLSYNC_FAIL: could not observe two jobs with "
+                      "posted WR before killing B")
+                print(f"  max_observed_sending_posted={max_observed_posted} "
+                      f"jobs={observed_jobs or '<none>'}")
+                return 1
         else:
             print("[3/5] wait fullsync completion")
 
@@ -377,8 +385,12 @@ def main():
             try:
                 completed = int(info.get("rdma_fs_total_completed", "0"))
                 failed = int(info.get("rdma_fs_total_failed", "0"))
+                posted = int(info.get("rdma_fs_sending_posted_jobs", "0") or 0)
             except ValueError:
-                completed = failed = 0
+                completed = failed = posted = 0
+            max_observed_posted = max(max_observed_posted, posted)
+            if info.get("rdma_fs_jobs"):
+                observed_jobs = info.get("rdma_fs_jobs")
             if args.kill_b:
                 if completed >= 1 and failed >= 1:
                     break
@@ -420,25 +432,31 @@ def main():
             completed = int(info.get("rdma_fs_total_completed", "0"))
             failed = int(info.get("rdma_fs_total_failed", "0"))
             max_conc = int(info.get("rdma_fs_max_concurrency_seen", "0"))
+            rrej = int(info.get("rdma_fs_resource_rejects", "0") or 0)
         except ValueError:
-            completed = failed = max_conc = 0
+            completed = failed = max_conc = rrej = 0
         active = info.get("rdma_fs_active_jobs", "?")
 
         print("[5/5] result")
         print(f"  master_completed={completed} failed={failed} "
-              f"max_concurrency_seen={max_conc} active_jobs={active}")
+              f"max_concurrency_seen={max_conc} resource_rejects={rrej} active_jobs={active}")
         leftovers = sorted(p.name for p in wd.glob("*fullsync.tmp*"))
         b_state = "skipped(killed)" if ok_b is None else str(ok_b)
         print(f"  slave_a_verified={ok_a} slave_b_verified={b_state} "
               f"sending_intervals={intervals} overlap={overlap}")
+        print(f"  max_observed_sending_posted={max_observed_posted}")
         print(f"  snapshot_leftovers={leftovers}")
         print(f"  artifacts={wd}")
 
-        if args.kill_b:
-            ok = (ok_a and failed >= 1 and active_zero and not leftovers
-                  and master.poll() is None)
+        if args.expect_resource_rejects:
+            ok = (ok_a and ok_b and completed >= 2 and rrej >= 1
+                  and active_zero and not leftovers and master.poll() is None)
+        elif args.kill_b:
+            ok = (ok_a and failed >= 1 and max_observed_posted >= 2
+                  and active_zero and not leftovers and master.poll() is None)
         else:
             ok = (ok_a and ok_b and completed >= 2 and max_conc >= 2
+                  and max_observed_posted >= 2
                   and overlap and active_zero and not leftovers)
         if ok:
             print("MULTI_RDMA_FULLSYNC_PASS")

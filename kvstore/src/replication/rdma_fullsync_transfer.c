@@ -74,6 +74,13 @@ static struct timespec fs_deadline_after_ms(long long ms) {
     return ts;
 }
 
+void rdma_fs_estimate_resources(int *slots, uint64_t *bytes) {
+    int n = (int)fs_cfg_send_slots();
+    size_t chunk = fs_cfg_chunk();
+    if (slots) *slots = n;
+    if (bytes) *bytes = (uint64_t)n * (uint64_t)chunk;
+}
+
 int rdma_fs_job_setup_verbs(rdma_fs_job_t *job) {
     if (!job || !job->id || !job->id->verbs) return -1;
 
@@ -282,8 +289,28 @@ void *rdma_fs_job_worker(void *arg) {
     int log_state = 0, log_cq = 0, log_reason = 0;
     uint64_t log_posted = 0, log_total = 0;
 
-    /* 1) 等 CM established。 */
-    struct timespec dl = fs_deadline_after_ms(RDMA_FS_CM_WAIT_MS);
+    /* 0) 等 owner 完整写出 FULLRESYNC。CM 建连超时不能从 job 创建就开始，
+     * 否则大快照/慢磁盘会在 Slave 尚未来得及建连前耗尽 10s 预算。 */
+    struct timespec dl = fs_deadline_after_ms(RDMA_FS_HEADER_WAIT_MS);
+    pthread_mutex_lock(&g_rdma_fs_mu);
+    while (!job->header_sent && !job->cancel) {
+        int rc = pthread_cond_timedwait(&g_rdma_fs_cv, &g_rdma_fs_mu, &dl);
+        if (rc == ETIMEDOUT) break;
+    }
+    if (job->cancel) {
+        reason = job->cancel_reason ? job->cancel_reason : RDMA_FS_REASON_CANCELLED;
+        failed = 1;
+    } else if (!job->header_sent) {
+        reason = RDMA_FS_REASON_SNAPSHOT;
+        failed = 1;
+    } else if (job->state == RDMA_FS_ST_WAIT_HEADER) {
+        job->state = RDMA_FS_ST_WAIT_ESTABLISHED;
+    }
+    pthread_mutex_unlock(&g_rdma_fs_mu);
+    if (failed) goto finish;
+
+    /* 1) 等 CM established（deadline 从 header 已完整写出开始）。 */
+    dl = fs_deadline_after_ms(RDMA_FS_CM_WAIT_MS);
     pthread_mutex_lock(&g_rdma_fs_mu);
     while (!job->established && !job->cancel) {
         int rc = pthread_cond_timedwait(&g_rdma_fs_cv, &g_rdma_fs_mu, &dl);
@@ -336,6 +363,7 @@ void *rdma_fs_job_worker(void *arg) {
             g_rdma_fs_max_seen = (unsigned)g_rdma_fs_sending;
         token_held = 1;
         job->state = RDMA_FS_ST_SENDING;
+        job->t_send_start_ms = kvs_now_ms();
         log_sending = g_rdma_fs_sending;
     }
     pthread_mutex_unlock(&g_rdma_fs_mu);

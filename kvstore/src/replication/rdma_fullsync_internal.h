@@ -18,13 +18,15 @@
 #define RDMA_FS_MAX_SLOTS         64
 #define RDMA_FS_MAX_JOBS          64
 #define RDMA_FS_SNAP_PATH_MAX     512
-#define RDMA_FS_CM_WAIT_MS        10000   /* 等 CM established */
+#define RDMA_FS_HEADER_WAIT_MS    300000  /* 等 owner 发送 FULLRESYNC（含大快照生成时间） */
+#define RDMA_FS_CM_WAIT_MS        10000   /* 等 CM established（从 header_sent 起算） */
 #define RDMA_FS_MR_WAIT_MS        15000   /* 等 FULLRESYNCWR */
 #define RDMA_FS_SEND_DRAIN_MS     20000   /* 等待在途 WR 完成 */
 #define RDMA_FS_DESTROY_WAIT_MS   2000
 
 enum rdma_fs_state {
     RDMA_FS_ST_NEW = 0,
+    RDMA_FS_ST_WAIT_HEADER,   /* job 已创建，等待 owner 完整写出 FULLRESYNC */
     RDMA_FS_ST_CM_SETUP,
     RDMA_FS_ST_WAIT_ESTABLISHED,
     RDMA_FS_ST_WAIT_MR,
@@ -75,6 +77,7 @@ typedef struct rdma_fs_job {
     int qp_depth;
     int pause_us;
     size_t chunk_size;
+    int header_sent;           /* owner 已完整写出 FULLRESYNC（CM 计时从此开始） */
     int established;
     int mr_ready;
     uint64_t remote_addr;
@@ -106,9 +109,14 @@ typedef struct rdma_fs_job {
     long long destroy_deadline_ms;
 
     long long t_begin_ms;
+    long long t_snap_ready_ms;
+    long long t_header_sent_ms;
     long long t_established_ms;
     long long t_mr_ms;
+    long long t_send_start_ms;
     long long t_done_ms;
+    long long t_end_sent_ms;
+    long long t_repldone_ms;
     long long wait_deadline_ms;   /* WR_DONE 待发 END / WAIT_REPLDONE 的任务级 deadline */
 
     struct rdma_fs_job *next;
@@ -124,6 +132,9 @@ extern unsigned g_rdma_fs_max_seen;
 
 /* 供 transfer.c 使用：worker 入口（pthread 参数为 job*）。 */
 void *rdma_fs_job_worker(void *arg);
+
+/* 估算一个新 job 将占用的发送 buffer 资源（slot 数 × chunk）。 */
+void rdma_fs_estimate_resources(int *slots, uint64_t *bytes);
 
 /* 供 mgr.c 使用：建/销毁每 job 的 QP/CQ/PD/slots。仅在 CM 线程调用。 */
 int rdma_fs_job_setup_verbs(rdma_fs_job_t *job);

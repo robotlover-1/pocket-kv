@@ -86,6 +86,8 @@ kv_config_t g_cfg = {
     .rdma_fullsync_max_concurrent = 2,
     .rdma_fullsync_pause_us = 0,
     .rdma_fullsync_repldone_timeout_ms = 60000,
+    .rdma_fullsync_max_connected = 4,
+    .rdma_fullsync_max_registered_mb = 64,
     .repl_rdma_write_buf_max_mb = 256,
     .aof_fsync = KVS_AOF_FSYNC_ALWAYS,
     .aof_fsync_per_command = 0,   /* 0=批量；1=逐条 */
@@ -328,6 +330,12 @@ static int parse_args(int argc, char **argv) {
         else if (!strcmp(argv[i], "--rdma-fullsync-repldone-timeout-ms") && i + 1 < argc) {
             g_cfg.rdma_fullsync_repldone_timeout_ms = atoi(argv[++i]);
         }
+        else if (!strcmp(argv[i], "--rdma-fullsync-max-connected") && i + 1 < argc) {
+            g_cfg.rdma_fullsync_max_connected = atoi(argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--rdma-fullsync-max-registered-mb") && i + 1 < argc) {
+            g_cfg.rdma_fullsync_max_registered_mb = atoi(argv[++i]);
+        }
         else if (!strcmp(argv[i], "--repl-rdma-write-buf-max-mb") && i + 1 < argc) {
             g_cfg.repl_rdma_write_buf_max_mb = atoi(argv[++i]);
         }
@@ -475,6 +483,8 @@ static int apply_config_kv(const char *key, const char *value) {
     else if (!strcmp(key, "rdma_fullsync_max_concurrent")) g_cfg.rdma_fullsync_max_concurrent = atoi(value);
     else if (!strcmp(key, "rdma_fullsync_pause_us")) g_cfg.rdma_fullsync_pause_us = atoi(value);
     else if (!strcmp(key, "rdma_fullsync_repldone_timeout_ms")) g_cfg.rdma_fullsync_repldone_timeout_ms = atoi(value);
+    else if (!strcmp(key, "rdma_fullsync_max_connected")) g_cfg.rdma_fullsync_max_connected = atoi(value);
+    else if (!strcmp(key, "rdma_fullsync_max_registered_mb")) g_cfg.rdma_fullsync_max_registered_mb = atoi(value);
     else if (!strcmp(key, "repl_rdma_write_buf_max_mb")) g_cfg.repl_rdma_write_buf_max_mb = atoi(value);
     else if (!strcmp(key, "appendfsync")) {
         if (parse_appendfsync_policy(value, &policy) != 0) return -1;
@@ -1389,6 +1399,19 @@ static int queue_snapshot_async(conn_t *c, unsigned long long snap_base_offset,
         fprintf(stderr, "master: fullsync snapshot open %s failed: %s\n", tmp_path, strerror(errno));
         goto fail;
     }
+    /* 测试钩子：模拟慢快照。用于验证 CM 建连超时不得早于 FULLRESYNC 发送。 */
+    {
+        const char *delay_ms = getenv("KVS_TEST_FULLSYNC_SNAPSHOT_DELAY_MS");
+        if (delay_ms && *delay_ms) {
+            int ms = atoi(delay_ms);
+            if (ms > 0) {
+                fprintf(stderr, "master: TEST fullsync snapshot delay %dms "
+                                "(tid=%llu, header not sent yet)\n",
+                        ms, (unsigned long long)tid);
+                usleep((useconds_t)ms * 1000);
+            }
+        }
+    }
     if (kvs_dump_to_fd(fd, snap_base_offset) != 0) {
         fprintf(stderr, "master: fullsync snapshot dump failed\n");
         goto fail;
@@ -1423,6 +1446,14 @@ static int queue_snapshot_async(conn_t *c, unsigned long long snap_base_offset,
     if (send_control_line(c->fd, hdr, (size_t)n) != 0) {
         fprintf(stderr, "master: fullsync header send failed\n");
         goto fail;
+    }
+    if (use_rdma) {
+        /* 只有 FULLRESYNC 完整写出后，worker 才开始 CM 建连计时。 */
+        if (rdma_fs_header_sent(tid) != 0) {
+            fprintf(stderr, "master: fullsync tid=%llu header_sent notify failed\n",
+                    (unsigned long long)tid);
+            goto fail;
+        }
     }
 
     repl_note_fullsync(total_bytes);
@@ -2597,9 +2628,11 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         kvs_ebpf_proxy_stats_t proxy_stats;
         kvs_repl_kprobe_stats_t kprobe_stats;
         rdma_fs_stats_t fs_stats;
+        char fs_jobs[4096];
         int recover_n = persist_build_recover_text(recover, sizeof(recover));
         persist_aof_debug_state(&aof_dbg);
         rdma_fs_get_stats(&fs_stats);
+        (void)rdma_fs_format_jobs(fs_jobs, sizeof(fs_jobs));
         repl_ebpf_get_stats(&ebpf_stats);
         repl_ebpf_proxy_get_stats(&proxy_stats);
         repl_kprobe_rdma_get_stats(&kprobe_stats);
@@ -2647,6 +2680,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             "repl_snapshot_bytes:%llu\n"
             "rdma_fs_active_jobs:%u\n"
             "rdma_fs_sending_jobs:%u\n"
+            "rdma_fs_sending_posted_jobs:%u\n"
+            "rdma_fs_max_posted_bytes:%llu\n"
             "rdma_fs_waiting_jobs:%u\n"
             "rdma_fs_total_started:%llu\n"
             "rdma_fs_total_completed:%llu\n"
@@ -2654,7 +2689,12 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             "rdma_fs_cm_rejects:%llu\n"
             "rdma_fs_cq_errors:%llu\n"
             "rdma_fs_registered_bytes:%llu\n"
+            "rdma_fs_connected_jobs:%u\n"
+            "rdma_fs_resource_rejects:%llu\n"
+            "rdma_fs_max_connected:%u\n"
+            "rdma_fs_max_registered_bytes:%llu\n"
             "rdma_fs_max_concurrency_seen:%u\n"
+            "rdma_fs_jobs:%s\n"
             "repl_backlog_size:%llu\n"
             "repl_backlog_histlen:%llu\n"
             "repl_backlog_start_offset:%llu\n"
@@ -2768,6 +2808,8 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             repl_snapshot_bytes(),
             fs_stats.active_jobs,
             fs_stats.sending_jobs,
+            fs_stats.sending_posted_jobs,
+            fs_stats.max_posted_bytes,
             fs_stats.waiting_jobs,
             fs_stats.total_started,
             fs_stats.total_completed,
@@ -2775,7 +2817,12 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             fs_stats.cm_rejects,
             fs_stats.cq_errors,
             fs_stats.registered_bytes,
+            fs_stats.connected_jobs,
+            fs_stats.resource_rejects,
+            fs_stats.max_connected,
+            fs_stats.max_registered_bytes,
             fs_stats.max_concurrency_seen,
+            fs_jobs,
             repl_backlog_size(),
             repl_backlog_histlen(),
             repl_backlog_start_offset(),
@@ -4258,6 +4305,8 @@ int main(int argc, char **argv) {
                 "  --rdma-fullsync-max-concurrent N  并发 RDMA 全量 job 上限 (默认 2)\n"
                 "  --rdma-fullsync-pause-us N        每个 WRITE chunk 间隔 µs (默认 0)\n"
                 "  --rdma-fullsync-repldone-timeout-ms N  FULLSYNCEND 后等待 REPLDONE 超时 (默认 60000)\n"
+                "  --rdma-fullsync-max-connected N   同时持有 RDMA 资源的 job 上限 (默认 4)\n"
+                "  --rdma-fullsync-max-registered-mb N 发送 buffer MR 总预算 MB (默认 64)\n"
                 "  --appendfsync always|off  AOF fsync 策略 (默认 always)\n"
                 "  --ebpf-enabled          启用 eBPF sockmap\n"
                 "  --ebpf-obj PATH         eBPF 对象文件路径\n"

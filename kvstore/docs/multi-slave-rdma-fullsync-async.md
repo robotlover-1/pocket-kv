@@ -16,6 +16,8 @@
 --rdma-fullsync-max-concurrent 2        # 同时处于 RDMA_SENDING 的 job 上限（默认 2）
 --rdma-fullsync-pause-us 0              # 每个 WRITE chunk 间隔（µs），用于限速/慢副本测试
 --rdma-fullsync-repldone-timeout-ms 60000  # FULLSYNCEND 后等待 REPLDONE 的任务级超时
+--rdma-fullsync-max-connected 4        # 同时持有 QP/CQ/MR 的 job 数上限（资源预算）
+--rdma-fullsync-max-registered-mb 64   # 所有活动 job 发送 buffer MR 的总预算
 
 # 同机部署（Master/Slave 在同一主机）必须显式指定 RDMA 端口：
 --rdma-port 5381
@@ -52,8 +54,10 @@ Master owner（reactor）
 RDMA fullsync manager（进程级）
   CM listener（懒启动：首次需要 RDMA 全量时绑定 rdma_port；绑定失败→TCP 回退）
     解析 CM private_data hello(tid, epoch) -> 查找 job
+    资源预算检查（max_connected / max_registered_bytes），超额明确拒绝
     为 job 创建独立 PD/CQ/comp_chan/QP/send slots，accept
   job worker（每 job 1 个线程）
+    WAIT_HEADER：等 owner 完整写出 FULLRESYNC（CM 超时从此才起算）
     wait established + remote MR + snapshot
     acquire 并发令牌
     用本 job 的 QP/CQ/slots 循环 RDMA WRITE（可与其他 job 真正重叠）
@@ -134,6 +138,29 @@ cancel/丢弃，绝不会对新 Barrier 发 END/ABORT/reject。
 - `rdma_fs_mgr_stop()` 现在会 cancel + join 全部 worker、逐 job teardown、
   销毁 child id/listener/pipe；reactor 循环退出时调用 `repl_rdma_fs_shutdown()`。
 
+### 3.4 CM 计时起点与资源预算（评审 RDMA-01/02）
+
+- job 状态新增 `WAIT_HEADER`：`rdma_fs_begin()` 创建 worker 后，worker **不计时**
+  等待 `rdma_fs_header_sent()`；owner 只有把 `FULLRESYNC` 完整写出后才调用它。
+  10s 的 CM 建连预算严格从 header 写出开始，大快照/慢磁盘不会被误判为 CM 超时。
+  快照阶段使用独立的 5 分钟上限（`RDMA_FS_HEADER_WAIT_MS`），测试钩子
+  `KVS_TEST_FULLSYNC_SNAPSHOT_DELAY_MS` 可注入慢快照。
+- 资源预算与发送并发分离：
+  - `--rdma-fullsync-max-concurrent`：同时处于 `RDMA_SENDING` 的 job 上限（默认 2）；
+  - `--rdma-fullsync-max-connected`：同时持有 PD/CQ/QP/MR 的 job 上限（默认 4）；
+  - `--rdma-fullsync-max-registered-mb`：所有活动 job 发送 buffer MR 总预算（默认 64MB）。
+  CM 建连时在分配任何 verbs 资源之前检查；超额立即置该 job FAILED、拒绝连接，由
+  owner fail-closed 该副本并触发重试。Slave 在连接被拒前拿不到 PD，因此也不会先
+  注册大目标 MR。
+
+### 3.5 崩溃一致性（评审 RDMA-07）
+
+Slave 收到 `FULLRESYNC` 时只记录快照基点 `g_slave_fullsync_base_offset`，
+**不提前**把持久化的 `applied/durable` 推进到该 offset。只有快照真正
+`replay_dump_file` + rename 成功后才把偏移推进到基点并写 replstate。
+因此在全量中途被 kill -9 的 Slave 重启后仍使用旧 dump/旧 offset，要么重新全量、
+要么从旧 offset 安全 partial，不会出现“offset 已到快照基点但数据从未加载”的丢数据。
+
 ## 4. 失败隔离
 
 - 单个 job 的 CM disconnect、CQ error、MR/资源创建失败、MR 等待超时、
@@ -157,8 +184,22 @@ rdma_fs_total_failed
 rdma_fs_cm_rejects
 rdma_fs_cq_errors
 rdma_fs_registered_bytes
+rdma_fs_connected_jobs
+rdma_fs_resource_rejects
+rdma_fs_max_connected
+rdma_fs_max_registered_bytes
+rdma_fs_sending_posted_jobs
+rdma_fs_max_posted_bytes
 rdma_fs_max_concurrency_seen
+rdma_fs_jobs            # 每 job: tid/slot/gen/state/posted/completed + 阶段耗时
 ```
+
+`rdma_fs_sending_posted_jobs >= 2` 表示两个 job 不仅同时 SENDING，而且各自已有
+posted WR；`rdma_fs_jobs` 提供 `snap_ms/header_ms/cm_ms/mr_ms/token_ms/send_ms/
+end_ms/ack_ms` 等阶段耗时，便于定位慢阶段。
+
+高频增量调试日志（`slave_apply/slave_durable` 每条打印）默认关闭，设置
+`KVS_REPL_VERBOSE_APPLY=1` 才输出。
 
 `rdma_fs_max_concurrency_seen >= 2` 表示至少两个 job 同时处于 `RDMA_SENDING`
 （由 worker 在持有并发令牌时更新，不依赖轮询采样）。
@@ -187,6 +228,15 @@ make check-multi-rdma-fault-isolation \
 # 协议状态机：无 tid/错 tid REPLDONE + 同连接重复 REPLSYNC（假 Slave，无需 RDMA 对端）
 make check-fullsync-state-guard REPL_MULTI_RDMA_REQUIRE=1
 
+# RDMA-01：快照人为延迟 12s（>10s CM 预算）仍必须成功
+make check-multi-rdma-cm-deadline REPL_RDMA_SMOKE_HOST=... RDMA_DEV=siw0
+
+# RDMA-02：max-connected=1 时第二个连接被资源预算拒绝并重试后完成
+make check-multi-rdma-resource-limit REPL_RDMA_SMOKE_HOST=... RDMA_DEV=siw0
+
+# RDMA-03/07：eBPF+Commit Gate + 并发写 + kill B + 重启追平（需要 root）
+sudo make check-multi-rdma-ebpf REPL_RDMA_SMOKE_HOST=... RDMA_DEV=siw0 REPL_MULTI_RDMA_REQUIRE=1
+
 # 直接控制测试参数：
 python3 tools/repl/run_multi_rdma_fullsync.py --bin ./kvstore \
   --host 192.168.233.128 --master-port 5280 \
@@ -197,6 +247,9 @@ python3 tools/repl/run_multi_rdma_fullsync.py --bin ./kvstore \
 `--pause-us` 拉长单 job 的发送窗口，用于在 soft-RoCE 上稳定观察两个 job 的
 `RDMA_SENDING` 重叠；真实 NIC 可以设为 0 并调大 chunk/slots。
 
+`--kill-b` 现在必须观察到 `rdma_fs_sending_posted_jobs >= 2`（两个 job 都已
+posted WR）才注入 SIGKILL；观察不到直接 FAIL，不会退化成“握手阶段崩溃”测试。
+
 **CI 必须检查输出包含 `MULTI_RDMA_FULLSYNC_PASS`**，不能只看退出码
 （脚本在无设备时默认打印 `..._SKIP` 并返回 0；`--require-rdma` 可改为 FAIL）。
 
@@ -205,4 +258,10 @@ python3 tools/repl/run_multi_rdma_fullsync.py --bin ./kvstore \
 - 第一版不做多 job 共享快照：每个 Slave 使用自己 `snapshot_offset` 的独立快照；
 - 快照在 owner 线程串行生成（存储遍历仍与 Master 写互斥），RDMA 传输并发；
 - `--rdma-fullsync-max-concurrent` 默认 2；其余 job 等待，不会无限扩张 recovery buffer；
-- `repl-transport=rdma` / `kprobe-rdma` 的旧实时路径不经过本模块。
+- `repl-transport=rdma` / `kprobe-rdma` 的旧实时路径不经过本模块；
+- **TCP sendfile 回退仍同步占用 owner/reactor**（RDMA manager 不可用或旧 Slave
+  未协商 v2 时）。该路径是兼容/故障路径，大快照+慢 Slave 会阻塞事件循环；
+  后续应将 RDMA 与 TCP 统一抽象成异步 FullsyncTask，或对回退大小设上限；
+- 快照 rename 与 replstate 落盘之间仍有极小的崩溃窗口（新 dump + 旧 offset），
+  当前顺序选择“旧 offset + 新 dump → 可能重复回放”而不是“丢快照”；彻底解决
+  需要原子提交 marker。

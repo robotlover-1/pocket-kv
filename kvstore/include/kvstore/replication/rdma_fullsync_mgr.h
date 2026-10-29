@@ -91,6 +91,12 @@ int rdma_fs_begin(void *owner_conn, uint64_t owner_conn_id, int slot,
 int rdma_fs_snapshot_ready(uint64_t tid, int fd, const char *path, uint64_t size);
 
 /*
+ * owner 已把 FULLRESYNC 头完整写入控制连接后调用。worker 的 CM 建连超时严格
+ * 从此刻开始，避免大快照生成时间被误计入 10s 建连预算。
+ */
+int rdma_fs_header_sent(uint64_t tid);
+
+/*
  * Master RESP 解析器收到 FULLRESYNCWR 后调用（owner 线程）。
  * 返回 1 表示命中新 job（已处理），0 表示无匹配（调用方可走旧路径）。
  */
@@ -133,16 +139,28 @@ typedef struct rdma_fs_stats {
     unsigned active_jobs;
     unsigned waiting_jobs;
     unsigned sending_jobs;
+    unsigned sending_posted_jobs;   /* SENDING 且 posted_bytes>0（真实 WRITE 在途） */
+    unsigned long long max_posted_bytes;
     unsigned long long total_started;
     unsigned long long total_completed;
     unsigned long long total_failed;
     unsigned long long cm_rejects;
     unsigned long long cq_errors;
     unsigned long long registered_bytes;
+    unsigned connected_jobs;
+    unsigned long long resource_rejects;
+    unsigned max_connected;
+    unsigned long long max_registered_bytes;
     unsigned max_concurrency_seen;
 } rdma_fs_stats_t;
 
 void rdma_fs_get_stats(rdma_fs_stats_t *out);
+
+/*
+ * 格式化每个活动 job 的身份证与阶段耗时（INFO 用）。
+ * 返回写入长度；无 job 或 RDMA 关闭时输出空串。
+ */
+int rdma_fs_format_jobs(char *out, size_t cap);
 
 #ifdef __cplusplus
 }

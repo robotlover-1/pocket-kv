@@ -47,6 +47,13 @@ REPL_MULTI_RDMA_FAULT_MASTER_PORT?=5270
 REPL_MULTI_RDMA_FAULT_SLAVE_A_PORT?=5272
 REPL_MULTI_RDMA_FAULT_SLAVE_B_PORT?=5274
 REPL_FS_GUARD_PORT?=5290
+REPL_CM_DEADLINE_PORT?=5490
+REPL_MULTI_RDMA_RES_MASTER_PORT?=5660
+REPL_MULTI_RDMA_RES_SLAVE_A_PORT?=5662
+REPL_MULTI_RDMA_RES_SLAVE_B_PORT?=5664
+REPL_MULTI_RDMA_EBPF_MASTER_PORT?=5570
+REPL_MULTI_RDMA_EBPF_SLAVE_A_PORT?=5572
+REPL_MULTI_RDMA_EBPF_SLAVE_B_PORT?=5574
 REPL_RDMA_STRESS_MASTER_PORT?=5230
 REPL_RDMA_STRESS_SLAVE_PORT?=5232
 REPL_RDMA_STRESS_PRELOAD?=128
@@ -445,6 +452,18 @@ check-repl-rdma-smoke:
 check-multi-rdma-fullsync: kvstore
 	python3 ./tools/repl/run_multi_rdma_fullsync.py --bin ./kvstore --host $(REPL_RDMA_SMOKE_HOST) --master-port $(REPL_MULTI_RDMA_MASTER_PORT) --slave-a-port $(REPL_MULTI_RDMA_SLAVE_A_PORT) --slave-b-port $(REPL_MULTI_RDMA_SLAVE_B_PORT) --rdma-dev $(RDMA_DEV) --preload $(REPL_MULTI_RDMA_PRELOAD) $(if $(filter 1,$(REPL_MULTI_RDMA_REQUIRE)),--require-rdma,)
 
+# ---- RDMA 资源预算：max_connected=1 时第二个连接必须被明确拒绝并可重试 ----
+check-multi-rdma-resource-limit: kvstore
+	python3 ./tools/repl/run_multi_rdma_fullsync.py --bin ./kvstore --host $(REPL_RDMA_SMOKE_HOST) --master-port $(REPL_MULTI_RDMA_RES_MASTER_PORT) --slave-a-port $(REPL_MULTI_RDMA_RES_SLAVE_A_PORT) --slave-b-port $(REPL_MULTI_RDMA_RES_SLAVE_B_PORT) --rdma-dev $(RDMA_DEV) --preload $(REPL_MULTI_RDMA_PRELOAD) --max-connected 1 --expect-resource-rejects $(if $(filter 1,$(REPL_MULTI_RDMA_REQUIRE)),--require-rdma,)
+
+# ---- eBPF/Commit Gate + 多 Slave 并发 RDMA 全量（需要 root）----
+check-multi-rdma-ebpf: kvstore ebpf-proxy client_capture_bpf
+	python3 ./tools/repl/run_multi_rdma_ebpf_integration.py --bin ./kvstore --host $(REPL_RDMA_SMOKE_HOST) --master-port $(REPL_MULTI_RDMA_EBPF_MASTER_PORT) --slave-a-port $(REPL_MULTI_RDMA_EBPF_SLAVE_A_PORT) --slave-b-port $(REPL_MULTI_RDMA_EBPF_SLAVE_B_PORT) --rdma-dev $(RDMA_DEV) $(if $(filter 1,$(REPL_MULTI_RDMA_REQUIRE)),--require,)
+
+# ---- RDMA-01：大快照/慢磁盘不得耗尽 CM 建连超时 ----
+check-multi-rdma-cm-deadline: kvstore
+	python3 ./tools/repl/run_fullsync_cm_deadline.py --bin ./kvstore --host $(REPL_RDMA_SMOKE_HOST) --port $(REPL_CM_DEADLINE_PORT) --rdma-dev $(RDMA_DEV) $(if $(filter 1,$(REPL_MULTI_RDMA_REQUIRE)),--require-rdma,)
+
 # ---- fullsync 状态机保护：无 tid/错 tid REPLDONE + 重复 REPLSYNC ----
 check-fullsync-state-guard: kvstore
 	python3 ./tools/repl/run_fullsync_state_guard.py --bin ./kvstore --host 127.0.0.1 --port $(REPL_FS_GUARD_PORT) --rdma-dev $(RDMA_DEV) $(if $(filter 1,$(REPL_MULTI_RDMA_REQUIRE)),--require-rdma,)
@@ -505,4 +524,4 @@ check-10w:
 
 check: check-resp check-ttl check-persist check-doc
 
-.PHONY: all clean build_dir check-kvstore check-slave-crash-recovery check-commit-gate-faults check-barrier-timeout check-multi-slave check-repl-5w5w test_persist_dump_demo test_persist_aof_demo test_vsearch check check-resp check-ttl check-persist check-doc check-bulk-1w check-all check-all-quick check-mass-ttl check-uring-persist check-mmap-recover check-repl check-repl-metrics check-repl-profile check-repl-ebpf check-repl-ebpf-env check-repl-ebpf-sync check-repl-ebpf-sync-required check-repl-ebpf-redirect check-repl-rdma-unsupported check-repl-rdma-smoke check-multi-rdma-fullsync check-multi-rdma-fault-isolation check-fullsync-state-guard check-repl-rdma-stress check-repl-rdma-soak check-repl-rdma-soak-skip check-rdma-standalone-probe check-rdma-pingpong-smoke check-demo-full-dump check-demo-incr-aof check-demo-repl-sync test_uring_persist test_mmap_recover test_repl_basic check-uring-persist-c check-mmap-recover-c check-repl-basic check-persist-purge check-persist-save-frontier tools/ebpf/repl_ebpf_daemon ebpf-proxy client_capture_bpf
+.PHONY: all clean build_dir check-kvstore check-slave-crash-recovery check-commit-gate-faults check-barrier-timeout check-multi-slave check-repl-5w5w test_persist_dump_demo test_persist_aof_demo test_vsearch check check-resp check-ttl check-persist check-doc check-bulk-1w check-all check-all-quick check-mass-ttl check-uring-persist check-mmap-recover check-repl check-repl-metrics check-repl-profile check-repl-ebpf check-repl-ebpf-env check-repl-ebpf-sync check-repl-ebpf-sync-required check-repl-ebpf-redirect check-repl-rdma-unsupported check-repl-rdma-smoke check-multi-rdma-fullsync check-multi-rdma-fault-isolation check-multi-rdma-cm-deadline check-multi-rdma-resource-limit check-multi-rdma-ebpf check-fullsync-state-guard check-repl-rdma-stress check-repl-rdma-soak check-repl-rdma-soak-skip check-rdma-standalone-probe check-rdma-pingpong-smoke check-demo-full-dump check-demo-incr-aof check-demo-repl-sync test_uring_persist test_mmap_recover test_repl_basic check-uring-persist-c check-mmap-recover-c check-repl-basic check-persist-purge check-persist-save-frontier tools/ebpf/repl_ebpf_daemon ebpf-proxy client_capture_bpf

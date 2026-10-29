@@ -409,6 +409,8 @@ typedef struct {
     int rdma_fullsync_max_concurrent; /* 新并发 fullsync 路径：同时处于 RDMA_SENDING 的 job 上限 */
     int rdma_fullsync_pause_us;       /* 新并发 fullsync 路径：每 WRITE chunk 间隔（µs），0=不限速 */
     int rdma_fullsync_repldone_timeout_ms; /* FULLSYNCEND 已发后等待 REPLDONE 的任务级超时 */
+    int rdma_fullsync_max_connected;  /* 同时持有 QP/CQ/MR 的 job 上限（资源预算） */
+    int rdma_fullsync_max_registered_mb; /* 所有活动 job 的发送 buffer MR 总预算（MB） */
     int repl_rdma_write_buf_max_mb;   /* slave WRITE 目标大小上限（MB），超限拒绝 → sendfile 回退 */
     kvs_aof_fsync_policy_t aof_fsync;
     int aof_fsync_per_command;   /* 逐条刷盘：每条命令立即 write+fsync（实验，对齐 redis 行为） */

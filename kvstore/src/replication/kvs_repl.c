@@ -471,6 +471,10 @@ unsigned long long g_slave_fullsync_target_bytes = 0;
 /* 防止同一次 fullsync 被 RDMA IMM / TCP FULLSYNCEND / 字节计数重复 finalize；
  * 新的 FULLRESYNC 建立时在 repl_slave_set_sync_state() 里复位。 */
 static int g_slave_fullsync_finish_done = 0;
+/* FULLRESYNC 头里的 master 快照基点。只有快照真正加载/rename 成功后才允许把
+ * applied/durable 推进到该值；否则中途崩溃会让 Slave 用“未加载的快照 offset”
+ * 去 partial resync，丢掉快照里的全部数据。 */
+static unsigned long long g_slave_fullsync_base_offset = 0;
 unsigned long long g_slave_fullsync_loaded_bytes = 0;
 int g_slave_fullsync_tmp_fd = -1;   /* temp file fd for receiving KVSD full sync data */
 static char g_slave_state_path[512] = {0};
@@ -683,6 +687,17 @@ static int repl_transport_tcp_connect_slave(const char *host, int port) {
 }
 
 #if KVS_ENABLE_RDMA
+/* 每条增量应用的调试日志：默认关闭（KVS_REPL_VERBOSE_APPLY=1 打开）。
+ * eBPF+RDMA 高频增量下逐条 fprintf 会严重拖慢 Slave。 */
+static int repl_rdma_verbose_apply(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("KVS_REPL_VERBOSE_APPLY");
+        v = (e && *e && atoi(e) != 0) ? 1 : 0;
+    }
+    return v;
+}
+
 static void repl_rdma_log(const char *stage, const char *detail) {
     fprintf(stderr, "repl rdma: %s%s%s\n", stage ? stage : "?", detail ? " - " : "", detail ? detail : "");
 }
@@ -3220,9 +3235,15 @@ void repl_slave_set_sync_state(const char *replid, unsigned long long applied_of
     if (replid && *replid) {
         snprintf(g_slave_master_replid, sizeof(g_slave_master_replid), "%s", replid);
     }
-    g_slave_repl_applied_offset = applied_offset;
-    g_slave_repl_durable_offset = durable_offset;
-    g_slave_repl_offset = applied_offset;
+    if (fullsync_loading) {
+        /* 快照尚未加载：只记录基点，持久化的 applied/durable 保持旧值。
+         * 若此时崩溃，重启后仍会用旧 dump + 旧 offset 重新 fullsync/partial。 */
+        g_slave_fullsync_base_offset = applied_offset;
+    } else {
+        g_slave_repl_applied_offset = applied_offset;
+        g_slave_repl_durable_offset = durable_offset;
+        g_slave_repl_offset = applied_offset;
+    }
     g_slave_loading_fullsync = fullsync_loading;
     g_slave_fullsync_target_bytes = fullsync_loading ? fullsync_target_bytes : 0;
     g_slave_fullsync_loaded_bytes = 0;
@@ -3260,7 +3281,7 @@ void repl_slave_set_sync_state(const char *replid, unsigned long long applied_of
         unlink(tmp_path);
         g_slave_fullsync_tmp_fd = -1;
     }
-    repl_slave_state_save();
+    if (!fullsync_loading) repl_slave_state_save();
 }
 
 static int repl_slave_send_repldone(void);
@@ -3271,9 +3292,7 @@ void repl_slave_finish_fullsync(void) {
     g_slave_loading_fullsync = 0;
     g_slave_fullsync_target_bytes = 0;
     g_slave_fullsync_loaded_bytes = 0;
-    if (g_slave_repl_durable_offset < g_slave_repl_applied_offset) {
-        g_slave_repl_durable_offset = g_slave_repl_applied_offset;
-    }
+    int dump_committed = 0;
 #if KVS_ENABLE_RDMA
     if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma") || !strcasecmp(g_cfg.repl_transport_backend, "rdma")) {
         fprintf(stderr, "repl rdma: slave_fullsync - finished applied_offset=%llu durable_offset=%llu\n", g_slave_repl_applied_offset, g_slave_repl_durable_offset);
@@ -3340,6 +3359,7 @@ void repl_slave_finish_fullsync(void) {
                     fprintf(stderr, "repl: slave fullsync aof rebase failed\n");
                 fprintf(stderr, "repl: slave fullsync dump saved to %s "
                                 "(aof rebased to 0)\n", g_cfg.dump_path);
+                dump_committed = 1;
             }
         } else {
             fprintf(stderr, "repl: slave fullsync finished but no temp file\n");
@@ -3347,6 +3367,12 @@ void repl_slave_finish_fullsync(void) {
         /* 目标文件已 rename 为正式 dump，清 path 元数据（不再 unlink） */
         tg->path[0] = '\0';
         tg->fd = -1;
+    }
+    if (dump_committed) {
+        /* 快照已真正成为本地基线：此时才允许把 applied/durable 推进到快照基点。 */
+        g_slave_repl_applied_offset = g_slave_fullsync_base_offset;
+        g_slave_repl_durable_offset = g_slave_fullsync_base_offset;
+        g_slave_repl_offset = g_slave_fullsync_base_offset;
     }
     repl_slave_state_save();
     repl_slave_send_repldone();
@@ -3358,7 +3384,8 @@ void repl_slave_note_applied(size_t rawlen) {
         g_slave_repl_applied_offset += (unsigned long long)rawlen;
         g_slave_repl_offset = g_slave_repl_applied_offset;
 #if KVS_ENABLE_RDMA
-    if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma") || !strcasecmp(g_cfg.repl_transport_backend, "rdma"))
+    if (repl_rdma_verbose_apply() &&
+        (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma") || !strcasecmp(g_cfg.repl_transport_backend, "rdma")))
         fprintf(stderr, "repl rdma: slave_apply - applied_before=%llu rawlen=%zu applied_after=%llu durable=%llu\n",
             before, rawlen, g_slave_repl_applied_offset, g_slave_repl_durable_offset);
 #endif
@@ -3366,7 +3393,8 @@ void repl_slave_note_applied(size_t rawlen) {
     } else {
         g_slave_fullsync_loaded_bytes += (unsigned long long)rawlen;
 #if KVS_ENABLE_RDMA
-        if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma") || !strcasecmp(g_cfg.repl_transport_backend, "rdma"))
+        if (repl_rdma_verbose_apply() &&
+            (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma") || !strcasecmp(g_cfg.repl_transport_backend, "rdma")))
             fprintf(stderr, "repl rdma: slave_apply - fullsync_chunk=%zu loaded=%llu target=%llu\n",
                 rawlen, g_slave_fullsync_loaded_bytes, g_slave_fullsync_target_bytes);
 #endif
@@ -3387,7 +3415,8 @@ void repl_slave_note_durable(size_t rawlen) {
         repl_slave_state_save();
     }
 #if KVS_ENABLE_RDMA
-    if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma") || !strcasecmp(g_cfg.repl_transport_backend, "rdma"))
+    if (repl_rdma_verbose_apply() &&
+        (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma") || !strcasecmp(g_cfg.repl_transport_backend, "rdma")))
         fprintf(stderr, "repl rdma: slave_durable - applied=%llu durable=%llu\n",
             g_slave_repl_applied_offset, g_slave_repl_durable_offset);
 #endif
