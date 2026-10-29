@@ -85,6 +85,7 @@ kv_config_t g_cfg = {
     .rdma_qp_wr_depth = 64,
     .rdma_fullsync_max_concurrent = 2,
     .rdma_fullsync_pause_us = 0,
+    .rdma_fullsync_repldone_timeout_ms = 60000,
     .repl_rdma_write_buf_max_mb = 256,
     .aof_fsync = KVS_AOF_FSYNC_ALWAYS,
     .aof_fsync_per_command = 0,   /* 0=批量；1=逐条 */
@@ -324,6 +325,9 @@ static int parse_args(int argc, char **argv) {
         else if (!strcmp(argv[i], "--rdma-fullsync-pause-us") && i + 1 < argc) {
             g_cfg.rdma_fullsync_pause_us = atoi(argv[++i]);
         }
+        else if (!strcmp(argv[i], "--rdma-fullsync-repldone-timeout-ms") && i + 1 < argc) {
+            g_cfg.rdma_fullsync_repldone_timeout_ms = atoi(argv[++i]);
+        }
         else if (!strcmp(argv[i], "--repl-rdma-write-buf-max-mb") && i + 1 < argc) {
             g_cfg.repl_rdma_write_buf_max_mb = atoi(argv[++i]);
         }
@@ -470,6 +474,7 @@ static int apply_config_kv(const char *key, const char *value) {
     else if (!strcmp(key, "rdma_qp_wr_depth")) g_cfg.rdma_qp_wr_depth = atoi(value);
     else if (!strcmp(key, "rdma_fullsync_max_concurrent")) g_cfg.rdma_fullsync_max_concurrent = atoi(value);
     else if (!strcmp(key, "rdma_fullsync_pause_us")) g_cfg.rdma_fullsync_pause_us = atoi(value);
+    else if (!strcmp(key, "rdma_fullsync_repldone_timeout_ms")) g_cfg.rdma_fullsync_repldone_timeout_ms = atoi(value);
     else if (!strcmp(key, "repl_rdma_write_buf_max_mb")) g_cfg.repl_rdma_write_buf_max_mb = atoi(value);
     else if (!strcmp(key, "appendfsync")) {
         if (parse_appendfsync_policy(value, &policy) != 0) return -1;
@@ -1373,6 +1378,9 @@ static int queue_snapshot_async(conn_t *c, unsigned long long snap_base_offset,
         repl_rdma_log("queue_snapshot_async - manager unavailable, TCP fallback");
     }
 
+    /* 连接级 fullsync 模式：REPLDONE 校验以它为准，不能靠消息参数反推。 */
+    c->repl_fs_mode = use_rdma ? KVS_FS_MODE_V2_RDMA : KVS_FS_MODE_TCP_FALLBACK;
+
     /* RDMA 路径用 transfer 唯一名 + O_EXCL；TCP 回退沿用进程级 tmp 名，
      * 崩溃残留用 O_TRUNC 覆盖（本进程是唯一写者）。 */
     int open_flags = O_RDWR | O_CREAT | O_CLOEXEC | (use_rdma ? O_EXCL : O_TRUNC);
@@ -1444,6 +1452,7 @@ fail:
         unlink(tmp_path);
     }
     if (use_rdma && tid) rdma_fs_cancel(tid, RDMA_FS_REASON_SNAPSHOT);
+    if (c) c->repl_fs_mode = KVS_FS_MODE_NONE;
     return -1;
 }
 
@@ -1504,6 +1513,7 @@ static int queue_snapshot(conn_t *c, unsigned long long snap_base_offset) {
             repl_rdma_log("queue_snapshot - RDMA start failed, falling back to TCP");
         }
     }
+    c->repl_fs_mode = rdma_ok ? KVS_FS_MODE_LEGACY_RDMA : KVS_FS_MODE_TCP_FALLBACK;
 
     /* Generate KVSD snapshot to temp file */
     snprintf(tmp_path, sizeof(tmp_path), "%s.fullsync.tmp.%ld", g_cfg.dump_path, (long)getpid());
@@ -1583,7 +1593,7 @@ static int queue_snapshot(conn_t *c, unsigned long long snap_base_offset) {
                 /* 等全部 WRITE 完成（slave 目标数据落定），再经 TCP 发完成信号，
                  * 兜底 rxe 下 RDMA IMM 事件可能丢失导致 slave 不 finalize。 */
                 extern int repl_rdma_wait_all_sends(int timeout_ms);
-                extern void repl_fullsync_send_end(int tcp_fd, uint64_t tid);
+                extern int repl_fullsync_send_end(int tcp_fd, uint64_t tid);
                 repl_rdma_wait_all_sends(15000);
                 if (transfer_id) repl_fullsync_send_end(c->fd, transfer_id);
             } else {
@@ -1591,7 +1601,7 @@ static int queue_snapshot(conn_t *c, unsigned long long snap_base_offset) {
             }
         }
         if (!data_sent) {
-            extern void repl_fullsync_abort_master(int tcp_fd, uint64_t tid);
+            extern int repl_fullsync_abort_master(int tcp_fd, uint64_t tid);
             extern int repl_fullsync_sendfile(int tcp_fd, int dump_fd, size_t total_bytes);
             extern void repl_rdma_master_transfer_cleanup(conn_t *c);
             /* 仅当 WRITE 握手已成功（slave 确实建了 file-backed 目标）才发 abort 清理；
@@ -1634,6 +1644,7 @@ static int queue_snapshot(conn_t *c, unsigned long long snap_base_offset) {
     ret = 0;
     repl_rdma_log("queue_snapshot - complete snapshot_bytes=%zu repl_offset=%llu", total, repl_master_offset());
 out:
+    if (ret != 0) c->repl_fs_mode = KVS_FS_MODE_NONE;
     return ret;
 }
 
@@ -1649,11 +1660,44 @@ void repl_rdma_fs_tick(void) {
     int n = rdma_fs_drain_events_owner(evs, 8);
     for (int i = 0; i < n; i++) {
         conn_t *c = (conn_t *)evs[i].owner_conn;
+        /* 事件必须精确属于当前连接上的当前 transfer；旧 job 的 WR_DONE/FAILED
+         * 绝不能对新 Barrier 发 END/ABORT 或 reject。 */
+        int owned = c && c->repl_fs_mode == KVS_FS_MODE_V2_RDMA
+            && c->repl_transfer_id == evs[i].tid
+            && c->repl_slot == evs[i].slot
+            && c->repl_barrier_gen == evs[i].replica_gen
+            && c->repl_barrier_seq == evs[i].barrier_seq;
         if (evs[i].type == RDMA_FS_EV_WR_DONE) {
+            if (!owned) {
+                fprintf(stderr, "master: stale WR_DONE tid=%llu slot=%d (conn mode/tid/"
+                                "gen/seq mismatch) — drop and cancel old job\n",
+                        (unsigned long long)evs[i].tid, evs[i].slot);
+                rdma_fs_cancel(evs[i].tid, RDMA_FS_REASON_CANCELLED);
+                continue;
+            }
             repl_rdma_log("fs_tick - tid=%llu WR done bytes=%llu, send FULLSYNCEND",
                           (unsigned long long)evs[i].tid,
                           (unsigned long long)evs[i].bytes_completed);
-            if (c && c->fd >= 0) repl_fullsync_send_end(c->fd, evs[i].tid);
+            if (repl_fullsync_send_end(c->fd, evs[i].tid) != 0) {
+                fprintf(stderr, "master: FULLSYNCEND tid=%llu short write/failure — "
+                                "fail-closed this replica\n",
+                        (unsigned long long)evs[i].tid);
+                rdma_fs_cancel(evs[i].tid, RDMA_FS_REASON_CONTROL_WRITE);
+                c->repl_fullsync_pending = 0;
+                c->repl_transfer_id = 0;
+                c->repl_fs_mode = KVS_FS_MODE_NONE;
+                repl_barrier_cancel(c);
+                repl_reject_replica(c);
+            } else if (rdma_fs_mark_fullsyncend_sent(evs[i].tid) != 0) {
+                fprintf(stderr, "master: FULLSYNCEND tid=%llu sent but job no longer "
+                                "waiting — cancel\n", (unsigned long long)evs[i].tid);
+                rdma_fs_cancel(evs[i].tid, RDMA_FS_REASON_CANCELLED);
+                c->repl_fullsync_pending = 0;
+                c->repl_transfer_id = 0;
+                c->repl_fs_mode = KVS_FS_MODE_NONE;
+                repl_barrier_cancel(c);
+                repl_reject_replica(c);
+            }
         } else if (evs[i].type == RDMA_FS_EV_FAILED) {
             fprintf(stderr, "master: fullsync job tid=%llu slot=%d failed "
                             "(%s, bytes=%llu/%llu) — isolating this replica only\n",
@@ -1661,16 +1705,28 @@ void repl_rdma_fs_tick(void) {
                     rdma_fs_reason_name(evs[i].reason),
                     (unsigned long long)evs[i].bytes_completed,
                     (unsigned long long)evs[i].bytes_total);
-            if (c && c->fd >= 0 && evs[i].tid)
-                repl_fullsync_abort_master(c->fd, evs[i].tid);
-            if (c) {
-                if (c->repl_transfer_id == evs[i].tid) c->repl_transfer_id = 0;
-                c->repl_fullsync_pending = 0;
-                repl_barrier_cancel(c);
-                repl_reject_replica(c);
+            if (!owned) {
+                fprintf(stderr, "master: stale FAILED tid=%llu (current mode=%d tid=%llu) "
+                                "— no action on current replica\n",
+                        (unsigned long long)evs[i].tid, c ? c->repl_fs_mode : -1,
+                        c ? (unsigned long long)c->repl_transfer_id : 0);
+                continue;
             }
+            if (c->fd >= 0)
+                (void)repl_fullsync_abort_master(c->fd, evs[i].tid);
+            c->repl_transfer_id = 0;
+            c->repl_fullsync_pending = 0;
+            c->repl_fs_mode = KVS_FS_MODE_NONE;
+            repl_barrier_cancel(c);
+            repl_reject_replica(c);
         }
     }
+#endif
+}
+
+void repl_rdma_fs_shutdown(void) {
+#if KVS_ENABLE_RDMA
+    rdma_fs_mgr_stop();
 #endif
 }
 
@@ -2242,6 +2298,17 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         /* slave 端通过 parse_resp_stream(NULL, ..., 1) 处理复制数据时，
          * 不应处理 REPLSYNC（缓存回放可能包含被 BPF 误捕获的 REPLSYNC） */
         if (from_replication && !c) goto out;
+        /* 同一控制连接一旦已是 replica 或仍有活动 fullsync/Barrier，拒绝第二次
+         * REPLSYNC：不能在旧 Barrier 上叠新 job（旧事件可能误操作新任务）。 */
+        if (g_cfg.role == ROLE_MASTER && c
+            && (c->is_replica || c->repl_fullsync_pending
+                || c->repl_fs_mode != KVS_FS_MODE_NONE)) {
+            fprintf(stderr, "master: duplicate REPLSYNC on active replica conn fd=%d "
+                            "(mode=%d pending=%d) — reject\n",
+                    c->fd, c->repl_fs_mode, c->repl_fullsync_pending);
+            repl_reject_replica(c);
+            return 0;
+        }
         const char *req_replid = argc >= 2 ? argv[1] : "?";
         unsigned long long req_offset = argc >= 3 ? (unsigned long long)strtoull(argv[2], NULL, 10) : 0;
         unsigned long long req_durable = argc >= 4 ? (unsigned long long)strtoull(argv[3], NULL, 10) : req_offset;
@@ -2339,6 +2406,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
                 repl_reject_replica(c);
                 c->repl_fullsync_pending = 0;
                 c->repl_transfer_id = 0;
+                c->repl_fs_mode = KVS_FS_MODE_NONE;
                 if (!rdma_fs_should_enable()) {
                     g_repl_fullsync_in_progress = 0;
                     if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma")) {
@@ -2408,29 +2476,44 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         unsigned long long done_tid = argc >= 2
             ? (unsigned long long)strtoull(argv[1], NULL, 10) : 0;
         if (g_cfg.role == ROLE_MASTER && c && c->is_replica) {
-            int new_proto = (done_tid != 0 && rdma_fs_should_enable());
-            if (new_proto && c->repl_transfer_id != done_tid) {
-                /* 同一控制连接上旧 transfer 的重复/迟到 REPLDONE：不得放行新 Barrier。 */
-                fprintf(stderr, "master: stale REPLDONE tid=%llu != active=%llu — ignored\n",
-                        done_tid, (unsigned long long)c->repl_transfer_id);
-                return 0;
-            }
-            if (new_proto) {
-                int ok = rdma_fs_on_repldone(((uint64_t)done_tid), c,
-                                             c->repl_slot, c->repl_barrier_gen);
-                if (!ok) {
-                    fprintf(stderr, "master: stale/mismatched REPLDONE tid=%llu "
-                                    "(active=%llu slot=%d gen=%llu) — ignored\n",
-                            done_tid, (unsigned long long)c->repl_transfer_id,
-                            c->repl_slot, (unsigned long long)c->repl_barrier_gen);
+            int mode = c->repl_fs_mode;
+            if (mode == KVS_FS_MODE_V2_RDMA) {
+                /* 活动 v2 transfer：必须带匹配 tid，且 job 必须处于 WAIT_REPLDONE。
+                 * 无 tid/错 tid/迟到 REPLDONE 一律忽略，绝不放行 Barrier。 */
+                if (done_tid == 0 || done_tid != c->repl_transfer_id) {
+                    fprintf(stderr, "master: REPLDONE tid=%llu rejected on active v2 "
+                                    "transfer (active=%llu) — barrier kept\n",
+                            done_tid, (unsigned long long)c->repl_transfer_id);
                     return 0;
                 }
+                if (!rdma_fs_on_repldone(((uint64_t)done_tid), c,
+                                         c->repl_slot, c->repl_barrier_gen)) {
+                    fprintf(stderr, "master: REPLDONE tid=%llu not in WAIT_REPLDONE / "
+                                    "slot/gen mismatch (slot=%d gen=%llu) — ignored\n",
+                            done_tid, c->repl_slot,
+                            (unsigned long long)c->repl_barrier_gen);
+                    return 0;
+                }
+            } else if (mode == KVS_FS_MODE_TCP_FALLBACK || mode == KVS_FS_MODE_LEGACY_RDMA) {
+                /* 明确走 TCP/旧 RDMA 回退的 transfer 只接受旧式无参 REPLDONE。 */
+                if (done_tid != 0) {
+                    fprintf(stderr, "master: REPLDONE tid=%llu rejected in legacy/TCP "
+                                    "fallback mode (mode=%d) — ignored\n", done_tid, mode);
+                    return 0;
+                }
+            } else {
+                /* 没有活动 fullsync：迟到 REPLDONE 不得释放无关 Barrier。 */
+                fprintf(stderr, "master: REPLDONE with no active fullsync "
+                                "(mode=none, pending=%d) — ignored\n",
+                        c->repl_fullsync_pending);
+                return 0;
             }
             c->repl_fullsync_pending = 0;
-            if (!new_proto) {
+            if (mode != KVS_FS_MODE_V2_RDMA) {
                 g_repl_fullsync_in_progress = 0;
             }
             c->repl_transfer_id = 0;
+            c->repl_fs_mode = KVS_FS_MODE_NONE;
 
             /* Slave 确认快照已加载完成 → 放行屏障：proxy 切回 FORWARDING 并 flush
              * 全量期间攒下的 proxy_cache。放行必须由 Slave 的确认触发，这样 cache 里的
@@ -2477,9 +2560,9 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             /* 旧单实例路径：从机确认全量完成后关闭 RDMA。
              * 新并发路径由 rdma_fullsync_mgr 在 REPLDONE 后异步销毁该 job 的 QP/CQ，
              * 不能调用全局 stop（会伤害其他 Slave 的 job）。 */
-            if (!new_proto) repl_rdma_stop_fullsync();
-            repl_rdma_log("master_repldone - slave fullsync complete tid=%llu (%s)",
-                          done_tid, new_proto ? "async job done" : "RDMA stopped");
+            if (mode != KVS_FS_MODE_V2_RDMA) repl_rdma_stop_fullsync();
+            repl_rdma_log("master_repldone - slave fullsync complete tid=%llu mode=%d",
+                          done_tid, mode);
             return 0;
         }
         /* Slave 侧兼容（旧代码路径，保留以防万一） */
@@ -4174,6 +4257,7 @@ int main(int argc, char **argv) {
                 "  --rdma-qp-wr-depth N    QP 队列深度 (默认 64)\n"
                 "  --rdma-fullsync-max-concurrent N  并发 RDMA 全量 job 上限 (默认 2)\n"
                 "  --rdma-fullsync-pause-us N        每个 WRITE chunk 间隔 µs (默认 0)\n"
+                "  --rdma-fullsync-repldone-timeout-ms N  FULLSYNCEND 后等待 REPLDONE 超时 (默认 60000)\n"
                 "  --appendfsync always|off  AOF fsync 策略 (默认 always)\n"
                 "  --ebpf-enabled          启用 eBPF sockmap\n"
                 "  --ebpf-obj PATH         eBPF 对象文件路径\n"

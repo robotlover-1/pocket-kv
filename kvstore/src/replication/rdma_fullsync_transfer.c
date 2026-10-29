@@ -53,6 +53,14 @@ static int fs_cfg_qp_depth(int slots) {
     return v;
 }
 
+/* CM 线程在 setup 阶段检查 worker/owner 是否已取消。 */
+static int fs_job_cancel_requested(rdma_fs_job_t *job) {
+    pthread_mutex_lock(&g_rdma_fs_mu);
+    int c = job->cancel;
+    pthread_mutex_unlock(&g_rdma_fs_mu);
+    return c;
+}
+
 /* 构造 CLOCK_REALTIME 绝对超时，供 pthread_cond_timedwait 使用。 */
 static struct timespec fs_deadline_after_ms(long long ms) {
     struct timespec ts;
@@ -81,6 +89,7 @@ int rdma_fs_job_setup_verbs(rdma_fs_job_t *job) {
     if (job->pause_us > 100000) job->pause_us = 100000;
     pthread_mutex_unlock(&g_rdma_fs_mu);
 
+    if (fs_job_cancel_requested(job)) return -1;
     job->comp_chan = ibv_create_comp_channel(job->id->verbs);
     if (!job->comp_chan) {
         fprintf(stderr, "repl rdma-fs: tid=%llu create_comp_channel failed: %s\n",
@@ -88,6 +97,7 @@ int rdma_fs_job_setup_verbs(rdma_fs_job_t *job) {
         return -1;
     }
 
+    if (fs_job_cancel_requested(job)) return -1;
     job->pd = ibv_alloc_pd(job->id->verbs);
     if (!job->pd) {
         fprintf(stderr, "repl rdma-fs: tid=%llu alloc_pd failed: %s\n",
@@ -97,6 +107,7 @@ int rdma_fs_job_setup_verbs(rdma_fs_job_t *job) {
         return -1;
     }
 
+    if (fs_job_cancel_requested(job)) return -1;
     job->cq = ibv_create_cq(job->id->verbs, (int)job->qp_depth, NULL,
                             job->comp_chan, 0);
     if (!job->cq) {
@@ -114,6 +125,7 @@ int rdma_fs_job_setup_verbs(rdma_fs_job_t *job) {
     attr.cap.max_recv_wr = 1;
     attr.cap.max_send_sge = 1;
     attr.cap.max_recv_sge = 1;
+    if (fs_job_cancel_requested(job)) return -1;
     if (rdma_create_qp(job->id, job->pd, &attr) != 0) {
         fprintf(stderr, "repl rdma-fs: tid=%llu create_qp failed: %s\n",
                 (unsigned long long)job->tid, strerror(errno));
@@ -124,6 +136,7 @@ int rdma_fs_job_setup_verbs(rdma_fs_job_t *job) {
     if (!job->qp) return -1;
 
     for (int i = 0; i < job->slot_count; i++) {
+        if (fs_job_cancel_requested(job)) return -1;
         rdma_fs_slot_t *s = &job->slots[i];
         s->buf = (unsigned char *)malloc(job->chunk_size);
         if (!s->buf) return -1;
@@ -172,24 +185,27 @@ void rdma_fs_job_teardown_verbs(rdma_fs_job_t *job) {
     }
 }
 
-/* 从 CQ 回收完成。返回完成数；*cq_err 置 1 表示出现失败 completion。 */
-static int fs_poll_cq(rdma_fs_job_t *job, int slot_inflight[], int *inflight,
-                      int *cq_err, int *wc_status, int *inflight_wr_out) {
+/* 从 CQ 回收完成。返回完成数；*cq_err 置 1 表示出现失败/非法 completion。
+ * 每个 CQE 必须严格匹配 RDMA_WRITE + 仍 in-flight 的 slot；完成字节按
+ * 该 slot 实际 post 的长度统计（不信任 drivers 的 wc.byte_len）。 */
+static int fs_poll_cq(rdma_fs_job_t *job, int slot_inflight[], size_t slot_len[],
+                      int *inflight, int *cq_err, int *wc_status,
+                      int *inflight_wr_out) {
     struct ibv_wc wc[8];
     int total = 0;
     *cq_err = 0;
 
     for (;;) {
         int n = ibv_poll_cq(job->cq, 8, wc);
-        if (n <= 0) break;
+        if (n < 0) {
+            *cq_err = 1;
+            if (wc_status) *wc_status = -1;
+            fprintf(stderr, "repl rdma-fs: tid=%llu ibv_poll_cq failed\n",
+                    (unsigned long long)job->tid);
+            break;
+        }
+        if (n == 0) break;
         for (int i = 0; i < n; i++) {
-            int slot = (wc[i].wr_id > 0) ? (int)(wc[i].wr_id - 1) : -1;
-            if (slot >= 0 && slot < job->slot_count && slot_inflight[slot]) {
-                slot_inflight[slot] = 0;
-            }
-            if (*inflight > 0) (*inflight)--;
-            job->completed_bytes += wc[i].byte_len;
-            total++;
             if (wc[i].status != IBV_WC_SUCCESS) {
                 *cq_err = 1;
                 if (wc_status) *wc_status = (int)wc[i].status;
@@ -197,7 +213,25 @@ static int fs_poll_cq(rdma_fs_job_t *job, int slot_inflight[], int *inflight,
                         "vendor=%u wr_id=%llu\n",
                         (unsigned long long)job->tid, wc[i].status, wc[i].opcode,
                         wc[i].vendor_err, (unsigned long long)wc[i].wr_id);
+                continue;
             }
+            int slot = (wc[i].wr_id > 0 && wc[i].wr_id <= (uint64_t)job->slot_count)
+                ? (int)(wc[i].wr_id - 1) : -1;
+            if (wc[i].opcode != IBV_WC_RDMA_WRITE || slot < 0 || !slot_inflight[slot]) {
+                *cq_err = 1;
+                if (wc_status) *wc_status = (int)wc[i].status;
+                fprintf(stderr, "repl rdma-fs: tid=%llu unexpected CQE opcode=%d "
+                        "wr_id=%llu (slot in_flight=%d)\n",
+                        (unsigned long long)job->tid, wc[i].opcode,
+                        (unsigned long long)wc[i].wr_id,
+                        slot >= 0 ? slot_inflight[slot] : -1);
+                continue;
+            }
+            slot_inflight[slot] = 0;
+            job->completed_bytes += (uint64_t)slot_len[slot];
+            slot_len[slot] = 0;
+            if (*inflight > 0) (*inflight)--;
+            total++;
         }
     }
     if (inflight_wr_out) *inflight_wr_out = *inflight;
@@ -238,7 +272,9 @@ void *rdma_fs_job_worker(void *arg) {
     int reason = RDMA_FS_REASON_NONE;
     int failed = 0;
     int slot_inflight[RDMA_FS_MAX_SLOTS];
+    size_t slot_len[RDMA_FS_MAX_SLOTS];
     memset(slot_inflight, 0, sizeof(slot_inflight));
+    memset(slot_len, 0, sizeof(slot_len));
     int inflight = 0;
     int cq_err = 0;
     int token_held = 0;
@@ -327,7 +363,7 @@ void *rdma_fs_job_worker(void *arg) {
             pthread_mutex_unlock(&g_rdma_fs_mu);
 
             int wc_status = 0;
-            int done = fs_poll_cq(job, slot_inflight, &inflight, &cq_err,
+            int done = fs_poll_cq(job, slot_inflight, slot_len, &inflight, &cq_err,
                                   &wc_status, NULL);
             if (cq_err) {
                 reason = RDMA_FS_REASON_CQ;
@@ -403,10 +439,10 @@ void *rdma_fs_job_worker(void *arg) {
 
             if (job->pause_us > 0) usleep((useconds_t)job->pause_us);
             int post_rc = ibv_post_send(job->qp, &wr, &bad);
-            if (post_rc != 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (post_rc != 0 && (post_rc == EAGAIN || post_rc == EWOULDBLOCK)) {
                 /* SQ 满：先回收 CQE 再重试一次。 */
                 fs_wait_completion(job, 5);
-                fs_poll_cq(job, slot_inflight, &inflight, &cq_err, NULL, NULL);
+                fs_poll_cq(job, slot_inflight, slot_len, &inflight, &cq_err, NULL, NULL);
                 if (cq_err) {
                     reason = RDMA_FS_REASON_CQ;
                     failed = 1;
@@ -415,14 +451,17 @@ void *rdma_fs_job_worker(void *arg) {
                 continue;
             }
             if (post_rc != 0) {
-                fprintf(stderr, "repl rdma-fs: tid=%llu ibv_post_send failed: %s\n",
-                        (unsigned long long)job->tid, strerror(errno));
+                fprintf(stderr, "repl rdma-fs: tid=%llu ibv_post_send failed rc=%d (%s) "
+                        "bad_wr=%s\n",
+                        (unsigned long long)job->tid, post_rc, strerror(post_rc),
+                        bad ? "set" : "null");
                 reason = RDMA_FS_REASON_CQ;
                 failed = 1;
                 break;
             }
 
             slot_inflight[slot] = 1;
+            slot_len[slot] = (size_t)r;
             inflight++;
             next_slot = (slot + 1) % job->slot_count;
             off += (uint64_t)r;
@@ -442,7 +481,7 @@ void *rdma_fs_job_worker(void *arg) {
                     break;
                 }
                 int wc_status = 0;
-                fs_poll_cq(job, slot_inflight, &inflight, &cq_err, &wc_status, NULL);
+                fs_poll_cq(job, slot_inflight, slot_len, &inflight, &cq_err, &wc_status, NULL);
                 if (cq_err) {
                     reason = RDMA_FS_REASON_CQ;
                     failed = 1;
@@ -481,6 +520,7 @@ finish:
     }
     if (failed) {
         job->state = RDMA_FS_ST_FAILED;
+        job->cancel = 1;
         job->cancel_reason = reason;
         job->cq_error = (reason == RDMA_FS_REASON_CQ) ? 1 : job->cq_error;
     } else if (job->posted_bytes == job->snap_size && inflight == 0) {

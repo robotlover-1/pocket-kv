@@ -58,6 +58,7 @@ const char *rdma_fs_reason_name(int reason) {
     case RDMA_FS_REASON_SNAPSHOT: return "snapshot_error";
     case RDMA_FS_REASON_REMOTE_MR: return "remote_mr_error";
     case RDMA_FS_REASON_OWNER_CLOSED: return "owner_closed";
+    case RDMA_FS_REASON_CONTROL_WRITE: return "control_write_error";
     default: return "unknown";
     }
 }
@@ -80,6 +81,7 @@ pthread_cond_t g_rdma_fs_cv = PTHREAD_COND_INITIALIZER;
 int g_rdma_fs_sending = 0;
 int g_rdma_fs_max_concurrent = 2;
 unsigned g_rdma_fs_max_seen = 0;
+static int g_rdma_fs_repldone_timeout_ms = 60000;
 
 enum fs_cmd_op {
     FS_CMD_DESTROY = 1,
@@ -127,6 +129,8 @@ static const char *fs_realtime_transport_name(void) {
 
 int rdma_fs_should_enable(void) {
     if (g_cfg.role != ROLE_MASTER) return 0;
+    /* owner 事件 drain 只接入 reactor 主循环；其他网络后端继续走旧路径。 */
+    if (strcmp(g_cfg.net_backend, "reactor") != 0) return 0;
     if (strcasecmp(fs_fullsync_transport_name(), "rdma") != 0) return 0;
     /* 纯 RDMA / kprobe-rdma 实时路径仍使用旧的单实例实现。 */
     if (!strcasecmp(g_cfg.repl_transport_backend, "rdma")) return 0;
@@ -199,7 +203,8 @@ static int fs_handle_connect_request(struct rdma_cm_id *id, uint64_t tid, uint64
     id->context = job;
     job->needs_destroy = 1;
     job->resources_destroyed = 0;
-    job->state = RDMA_FS_ST_WAIT_ESTABLISHED;
+    job->cm_setup = 1;
+    job->state = RDMA_FS_ST_CM_SETUP;
     g_mgr.registered_bytes += 0;
     fprintf(stderr, "repl rdma-fs: CM connect tid=%llu t=%lld (waiting_jobs=%d)\n",
             (unsigned long long)tid, kvs_now_ms(), g_rdma_fs_sending);
@@ -210,6 +215,7 @@ static int fs_handle_connect_request(struct rdma_cm_id *id, uint64_t tid, uint64
                 (unsigned long long)tid);
         rdma_reject(id, NULL, 0);
         pthread_mutex_lock(&g_rdma_fs_mu);
+        job->cm_setup = 0;
         job->cm_disconnected = 1;
         job->cancel = 1;
         job->cancel_reason = RDMA_FS_REASON_RESOURCE;
@@ -220,7 +226,10 @@ static int fs_handle_connect_request(struct rdma_cm_id *id, uint64_t tid, uint64
     }
 
     pthread_mutex_lock(&g_rdma_fs_mu);
+    job->cm_setup = 0;
     int aborted = job->cancel || job->owner_conn == NULL;
+    if (!aborted && job->state == RDMA_FS_ST_CM_SETUP)
+        job->state = RDMA_FS_ST_WAIT_ESTABLISHED;
     pthread_mutex_unlock(&g_rdma_fs_mu);
     if (aborted) {
         rdma_reject(id, NULL, 0);
@@ -236,6 +245,7 @@ static int fs_handle_connect_request(struct rdma_cm_id *id, uint64_t tid, uint64
         fprintf(stderr, "repl rdma-fs: tid=%llu rdma_accept failed: %s\n",
                 (unsigned long long)tid, strerror(errno));
         pthread_mutex_lock(&g_rdma_fs_mu);
+        job->cm_setup = 0;
         job->cm_disconnected = 1;
         job->cancel = 1;
         job->cancel_reason = RDMA_FS_REASON_CM;
@@ -496,6 +506,9 @@ int rdma_fs_mgr_start(void) {
         g_rdma_fs_max_concurrent = v;
     }
     if (g_rdma_fs_max_concurrent < 1) g_rdma_fs_max_concurrent = 1;
+    g_rdma_fs_repldone_timeout_ms = g_cfg.rdma_fullsync_repldone_timeout_ms;
+    if (g_rdma_fs_repldone_timeout_ms < 1000) g_rdma_fs_repldone_timeout_ms = 1000;
+    if (g_rdma_fs_repldone_timeout_ms > 600000) g_rdma_fs_repldone_timeout_ms = 600000;
 
     g_mgr.epoch = ((uint64_t)getpid() << 32) ^ (uint64_t)time(NULL) ^ (uint64_t)kvs_now_ms();
     if (g_mgr.epoch == 0) g_mgr.epoch = 1;
@@ -528,6 +541,20 @@ fail:
 void rdma_fs_mgr_stop(void) {
     if (!g_mgr.started) return;
     __atomic_store_n(&g_mgr.shutdown, 1, __ATOMIC_RELEASE);
+
+    /* 1) 取消所有活动 job 并唤醒等待中的 worker。 */
+    pthread_mutex_lock(&g_rdma_fs_mu);
+    for (rdma_fs_job_t *j = g_mgr.jobs; j; j = j->next) {
+        j->cancel = 1;
+        j->notified = 1;
+        if (!j->cancel_reason) j->cancel_reason = RDMA_FS_REASON_CANCELLED;
+        if (j->state != RDMA_FS_ST_DONE) j->state = RDMA_FS_ST_FAILED;
+        j->wait_deadline_ms = 0;
+    }
+    pthread_cond_broadcast(&g_rdma_fs_cv);
+    pthread_mutex_unlock(&g_rdma_fs_mu);
+
+    /* 2) 停止 CM 线程（之后由本线程独占所有 CM/verbs 资源）。 */
     if (g_mgr.cmd_pipe[1] >= 0) {
         fs_cmd_t cmd = { .op = FS_CMD_STOP, .tid = 0 };
         ssize_t wn = write(g_mgr.cmd_pipe[1], &cmd, sizeof(cmd));
@@ -535,11 +562,51 @@ void rdma_fs_mgr_stop(void) {
     }
     if (g_mgr.ready) pthread_join(g_mgr.cm_thread, NULL);
     g_mgr.ready = 0;
+
+    /* 3) join 所有 worker。 */
+    for (;;) {
+        rdma_fs_job_t *target = NULL;
+        pthread_mutex_lock(&g_rdma_fs_mu);
+        for (rdma_fs_job_t *j = g_mgr.jobs; j; j = j->next) {
+            if (j->worker_started && !j->worker_joined) { target = j; break; }
+        }
+        pthread_mutex_unlock(&g_rdma_fs_mu);
+        if (!target) break;
+        pthread_join(target->worker, NULL);
+        pthread_mutex_lock(&g_rdma_fs_mu);
+        target->worker_joined = 1;
+        pthread_mutex_unlock(&g_rdma_fs_mu);
+    }
+
+    /* 4) 逐 job teardown（QP -> MR -> CQ -> PD -> comp_chan -> child id）并释放快照。 */
+    for (;;) {
+        rdma_fs_job_t *job = NULL;
+        pthread_mutex_lock(&g_rdma_fs_mu);
+        job = g_mgr.jobs;
+        if (job) fs_unlink_locked(job);
+        pthread_mutex_unlock(&g_rdma_fs_mu);
+        if (!job) break;
+        if (job->id) {
+            job->id->context = NULL;
+            rdma_fs_job_teardown_verbs(job);
+            rdma_destroy_id(job->id);
+            job->id = NULL;
+        }
+        if (job->snap_fd >= 0) {
+            close(job->snap_fd);
+            job->snap_fd = -1;
+        }
+        if (job->snap_path[0]) unlink(job->snap_path);
+        free(job);
+    }
+
+    /* 5) listener / event channel / command pipe。 */
     if (g_mgr.listen_id) { rdma_destroy_id(g_mgr.listen_id); g_mgr.listen_id = NULL; }
     if (g_mgr.cm_ec) { rdma_destroy_event_channel(g_mgr.cm_ec); g_mgr.cm_ec = NULL; }
     if (g_mgr.cmd_pipe[0] >= 0) { close(g_mgr.cmd_pipe[0]); g_mgr.cmd_pipe[0] = -1; }
     if (g_mgr.cmd_pipe[1] >= 0) { close(g_mgr.cmd_pipe[1]); g_mgr.cmd_pipe[1] = -1; }
     g_mgr.started = 0;
+    g_mgr.shutdown = 0;
 }
 
 int rdma_fs_mgr_ready(void) {
@@ -558,7 +625,22 @@ int rdma_fs_begin(void *owner_conn, uint64_t owner_conn_id, int slot,
     /* 有界 job 表：异常客户端反复 REPLSYNC 时拒绝新建 job（调用方回退 TCP），
      * 避免 manager 内存/线程无上限增长。 */
     unsigned live = 0;
-    for (rdma_fs_job_t *j = g_mgr.jobs; j; j = j->next) live++;
+    for (rdma_fs_job_t *j = g_mgr.jobs; j; j = j->next) {
+        live++;
+        /* 同一 replica 连接/slot 同时只允许一个活动 job：重复 REPLSYNC
+         * 不得在旧 Barrier/旧 job 上再叠一个新任务。 */
+        /* slot=-1 表示 proxy 未注册（如无 eBPF 的环境），不能按 slot 去重；
+         * 此时只靠 owner_conn 保证一连接一个 job。 */
+        if (((j->owner_conn == owner_conn)
+             || (slot >= 0 && j->slot == slot && j->replica_gen == replica_gen))
+            && j->state != RDMA_FS_ST_FAILED && j->state != RDMA_FS_ST_DONE) {
+            pthread_mutex_unlock(&g_rdma_fs_mu);
+            free(job);
+            fprintf(stderr, "repl rdma-fs: duplicate job for slot=%d conn=%p, reject\n",
+                    slot, owner_conn);
+            return -1;
+        }
+    }
     if (live >= RDMA_FS_MAX_JOBS) {
         pthread_mutex_unlock(&g_rdma_fs_mu);
         free(job);
@@ -721,6 +803,27 @@ void rdma_fs_cancel(uint64_t tid, int reason) {
     pthread_mutex_unlock(&g_rdma_fs_mu);
 }
 
+int rdma_fs_mark_fullsyncend_sent(uint64_t tid) {
+    pthread_mutex_lock(&g_rdma_fs_mu);
+    rdma_fs_job_t *job = fs_find_locked(tid);
+    if (!job) {
+        pthread_mutex_unlock(&g_rdma_fs_mu);
+        return -1;
+    }
+    if (job->state == RDMA_FS_ST_WAIT_REPLDONE) {
+        pthread_mutex_unlock(&g_rdma_fs_mu);
+        return 0;   /* 幂等 */
+    }
+    if (job->state != RDMA_FS_ST_WR_DONE) {
+        pthread_mutex_unlock(&g_rdma_fs_mu);
+        return -1;
+    }
+    job->state = RDMA_FS_ST_WAIT_REPLDONE;
+    job->wait_deadline_ms = kvs_now_ms() + g_rdma_fs_repldone_timeout_ms;
+    pthread_mutex_unlock(&g_rdma_fs_mu);
+    return 0;
+}
+
 int rdma_fs_drain_events_owner(rdma_fs_event_t *out, int max) {
     if (!out || max <= 0) return 0;
 
@@ -745,7 +848,30 @@ int rdma_fs_drain_events_owner(rdma_fs_event_t *out, int max) {
     int n = 0;
     pthread_mutex_lock(&g_rdma_fs_mu);
 
-    /* 2) 为终止状态的 job 安排 CM 资源销毁（worker 已 join）。 */
+    /* 2) 任务级完成超时：
+     *    - WR_DONE 已通知 owner，但 FULLSYNCEND 迟迟未确认发送成功；
+     *    - WAIT_REPLDONE 已成功发送 END，但 Slave 长时间不回报 REPLDONE。
+     * 只把该 job 置 FAILED，下一轮生成 FAILED 事件由 owner 隔离该副本。 */
+    long long now_ms = kvs_now_ms();
+    for (rdma_fs_job_t *j = g_mgr.jobs; j; j = j->next) {
+        int in_wait = ((j->state == RDMA_FS_ST_WR_DONE && j->notified)
+                       || j->state == RDMA_FS_ST_WAIT_REPLDONE);
+        if (in_wait && j->wait_deadline_ms > 0 && now_ms >= j->wait_deadline_ms) {
+            fprintf(stderr, "repl rdma-fs: tid=%llu completion timeout in state=%d "
+                            "(posted=%llu/%llu), fail-closed\n",
+                    (unsigned long long)j->tid, j->state,
+                    (unsigned long long)j->posted_bytes,
+                    (unsigned long long)j->snap_size);
+            j->state = RDMA_FS_ST_FAILED;
+            j->cancel = 1;
+            j->cancel_reason = RDMA_FS_REASON_TIMEOUT;
+            j->notified = 0;   /* 允许下面的 FAILED 事件通知 owner */
+            j->wait_deadline_ms = 0;
+            pthread_cond_broadcast(&g_rdma_fs_cv);
+        }
+    }
+
+    /* 3) 为终止状态的 job 安排 CM 资源销毁（worker 已 join）。 */
     for (rdma_fs_job_t *j = g_mgr.jobs; j; j = j->next) {
         int terminal = (j->state == RDMA_FS_ST_FAILED || j->state == RDMA_FS_ST_DONE
                         || j->owner_conn == NULL);
@@ -768,11 +894,15 @@ int rdma_fs_drain_events_owner(rdma_fs_event_t *out, int max) {
             e->type = RDMA_FS_EV_WR_DONE;
             e->slot = j->slot;
             e->tid = j->tid;
+            e->replica_gen = j->replica_gen;
+            e->barrier_seq = j->barrier_seq;
             e->owner_conn = j->owner_conn;
             e->bytes_total = j->snap_size;
             e->bytes_completed = j->posted_bytes;
             j->notified = 1;
-            j->state = RDMA_FS_ST_WAIT_REPLDONE;
+            /* 只有 owner 成功写完 FULLSYNCEND 后才进入 WAIT_REPLDONE
+             * （rdma_fs_mark_fullsyncend_sent）；超时防止 owner 侧漏处理。 */
+            j->wait_deadline_ms = now_ms + g_rdma_fs_repldone_timeout_ms;
             j->t_done_ms = kvs_now_ms();
         } else if (j->state == RDMA_FS_ST_FAILED && !j->notified) {
             rdma_fs_event_t *e = &out[n++];
@@ -781,10 +911,13 @@ int rdma_fs_drain_events_owner(rdma_fs_event_t *out, int max) {
             e->reason = j->cancel_reason;
             e->slot = j->slot;
             e->tid = j->tid;
+            e->replica_gen = j->replica_gen;
+            e->barrier_seq = j->barrier_seq;
             e->owner_conn = j->owner_conn;
             e->bytes_total = j->snap_size;
             e->bytes_completed = j->posted_bytes;
             j->notified = 1;
+            j->wait_deadline_ms = 0;
             if (!j->failed_counted) { g_mgr.total_failed++; j->failed_counted = 1; }
             if (j->cq_error && !j->cq_counted) { g_mgr.cq_errors++; j->cq_counted = 1; }
         }
@@ -818,7 +951,8 @@ int rdma_fs_drain_events_owner(rdma_fs_event_t *out, int max) {
     for (rdma_fs_job_t *j = g_mgr.jobs; j; j = j->next) {
         active++;
         if (j->state == RDMA_FS_ST_WAIT_TOKEN || j->state == RDMA_FS_ST_WAIT_MR
-            || j->state == RDMA_FS_ST_NEW || j->state == RDMA_FS_ST_WAIT_ESTABLISHED)
+            || j->state == RDMA_FS_ST_NEW || j->state == RDMA_FS_ST_CM_SETUP
+            || j->state == RDMA_FS_ST_WAIT_ESTABLISHED)
             waiting++;
         if (j->state == RDMA_FS_ST_SENDING) { sending++; conc++; }
     }
@@ -835,7 +969,8 @@ void rdma_fs_get_stats(rdma_fs_stats_t *out) {
     for (rdma_fs_job_t *j = g_mgr.jobs; j; j = j->next) {
         out->active_jobs++;
         if (j->state == RDMA_FS_ST_SENDING) out->sending_jobs++;
-        else if (j->state == RDMA_FS_ST_NEW || j->state == RDMA_FS_ST_WAIT_ESTABLISHED
+        else if (j->state == RDMA_FS_ST_NEW || j->state == RDMA_FS_ST_CM_SETUP
+                 || j->state == RDMA_FS_ST_WAIT_ESTABLISHED
                  || j->state == RDMA_FS_ST_WAIT_MR || j->state == RDMA_FS_ST_WAIT_TOKEN)
             out->waiting_jobs++;
         out->registered_bytes += (unsigned long long)j->slot_count * j->chunk_size;
@@ -877,6 +1012,8 @@ int rdma_fs_on_repldone(uint64_t tid, void *owner_conn, int slot,
 }
 void rdma_fs_cancel_owner(void *owner_conn) { (void)owner_conn; }
 void rdma_fs_cancel(uint64_t tid, int reason) { (void)tid; (void)reason; }
+int rdma_fs_mark_fullsyncend_sent(uint64_t tid) { (void)tid; return -1; }
+
 int rdma_fs_drain_events_owner(rdma_fs_event_t *out, int max) { (void)out; (void)max; return 0; }
 void rdma_fs_get_stats(rdma_fs_stats_t *out) { if (out) memset(out, 0, sizeof(*out)); }
 

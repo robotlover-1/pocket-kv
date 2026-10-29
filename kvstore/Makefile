@@ -42,6 +42,11 @@ REPL_MULTI_RDMA_MASTER_PORT?=5260
 REPL_MULTI_RDMA_SLAVE_A_PORT?=5262
 REPL_MULTI_RDMA_SLAVE_B_PORT?=5264
 REPL_MULTI_RDMA_PRELOAD?=30000
+REPL_MULTI_RDMA_REQUIRE?=0
+REPL_MULTI_RDMA_FAULT_MASTER_PORT?=5270
+REPL_MULTI_RDMA_FAULT_SLAVE_A_PORT?=5272
+REPL_MULTI_RDMA_FAULT_SLAVE_B_PORT?=5274
+REPL_FS_GUARD_PORT?=5290
 REPL_RDMA_STRESS_MASTER_PORT?=5230
 REPL_RDMA_STRESS_SLAVE_PORT?=5232
 REPL_RDMA_STRESS_PRELOAD?=128
@@ -438,7 +443,15 @@ check-repl-rdma-smoke:
 
 # ---- 两个 Slave 真正并发 RDMA 全量同步（非 root；需 siw/rxe 设备与可达 IP）----
 check-multi-rdma-fullsync: kvstore
-	python3 ./tools/repl/run_multi_rdma_fullsync.py --bin ./kvstore --host $(REPL_RDMA_SMOKE_HOST) --master-port $(REPL_MULTI_RDMA_MASTER_PORT) --slave-a-port $(REPL_MULTI_RDMA_SLAVE_A_PORT) --slave-b-port $(REPL_MULTI_RDMA_SLAVE_B_PORT) --rdma-dev $(RDMA_DEV) --preload $(REPL_MULTI_RDMA_PRELOAD)
+	python3 ./tools/repl/run_multi_rdma_fullsync.py --bin ./kvstore --host $(REPL_RDMA_SMOKE_HOST) --master-port $(REPL_MULTI_RDMA_MASTER_PORT) --slave-a-port $(REPL_MULTI_RDMA_SLAVE_A_PORT) --slave-b-port $(REPL_MULTI_RDMA_SLAVE_B_PORT) --rdma-dev $(RDMA_DEV) --preload $(REPL_MULTI_RDMA_PRELOAD) $(if $(filter 1,$(REPL_MULTI_RDMA_REQUIRE)),--require-rdma,)
+
+# ---- fullsync 状态机保护：无 tid/错 tid REPLDONE + 重复 REPLSYNC ----
+check-fullsync-state-guard: kvstore
+	python3 ./tools/repl/run_fullsync_state_guard.py --bin ./kvstore --host 127.0.0.1 --port $(REPL_FS_GUARD_PORT) --rdma-dev $(RDMA_DEV) $(if $(filter 1,$(REPL_MULTI_RDMA_REQUIRE)),--require-rdma,)
+
+# ---- 故障隔离：两个 job 发送中 kill B，A 必须完整完成 ----
+check-multi-rdma-fault-isolation: kvstore
+	python3 ./tools/repl/run_multi_rdma_fullsync.py --bin ./kvstore --host $(REPL_RDMA_SMOKE_HOST) --master-port $(REPL_MULTI_RDMA_FAULT_MASTER_PORT) --slave-a-port $(REPL_MULTI_RDMA_FAULT_SLAVE_A_PORT) --slave-b-port $(REPL_MULTI_RDMA_FAULT_SLAVE_B_PORT) --rdma-dev $(RDMA_DEV) --preload $(REPL_MULTI_RDMA_PRELOAD) --kill-b --require-rdma
 
 check-repl-rdma-stress:
 	-kill $$(lsof -ti:$(REPL_RDMA_STRESS_MASTER_PORT)) 2>/dev/null
@@ -492,4 +505,4 @@ check-10w:
 
 check: check-resp check-ttl check-persist check-doc
 
-.PHONY: all clean build_dir check-kvstore check-slave-crash-recovery check-commit-gate-faults check-barrier-timeout check-multi-slave check-repl-5w5w test_persist_dump_demo test_persist_aof_demo test_vsearch check check-resp check-ttl check-persist check-doc check-bulk-1w check-all check-all-quick check-mass-ttl check-uring-persist check-mmap-recover check-repl check-repl-metrics check-repl-profile check-repl-ebpf check-repl-ebpf-env check-repl-ebpf-sync check-repl-ebpf-sync-required check-repl-ebpf-redirect check-repl-rdma-unsupported check-repl-rdma-smoke check-multi-rdma-fullsync check-repl-rdma-stress check-repl-rdma-soak check-repl-rdma-soak-skip check-rdma-standalone-probe check-rdma-pingpong-smoke check-demo-full-dump check-demo-incr-aof check-demo-repl-sync test_uring_persist test_mmap_recover test_repl_basic check-uring-persist-c check-mmap-recover-c check-repl-basic check-persist-purge check-persist-save-frontier tools/ebpf/repl_ebpf_daemon ebpf-proxy client_capture_bpf
+.PHONY: all clean build_dir check-kvstore check-slave-crash-recovery check-commit-gate-faults check-barrier-timeout check-multi-slave check-repl-5w5w test_persist_dump_demo test_persist_aof_demo test_vsearch check check-resp check-ttl check-persist check-doc check-bulk-1w check-all check-all-quick check-mass-ttl check-uring-persist check-mmap-recover check-repl check-repl-metrics check-repl-profile check-repl-ebpf check-repl-ebpf-env check-repl-ebpf-sync check-repl-ebpf-sync-required check-repl-ebpf-redirect check-repl-rdma-unsupported check-repl-rdma-smoke check-multi-rdma-fullsync check-multi-rdma-fault-isolation check-fullsync-state-guard check-repl-rdma-stress check-repl-rdma-soak check-repl-rdma-soak-skip check-rdma-standalone-probe check-rdma-pingpong-smoke check-demo-full-dump check-demo-incr-aof check-demo-repl-sync test_uring_persist test_mmap_recover test_repl_basic check-uring-persist-c check-mmap-recover-c check-repl-basic check-persist-purge check-persist-save-frontier tools/ebpf/repl_ebpf_daemon ebpf-proxy client_capture_bpf

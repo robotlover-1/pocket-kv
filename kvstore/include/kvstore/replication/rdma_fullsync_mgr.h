@@ -38,6 +38,8 @@ typedef struct rdma_fs_event {
     int reason;                 /* 失败原因（rdma_fs_reason_t） */
     int slot;                   /* replica slot */
     uint64_t tid;               /* transfer_id */
+    uint64_t replica_gen;       /* slot generation（与 barrier 绑定） */
+    uint64_t barrier_seq;       /* 本次 barrier 序号 */
     void *owner_conn;           /* opaque conn_t*，仅 owner 线程解引用 */
     uint64_t bytes_total;
     uint64_t bytes_completed;
@@ -52,7 +54,8 @@ enum {
     RDMA_FS_REASON_RESOURCE,
     RDMA_FS_REASON_SNAPSHOT,
     RDMA_FS_REASON_REMOTE_MR,
-    RDMA_FS_REASON_OWNER_CLOSED
+    RDMA_FS_REASON_OWNER_CLOSED,
+    RDMA_FS_REASON_CONTROL_WRITE  /* FULLSYNCEND/ABORT 控制消息短写或失败 */
 };
 
 const char *rdma_fs_reason_name(int reason);
@@ -100,6 +103,12 @@ int rdma_fs_on_remote_mr(uint64_t tid, void *owner_conn, uint64_t addr,
  */
 int rdma_fs_on_repldone(uint64_t tid, void *owner_conn, int slot,
                         uint64_t replica_gen);
+
+/*
+ * owner 成功把 FULLSYNCEND 完整写入控制连接后调用：job 从 WR_DONE 进入
+ * WAIT_REPLDONE 并开始任务级完成超时。发送失败必须改用 rdma_fs_cancel()。
+ */
+int rdma_fs_mark_fullsyncend_sent(uint64_t tid);
 
 /* owner 连接关闭前调用：取消该连接的所有 job，之后不再返回其事件。 */
 void rdma_fs_cancel_owner(void *owner_conn);

@@ -180,6 +180,75 @@ def stop(proc):
             proc.kill()
 
 
+def verify_all(host, port, count, batch=1000):
+    """通过持久连接分批 pipeline HGET，校验全部 key 的值。返回 (bad, first_bad)。"""
+    s = socket.create_connection((host, port), timeout=30)
+    buf = [b""]
+    bad = 0
+    first_bad = None
+    try:
+        for start in range(0, count, batch):
+            n = min(batch, count - start)
+            out = []
+            for i in range(start, start + n):
+                k = f"k:{i}"
+                out.append(f"*2\r\n$4\r\nHGET\r\n${len(k)}\r\n{k}\r\n")
+            s.sendall("".join(out).encode())
+            for i in range(start, start + n):
+                item, _ = _read_item(s, buf)
+                try:
+                    head, rest = item.split(b"\r\n", 1)
+                    ln = int(head[1:])
+                except Exception:
+                    bad += 1
+                    if first_bad is None:
+                        first_bad = (i, b"<parse-error>")
+                    continue
+                val = rest[:-2] if ln >= 0 else None
+                if val != f"v{i}".encode():
+                    bad += 1
+                    if first_bad is None:
+                        first_bad = (i, val)
+    finally:
+        s.close()
+    return bad, first_bad
+
+
+def sending_intervals(log_path):
+    """解析 master 日志中每个 job 的 SENDING 区间，判断是否存在真实时间重叠。"""
+    import re
+    starts, ends = {}, {}
+    try:
+        lines = Path(log_path).read_text(errors="ignore").splitlines()
+    except OSError:
+        return [], False
+    for line in lines:
+        m = re.search(r"tid=(\d+) SENDING start t=(-?\d+)", line)
+        if m:
+            starts[int(m.group(1))] = int(m.group(2))
+        m = re.search(r"tid=(\d+) SENDING done t=(-?\d+)", line)
+        if m:
+            ends[int(m.group(1))] = int(m.group(2))
+    intervals = [(t, starts[t], ends[t]) for t in starts if t in ends]
+    overlap = False
+    for i in range(len(intervals)):
+        for j in range(i + 1, len(intervals)):
+            a, b = intervals[i], intervals[j]
+            if max(a[1], b[1]) <= min(a[2], b[2]):
+                overlap = True
+    return intervals, overlap
+
+
+def wait_active_zero(host, port, tries=200):
+    info = {}
+    for _ in range(tries):
+        info = master_info(host, port)
+        if info.get("rdma_fs_active_jobs") == "0":
+            return info, True
+        time.sleep(0.1)
+    return info, False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", default="./kvstore")
@@ -195,10 +264,20 @@ def main():
     ap.add_argument("--send-slots", type=int, default=1)
     ap.add_argument("--pause-us", type=int, default=2000)
     ap.add_argument("--wait-seconds", type=float, default=60.0)
+    ap.add_argument("--verify-batch", type=int, default=1000)
+    ap.add_argument("--sample-only", action="store_true",
+                    help="只抽样校验 3 个 key（默认全量校验所有 preload key）")
+    ap.add_argument("--require-rdma", action="store_true",
+                    help="RDMA 设备缺失时返回失败而不是 SKIP（CI 门禁用）")
+    ap.add_argument("--kill-b", action="store_true",
+                    help="故障注入：两个 job 开始发送后 kill -9 Slave B，验证 A 不受影响")
     ap.add_argument("--work-dir", default="./artifacts/repl/multi-rdma-fullsync")
     args = ap.parse_args()
 
     if not Path(f"/sys/class/infiniband/{args.rdma_dev}").exists():
+        if args.require_rdma:
+            print(f"MULTI_RDMA_FULLSYNC_FAIL: required RDMA device {args.rdma_dev} not found")
+            return 1
         print(f"MULTI_RDMA_FULLSYNC_SKIP: RDMA device {args.rdma_dev} not found")
         return 0
 
@@ -240,12 +319,10 @@ def main():
             print("MULTI_RDMA_FULLSYNC_FAIL: master not ready")
             return 1
 
-        print(f"[1/4] preload {args.preload} keys")
+        print(f"[1/5] preload {args.preload} keys")
         preload(args.host, args.master_port, args.preload)
-        mid = args.preload // 2
-        last = args.preload - 1
 
-        print("[2/4] start two slaves")
+        print("[2/5] start two slaves")
         slave_a_log = log("slave-a")
         slave_b_log = log("slave-b")
         slave_a = subprocess.Popen(
@@ -262,48 +339,108 @@ def main():
             print("MULTI_RDMA_FULLSYNC_FAIL: slave not ready")
             return 1
 
-        print("[3/4] wait fullsync completion")
+        if args.kill_b:
+            print("[3/5] wait both jobs then kill -9 Slave B")
+            started = False
+            deadline = time.time() + args.wait_seconds
+            kill_deadline = None
+            while time.time() < deadline:
+                info = master_info(args.host, args.master_port)
+                try:
+                    n_started = int(info.get("rdma_fs_total_started", "0"))
+                    sending = int(info.get("rdma_fs_sending_jobs", "0"))
+                except ValueError:
+                    n_started = sending = 0
+                if sending >= 2:
+                    started = True
+                    break
+                if n_started >= 2:
+                    started = True
+                    if kill_deadline is None:
+                        # 给 B 一点时间进入真实 RDMA_SENDING（仍在其传输窗口内）
+                        kill_deadline = time.time() + 2.0
+                    if time.time() >= kill_deadline:
+                        break
+                time.sleep(0.02)
+            if started:
+                slave_b.send_signal(signal.SIGKILL)
+                print("  killed Slave B pid", slave_b.pid)
+            else:
+                print("  could not observe two started jobs before timeout")
+        else:
+            print("[3/5] wait fullsync completion")
+
         deadline = time.time() + args.wait_seconds
         info = {}
         while time.time() < deadline:
             info = master_info(args.host, args.master_port)
             try:
                 completed = int(info.get("rdma_fs_total_completed", "0"))
+                failed = int(info.get("rdma_fs_total_failed", "0"))
             except ValueError:
-                completed = 0
-            if completed >= 2:
+                completed = failed = 0
+            if args.kill_b:
+                if completed >= 1 and failed >= 1:
+                    break
+            elif completed >= 2:
                 break
             time.sleep(0.1)
 
-        # 等待 manager 回收 job/快照（active_jobs 归零）再断言
-        for _ in range(100):
-            info = master_info(args.host, args.master_port)
-            if info.get("rdma_fs_active_jobs") == "0":
-                break
-            time.sleep(0.1)
+        info, active_zero = wait_active_zero(args.host, args.master_port)
 
-        ok_a = wait_key(args.host, args.slave_a_port, "k:0", "v0") and \
-            wait_key(args.host, args.slave_a_port, f"k:{mid}", f"v{mid}") and \
-            wait_key(args.host, args.slave_a_port, f"k:{last}", f"v{last}")
-        ok_b = wait_key(args.host, args.slave_b_port, "k:0", "v0") and \
-            wait_key(args.host, args.slave_b_port, f"k:{mid}", f"v{mid}") and \
-            wait_key(args.host, args.slave_b_port, f"k:{last}", f"v{last}")
+        print("[4/5] verify data")
+        if args.sample_only:
+            mid = args.preload // 2
+            last = args.preload - 1
+            ok_a = all(wait_key(args.host, args.slave_a_port, f"k:{i}", f"v{i}", n=100)
+                       for i in (0, mid, last))
+            ok_b = None if args.kill_b else all(
+                wait_key(args.host, args.slave_b_port, f"k:{i}", f"v{i}", n=100)
+                for i in (0, mid, last))
+            bad_a = 0 if ok_a else 1
+            bad_b = 0 if (args.kill_b or ok_b) else 1
+        else:
+            bad_a, first_a = verify_all(args.host, args.slave_a_port, args.preload,
+                                        args.verify_batch)
+            if args.kill_b:
+                bad_b, first_b = 0, None
+                ok_b = None
+            else:
+                bad_b, first_b = verify_all(args.host, args.slave_b_port, args.preload,
+                                            args.verify_batch)
+                ok_b = bad_b == 0
+            ok_a = bad_a == 0
+            if bad_a:
+                print(f"  slave A mismatches={bad_a} first={first_a}")
+            if bad_b:
+                print(f"  slave B mismatches={bad_b} first={first_b}")
 
+        intervals, overlap = sending_intervals(wd / "master.log")
         try:
             completed = int(info.get("rdma_fs_total_completed", "0"))
             failed = int(info.get("rdma_fs_total_failed", "0"))
             max_conc = int(info.get("rdma_fs_max_concurrency_seen", "0"))
         except ValueError:
             completed = failed = max_conc = 0
-        active = info.get("rdma_fs_active_jobs", "0")
+        active = info.get("rdma_fs_active_jobs", "?")
 
-        print("[4/4] result")
+        print("[5/5] result")
         print(f"  master_completed={completed} failed={failed} "
               f"max_concurrency_seen={max_conc} active_jobs={active}")
-        print(f"  slave_a_converged={ok_a} slave_b_converged={ok_b}")
+        leftovers = sorted(p.name for p in wd.glob("*fullsync.tmp*"))
+        b_state = "skipped(killed)" if ok_b is None else str(ok_b)
+        print(f"  slave_a_verified={ok_a} slave_b_verified={b_state} "
+              f"sending_intervals={intervals} overlap={overlap}")
+        print(f"  snapshot_leftovers={leftovers}")
         print(f"  artifacts={wd}")
 
-        if ok_a and ok_b and completed >= 2 and max_conc >= 2 and active == "0":
+        if args.kill_b:
+            ok = (ok_a and failed >= 1 and active_zero and not leftovers
+                  and master.poll() is None)
+        else:
+            ok = (ok_a and ok_b and completed >= 2 and max_conc >= 2
+                  and overlap and active_zero and not leftovers)
+        if ok:
             print("MULTI_RDMA_FULLSYNC_PASS")
             rc = 0
         else:
@@ -322,7 +459,7 @@ def main():
                 p = wd / f"{name}.log"
                 if p.exists():
                     print(f"--- {name}.log tail ---")
-                    print("\n".join(p.read_text(errors="ignore").splitlines()[-30:]))
+                    print("\n".join(p.read_text(errors="ignore").splitlines()[-40:]))
 
 
 if __name__ == "__main__":

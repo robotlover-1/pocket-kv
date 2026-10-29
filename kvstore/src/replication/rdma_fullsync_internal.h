@@ -25,6 +25,7 @@
 
 enum rdma_fs_state {
     RDMA_FS_ST_NEW = 0,
+    RDMA_FS_ST_CM_SETUP,
     RDMA_FS_ST_WAIT_ESTABLISHED,
     RDMA_FS_ST_WAIT_MR,
     RDMA_FS_ST_WAIT_TOKEN,
@@ -55,6 +56,7 @@ typedef struct rdma_fs_job {
     int state;
     int cancel;
     int cancel_reason;
+    int cm_setup;              /* CM 线程正在 setup_verbs（cancel 时需尽快退出） */
     int notified;              /* owner 已取走 WR_DONE/FAILED 事件 */
     int failed_counted;        /* 统计去重：失败只计一次 */
     int cq_counted;            /* 统计去重：CQ error 只计一次 */
@@ -107,6 +109,7 @@ typedef struct rdma_fs_job {
     long long t_established_ms;
     long long t_mr_ms;
     long long t_done_ms;
+    long long wait_deadline_ms;   /* WR_DONE 待发 END / WAIT_REPLDONE 的任务级 deadline */
 
     struct rdma_fs_job *next;
     struct rdma_fs_job *prev;

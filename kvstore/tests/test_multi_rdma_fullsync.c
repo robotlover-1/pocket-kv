@@ -89,6 +89,7 @@ static void test_disabled_stubs(void) {
     CHECK(rdma_fs_begin(NULL, 0, 0, 0, 0, 0, 0, &tid, &epoch) != 0);
     CHECK(rdma_fs_on_remote_mr(1, NULL, 1, 1, 1) == 0);
     CHECK(rdma_fs_on_repldone(1, NULL, 0, 0) == 0);
+    CHECK(rdma_fs_mark_fullsyncend_sent(1) != 0);
 
     rdma_fs_event_t evs[4];
     CHECK(rdma_fs_drain_events_owner(evs, 4) == 0);

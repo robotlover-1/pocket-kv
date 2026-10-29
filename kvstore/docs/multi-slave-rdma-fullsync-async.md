@@ -15,6 +15,7 @@
 # 可选：
 --rdma-fullsync-max-concurrent 2        # 同时处于 RDMA_SENDING 的 job 上限（默认 2）
 --rdma-fullsync-pause-us 0              # 每个 WRITE chunk 间隔（µs），用于限速/慢副本测试
+--rdma-fullsync-repldone-timeout-ms 60000  # FULLSYNCEND 后等待 REPLDONE 的任务级超时
 
 # 同机部署（Master/Slave 在同一主机）必须显式指定 RDMA 端口：
 --rdma-port 5381
@@ -90,6 +91,49 @@ worker 与 CM 线程不访问 `conn_t`；所有 TCP 控制写（FULLSYNCEND/FULL
 - 旧 Master + 新 Slave：新 Slave 多带一个参数；旧 Master 忽略/按 0 处理，
   FULLRESYNC 不带 epoch → Slave 不发送 CM hello，继续旧单实例 RDMA。
 
+### 3.1 连接级 fullsync mode 与身份校验（评审 P0 修复）
+
+`conn_t.repl_fs_mode` 显式记录当前连接的全量模式，REPLDONE 不再通过“消息有没有
+tid”反推协议：
+
+| mode | 含义 | REPLDONE 规则 |
+|---|---|---|
+| `NONE` | 没有活动全量 | 一律忽略，不释放 Barrier |
+| `V2_RDMA` | 新并发 RDMA | 必须带 tid == `c->repl_transfer_id`，且 job 处于 `WAIT_REPLDONE` |
+| `TCP_FALLBACK` | 明确的 TCP sendfile 回退 | 只接受无参旧式 REPLDONE |
+| `LEGACY_RDMA` | 旧单实例 RDMA | 只接受无参旧式 REPLDONE |
+
+同一控制连接已有 `is_replica` / `repl_fullsync_pending` / 非 NONE 模式时，**重复
+REPLSYNC 直接拒绝并断开**，不在旧 Barrier 上叠新 job；`rdma_fs_begin()` 也防御
+同一 `(owner_conn, slot)` 的活动 job。
+
+owner 处理 `WR_DONE/FAILED` 事件时校验
+`tid + slot + replica_gen + barrier_seq + 连接当前 tid/mode`；旧 job 的事件只
+cancel/丢弃，绝不会对新 Barrier 发 END/ABORT/reject。
+
+### 3.2 FULLSYNCEND 与控制面闭环（评审 P1 修复）
+
+- `repl_fullsync_send_end()` / `repl_fullsync_abort_master()` 返回 int：循环累计
+  偏移，短写/EAGAIN 超时/断线返回 -1；失败时该副本 fail-closed（cancel Barrier +
+  reject），不会静默停在 `WAIT_REPLDONE`。
+- owner 仅在 END **完整写出**后调用 `rdma_fs_mark_fullsyncend_sent()`，job 才进入
+  `WAIT_REPLDONE` 并设置 deadline。
+- `WR_DONE`（待发 END）与 `WAIT_REPLDONE` 都有任务级 deadline
+  （`--rdma-fullsync-repldone-timeout-ms`，默认 60s，最小 1s）；超时只失败该 job，
+  下一轮 drain 生成 FAILED 事件，仅拒绝该副本。
+
+### 3.3 CQ / 生命周期加固
+
+- CQE 必须 `IBV_WC_SUCCESS` + `IBV_WC_RDMA_WRITE` + `wr_id` 对应仍 in-flight 的
+  slot；重复/未知/非法完成立即 fail-closed；
+- `ibv_poll_cq()` 负返回值立即按 CQ error 处理；
+- 完成字节按 `slot_len[]` 统计，不依赖 `wc.byte_len`；
+- `ibv_post_send` 使用返回值判定错误（EAGAIN 重试，其余失败）；
+- CM `setup_verbs` 每步检查 `job->cancel`，`CM_SETUP` 状态与 worker 超时/取消
+  收敛；worker 失败会置 cancel，避免 setup 继续占用资源；
+- `rdma_fs_mgr_stop()` 现在会 cancel + join 全部 worker、逐 job teardown、
+  销毁 child id/listener/pipe；reactor 循环退出时调用 `repl_rdma_fs_shutdown()`。
+
 ## 4. 失败隔离
 
 - 单个 job 的 CM disconnect、CQ error、MR/资源创建失败、MR 等待超时、
@@ -125,10 +169,23 @@ rdma_fs_max_concurrency_seen
 # 无硬件单测：CM hello 编解码/版本/字节序/零值拒绝 + 关闭 stub 行为
 make test_multi_rdma_fullsync
 
-# 端到端：两个 Slave 同时全量同步，断言 WRITE 时间重叠、数据一致、资源归零
+# 端到端：两个 Slave 同时全量同步
+#   - 默认全量校验所有 preload key（不是抽样）
+#   - 解析 master 日志的 SENDING start/done 区间，断言真实时间重叠
+#   - active_jobs 归零
 # 需要可用 RDMA 设备与可达 IP（不能是 127.0.0.1）
 make check-multi-rdma-fullsync \
   REPL_RDMA_SMOKE_HOST=192.168.233.128 RDMA_DEV=siw0
+
+# CI 门禁：设备缺失时必须是 FAIL，不能把 SKIP 当通过
+make check-multi-rdma-fullsync REPL_MULTI_RDMA_REQUIRE=1 ...
+
+# 故障隔离：两个 job 进入发送后 kill -9 Slave B，A 仍完整完成
+make check-multi-rdma-fault-isolation \
+  REPL_RDMA_SMOKE_HOST=192.168.233.128 RDMA_DEV=siw0
+
+# 协议状态机：无 tid/错 tid REPLDONE + 同连接重复 REPLSYNC（假 Slave，无需 RDMA 对端）
+make check-fullsync-state-guard REPL_MULTI_RDMA_REQUIRE=1
 
 # 直接控制测试参数：
 python3 tools/repl/run_multi_rdma_fullsync.py --bin ./kvstore \
@@ -139,6 +196,9 @@ python3 tools/repl/run_multi_rdma_fullsync.py --bin ./kvstore \
 
 `--pause-us` 拉长单 job 的发送窗口，用于在 soft-RoCE 上稳定观察两个 job 的
 `RDMA_SENDING` 重叠；真实 NIC 可以设为 0 并调大 chunk/slots。
+
+**CI 必须检查输出包含 `MULTI_RDMA_FULLSYNC_PASS`**，不能只看退出码
+（脚本在无设备时默认打印 `..._SKIP` 并返回 0；`--require-rdma` 可改为 FAIL）。
 
 ## 7. 已知边界
 

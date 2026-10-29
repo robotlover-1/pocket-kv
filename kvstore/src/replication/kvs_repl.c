@@ -2908,6 +2908,9 @@ void repl_rdma_master_transfer_cleanup(conn_t *c) {
      * 任何事件指向该 conn（防 UAF）。旧路径没有 job，这里是无害的空遍历。 */
     rdma_fs_cancel_owner(c);
     if (c) {
+        /* 注意：不要在这里清 repl_fs_mode。旧单实例路径在 queue_snapshot 末尾
+         * 也会调用本函数清理 WRITE 状态，但此时还要等 Slave 的 legacy REPLDONE
+         * 才 release Barrier；模式由 REPLDONE/失败/显式 reset 负责清除。 */
         c->repl_transfer_id = 0;
         c->repl_fullsync_state = KVS_FULLSYNC_ST_IDLE;
         c->repl_fullsync_expected_bytes = 0;
@@ -3083,30 +3086,42 @@ int repl_rdma_wait_all_sends(int timeout_ms) {
     return g_repl_rdma_ctx.send_slots_in_flight > 0 ? -1 : 0;
 }
 
+/* 完整写出一条小控制消息（最多等待 ~50ms，避免 owner 线程长时间阻塞）。
+ * 返回 0 表示整条消息已进内核缓冲；-1 表示短写/断线/EAGAIN 超时。
+ * 注意：失败前可能已经写出部分字节，调用方必须关闭/拒绝该连接，不能继续拼接。 */
+static int repl_send_control_msg(int fd, const char *msg, size_t len) {
+    size_t off = 0;
+    int spins = 0;
+    while (off < len && spins < 50) {
+        ssize_t w = send(fd, msg + off, len - off, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (w > 0) { off += (size_t)w; continue; }
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            usleep(1000);
+            spins++;
+            continue;
+        }
+        if (w < 0 && errno == EINTR) continue;
+        return -1;
+    }
+    return off == len ? 0 : -1;
+}
+
 /* Master: 向 slave 发送 FULLSYNCEND（TCP 完成信号，兜底 rxe IMM 事件丢失）。 */
-void repl_fullsync_send_end(int tcp_fd, uint64_t tid) {
+int repl_fullsync_send_end(int tcp_fd, uint64_t tid) {
     char msg[128];
     int n = snprintf(msg, sizeof(msg), "+FULLSYNCEND %llu\r\n",
                      (unsigned long long)tid);
-    for (int i = 0; i < 100 && n > 0; i++) {
-        ssize_t w = send(tcp_fd, msg, (size_t)n, MSG_NOSIGNAL | MSG_DONTWAIT);
-        if (w > 0) break;
-        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { usleep(1000); continue; }
-        break;
-    }
+    if (n <= 0) return -1;
+    return repl_send_control_msg(tcp_fd, msg, (size_t)n);
 }
 
 /* Master: 向 slave 发送 FULLSYNCABORT，丢弃该 transfer 的残留 WRITE 目标（best-effort）。 */
-void repl_fullsync_abort_master(int tcp_fd, uint64_t tid) {
+int repl_fullsync_abort_master(int tcp_fd, uint64_t tid) {
     char msg[128];
     int n = snprintf(msg, sizeof(msg), "+FULLSYNCABORT %llu\r\n",
                      (unsigned long long)tid);
-    for (int i = 0; i < 100 && n > 0; i++) {
-        ssize_t w = send(tcp_fd, msg, (size_t)n, MSG_NOSIGNAL | MSG_DONTWAIT);
-        if (w > 0) break;
-        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { usleep(1000); continue; }
-        break;
-    }
+    if (n <= 0) return -1;
+    return repl_send_control_msg(tcp_fd, msg, (size_t)n);
 }
 
 /* Slave: 把全量 KVSD 数据写入 file-backed 目标映射（SEND 预热 chunk 走这里，

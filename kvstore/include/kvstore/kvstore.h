@@ -65,6 +65,17 @@
 #define KVS_REPL_TRANSPORT_KPROBE_RDMA 4
 #define KVS_REPL_TRANSPORT_EBPF_TCP 5
 
+/* 单连接 fullsync 协议/传输模式：用于 REPLDONE 身份校验，避免用消息参数反推。
+ * NONE          = 当前没有全量同步
+ * V2_RDMA       = 新并发 RDMA 路径（REPLDONE 必须带匹配 tid）
+ * TCP_FALLBACK  = new/old Master 明确 TCP sendfile 回退（旧式无参 REPLDONE）
+ * LEGACY_RDMA   = 旧单实例 RDMA 路径（旧式无参 REPLDONE）
+ */
+#define KVS_FS_MODE_NONE         0
+#define KVS_FS_MODE_V2_RDMA      1
+#define KVS_FS_MODE_TCP_FALLBACK 2
+#define KVS_FS_MODE_LEGACY_RDMA  3
+
 /* KVSD format flags */
 #define KVSD_FLAG_HAS_EXPIRE  0x01   /* record has 8-byte expire_ms after value */
 
@@ -306,6 +317,7 @@ typedef struct conn_s {
     int authed;                 /* 客户端是否已通过 AUTH（requirepass 启用时检查） */
     int repl_draining;
     int repl_fullsync_pending;
+    int repl_fs_mode;             /* KVS_FS_MODE_*：本连接当前全量同步模式 */
     int repl_transport_kind;
     int repl_fs_v2;               /* REPLSYNC 协商：对端支持 rdma-fullsync-v2（跨线程只读） */
     /* ---- eBPF 多副本 fan-out slot（每个控制连接一份） ----
@@ -396,6 +408,7 @@ typedef struct {
     int rdma_qp_wr_depth;
     int rdma_fullsync_max_concurrent; /* 新并发 fullsync 路径：同时处于 RDMA_SENDING 的 job 上限 */
     int rdma_fullsync_pause_us;       /* 新并发 fullsync 路径：每 WRITE chunk 间隔（µs），0=不限速 */
+    int rdma_fullsync_repldone_timeout_ms; /* FULLSYNCEND 已发后等待 REPLDONE 的任务级超时 */
     int repl_rdma_write_buf_max_mb;   /* slave WRITE 目标大小上限（MB），超限拒绝 → sendfile 回退 */
     kvs_aof_fsync_policy_t aof_fsync;
     int aof_fsync_per_command;   /* 逐条刷盘：每条命令立即 write+fsync（实验，对齐 redis 行为） */
@@ -539,8 +552,10 @@ void repl_rdma_set_transfer_id(uint64_t tid);
 void repl_rdma_raise_memlock(void);
 int repl_fullsync_wait_remote_mr(conn_t *c, int timeout_ms);
 int repl_fullsync_sendfile(int tcp_fd, int dump_fd, size_t total_bytes);
-void repl_fullsync_abort_master(int tcp_fd, uint64_t tid);
-void repl_fullsync_send_end(int tcp_fd, uint64_t tid);
+/* 返回 0 表示整条控制消息已完整写出；-1 表示短写/断线/EAGAIN 超时。
+ * 失败时调用方必须对该副本 fail-closed（不能静默停在 WAIT_REPLDONE）。 */
+int repl_fullsync_abort_master(int tcp_fd, uint64_t tid);
+int repl_fullsync_send_end(int tcp_fd, uint64_t tid);
 int repl_rdma_wait_all_sends(int timeout_ms);
 int repl_rdma_slave_has_write_buffer(void);
 int repl_rdma_slave_check_write_complete(void);
@@ -621,6 +636,8 @@ int start_slave_thread(void);
 int start_rdma_master_listener(void);
 int repl_rdma_start_fullsync(conn_t *c);
 void repl_rdma_stop_fullsync(void);
+/* 进程退出（reactor 循环结束）时停止并发 RDMA fullsync manager。 */
+void repl_rdma_fs_shutdown(void);
 int repl_slaveof(const char *host, int port);
 int repl_slaveof_noone(void);
 const char *repl_master_link_state_name(void);

@@ -410,5 +410,9 @@ int reactor_start(void) {
         flush_conn_output(NULL);
     }
 
+    /* 事件循环正常退出（epoll 错误）时收敛并发 RDMA fullsync 资源。
+     * 注意：SIGINT/SIGTERM 仍走默认动作直接退出，由 OS 回收；这里覆盖的是
+     * reactor_start() 返回的控制路径。 */
+    repl_rdma_fs_shutdown();
     return 0;
 }
