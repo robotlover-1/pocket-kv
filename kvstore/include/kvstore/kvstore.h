@@ -788,6 +788,9 @@ typedef struct {
     long long aof_write_submitted;   /* 已交给 AOF 的字节数 */
     long long aof_write_offset;      /* 已落盘的字节数 */
     int aof_outstanding;             /* 在途批次 */
+    unsigned long long aof_batch_count;    /* 完成的 write+fsync 批次数 */
+    unsigned long long aof_batch_us_total; /* 批次 write+fsync 累计耗时（µs） */
+    unsigned long long aof_error_count;    /* AOF 写/fsync 错误累计次数 */
 } kvs_aof_debug_t;
 void persist_aof_debug_state(kvs_aof_debug_t *out);
 /* 全量同步后重定 AOF 基线（截断为 0 + 计数归零），配合 kvs_dump_set_aof_offset(0) */

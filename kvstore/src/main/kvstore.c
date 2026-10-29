@@ -2112,6 +2112,53 @@ static inline int fast_uitoa(unsigned long long val, char *buf) {
     return i;
 }
 
+
+/* 多 Slave per-slot 观测：只输出已注册 eBPF slot（0..7）的连接，避免动态/高基数标签。
+ * 同一 slot 多个连接时取最大 offset 与最小 ACK 年龄（与聚合口径一致）。 */
+static int build_replica_slot_text(char *buf, size_t cap) {
+    struct slot_stat {
+        int connected;
+        int transport;
+        unsigned long long applied, durable;
+        long long ack_age_ms;
+    } slots[8];
+    memset(slots, 0, sizeof(slots));
+    for (int i = 0; i < 8; ++i) slots[i].ack_age_ms = -1;
+
+    pthread_mutex_lock(&g_repl_lock);
+    for (conn_t *rc = g_replicas; rc; rc = rc->next_replica) {
+        int slot = rc->repl_slot;
+        if (slot < 0 || slot >= 8) continue;
+        struct slot_stat *st = &slots[slot];
+        st->connected = 1;
+        st->transport = rc->repl_transport_kind;
+        if (rc->repl_applied_offset_ack > st->applied) st->applied = rc->repl_applied_offset_ack;
+        if (rc->repl_durable_offset_ack > st->durable) st->durable = rc->repl_durable_offset_ack;
+        if (rc->repl_last_ack_ms > 0) {
+            long long age = kvs_now_ms() - rc->repl_last_ack_ms;
+            if (st->ack_age_ms < 0 || age < st->ack_age_ms) st->ack_age_ms = age;
+        }
+    }
+    pthread_mutex_unlock(&g_repl_lock);
+
+    size_t pos = 0;
+    for (int i = 0; i < 8; ++i) {
+        if (!slots[i].connected) continue;
+        int n = snprintf(buf + pos, cap - pos,
+            "replica_slot_%d_applied=%llu\n"
+            "replica_slot_%d_durable=%llu\n"
+            "replica_slot_%d_ack_age_ms=%lld\n"
+            "replica_slot_%d_transport=%d\n",
+            i, slots[i].applied,
+            i, slots[i].durable,
+            i, slots[i].ack_age_ms,
+            i, slots[i].transport);
+        if (n < 0 || (size_t)n >= cap - pos) break;
+        pos += (size_t)n;
+    }
+    return (int)pos;
+}
+
 static void repl_collect_replica_ack_stats(unsigned long long *max_applied, unsigned long long *max_durable, long long *min_ack_age_ms, int *replicas) {
     unsigned long long applied = 0;
     unsigned long long durable = 0;
@@ -2691,6 +2738,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         kvs_repl_kprobe_stats_t kprobe_stats;
         rdma_fs_stats_t fs_stats;
         char fs_jobs[4096];
+        char replica_slots[1024] = {0};
         int recover_n = persist_build_recover_text(recover, sizeof(recover));
         persist_aof_debug_state(&aof_dbg);
         rdma_fs_get_stats(&fs_stats);
@@ -2704,6 +2752,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         long long min_replica_ack_age_ms = -1;
         int replicas = 0;
         repl_collect_replica_ack_stats(&max_replica_applied, &max_replica_durable, &min_replica_ack_age_ms, &replicas);
+        (void)build_replica_slot_text(replica_slots, sizeof(replica_slots));
 
         snprintf(info, sizeof(info),
             "role:%s\n"
@@ -2720,6 +2769,10 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             "aof_thread:%d\n"
             "aof_submitted:%lld\n"
             "aof_written:%lld\n"
+            "aof_outstanding:%d\n"
+            "aof_batch_count:%llu\n"
+            "aof_batch_us_total:%llu\n"
+            "aof_error_count:%llu\n"
             "aof_rewrite:%s\n"
             "aof_rewrite_pid:%ld\n"
             "master_host:%s\n"
@@ -2801,6 +2854,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             "replica_max_applied_offset_ack:%llu\n"
             "replica_max_durable_offset_ack:%llu\n"
             "replica_min_ack_age_ms:%lld\n"
+            "%s"
             "rdma_recv_slots:%d\n"
             "rdma_chunk_size:%d\n"
             "rdma_qp_wr_depth:%d\n"
@@ -2850,6 +2904,10 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             aof_dbg.aof_thread_created,
             aof_dbg.aof_write_submitted,
             aof_dbg.aof_write_offset,
+            aof_dbg.aof_outstanding,
+            aof_dbg.aof_batch_count,
+            aof_dbg.aof_batch_us_total,
+            aof_dbg.aof_error_count,
             persist_bgrewriteaof_state_name(),
             (long)(persist_bgrewriteaof_in_progress() ? 1 : -1),
             g_cfg.master_host[0] ? g_cfg.master_host : "",
@@ -2931,6 +2989,7 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             max_replica_applied,
             max_replica_durable,
             min_replica_ack_age_ms,
+            replica_slots,
             repl_rdma_effective_recv_slots(),
             repl_rdma_effective_chunk_size(),
             repl_rdma_effective_qp_wr_depth(),

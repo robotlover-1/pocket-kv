@@ -74,6 +74,7 @@ typedef struct persist_slot_s {
     int            cqe_ok;
     int            last_error;
     int            in_use;
+    long long      submitted_us;     /* 提交 write+fsync 的时间点（批耗时观测） */
     struct persist_slot_s *ready_next, *completed_next;
 } persist_slot_t;
 
@@ -105,6 +106,13 @@ static size_t g_aof_buf_cap = 0;
 
 static int g_persist_eventfd = -1;
 static int g_persist_fatal_error = 0;
+/* 低开销观测计数器：仅原子累加，不在命令热路径做日志/动态注册。 */
+static _Atomic unsigned long long g_aof_batch_count = 0;
+static _Atomic unsigned long long g_aof_batch_us_total = 0;
+static _Atomic unsigned long long g_aof_error_count = 0;
+static inline void persist_note_aof_error(void) {
+    atomic_fetch_add_explicit(&g_aof_error_count, 1, memory_order_relaxed);
+}
 static int g_persist_aof_registered = 0;
 
 static int g_persist_uring_ready = 0;
@@ -142,6 +150,7 @@ static void slot_push_free(persist_slot_t *s) {   /* 仅主线程 */
     s->cqe_ok = 0;
     s->last_error = 0;
     s->in_use = 0;
+    s->submitted_us = 0;
     s->completed_next = NULL;
     s->ready_next = g_free_slots;
     g_free_slots = s;
@@ -323,10 +332,14 @@ static void reap_completions_inline(void) {
         }
         io_uring_cqe_seen(&g_persist_uring, cqe);
         if (s && s->cqe_seen == 2) {
+            long long dur = (s->submitted_us > 0) ? (kvs_now_us() - s->submitted_us) : 0;
+            atomic_fetch_add_explicit(&g_aof_batch_count, 1, memory_order_relaxed);
+            if (dur > 0) atomic_fetch_add_explicit(&g_aof_batch_us_total, (unsigned long long)dur, memory_order_relaxed);
             if (s->cqe_ok != 2) {
                 fprintf(stderr, "persist: CQE error cqe_ok=%d last_error=%d\n",
                         s->cqe_ok, s->last_error);
                 g_persist_fatal_error = 1;
+                persist_note_aof_error();
             }
             pthread_mutex_lock(&g_slot_lock);
             slot_push_completed(s);
@@ -349,7 +362,7 @@ static void aof_thread_drain_impl(int signal_main) {
         persist_slot_t *s = slot_pop_ready();
         pthread_mutex_unlock(&g_slot_lock);
         if (!s) break;
-        if (submit_one_slot(s) != 0) { g_persist_fatal_error = 1; break; }
+        if (submit_one_slot(s) != 0) { g_persist_fatal_error = 1; persist_note_aof_error(); break; }
     }
     while (atomic_load_explicit(&g_outstanding, memory_order_acquire) > 0) {
         io_uring_submit_and_wait(&g_persist_uring, 1);
@@ -370,7 +383,7 @@ static void aof_thread_submit_all_ready(void) {
         persist_slot_t *s = slot_pop_ready();
         pthread_mutex_unlock(&g_slot_lock);
         if (!s) break;
-        if (submit_one_slot(s) != 0) { g_persist_fatal_error = 1; break; }
+        if (submit_one_slot(s) != 0) { g_persist_fatal_error = 1; persist_note_aof_error(); break; }
     }
 }
 
@@ -869,7 +882,7 @@ int persist_init(void) {
         for (int i = 0; i < PERSIST_INFLIGHT_SIZE; ++i)
             slot_push_free(&g_inflight[i]);
         /* T2：AOF 线程接管 io_uring（SINGLE_ISSUER）。主线程不再 uring_init_once。 */
-        if (aof_thread_start() != 0) g_persist_fatal_error = 1;
+        if (aof_thread_start() != 0) { g_persist_fatal_error = 1; persist_note_aof_error(); }
     }
     return 0;
 }
@@ -921,6 +934,9 @@ void persist_aof_debug_state(kvs_aof_debug_t *out) {
     out->aof_write_submitted = g_aof_write_submitted;
     out->aof_write_offset = g_aof_write_offset;
     out->aof_outstanding = (int)atomic_load_explicit(&g_outstanding, memory_order_relaxed);
+    out->aof_batch_count = atomic_load_explicit(&g_aof_batch_count, memory_order_relaxed);
+    out->aof_batch_us_total = atomic_load_explicit(&g_aof_batch_us_total, memory_order_relaxed);
+    out->aof_error_count = atomic_load_explicit(&g_aof_error_count, memory_order_relaxed);
 }
 
 /* fsync 目录项：rename/truncate 之外，文件条目本身（新建/替换）也要落盘确认。 */
@@ -1017,11 +1033,15 @@ int persist_force_aof_flush(void) {
 /* 同步直接写 AOF 缓冲 + fdatasync（对齐 redis：直接系统调用，无 io_uring/fsync 元数据开销）。 */
 static int persist_sync_append_write(void) {
     if (!g_aof_buf || g_aof_buf_len == 0) return KVS_PERSIST_OK;
+    long long t0 = kvs_now_us();
     ssize_t w = pwrite(g_aof_fd, g_aof_buf, g_aof_buf_len, (off_t)g_aof_write_offset);
-    if (w < 0 || (size_t)w != g_aof_buf_len) return KVS_PERSIST_ERR;
+    if (w < 0 || (size_t)w != g_aof_buf_len) { persist_note_aof_error(); return KVS_PERSIST_ERR; }
     g_aof_write_offset += (long long)w;
     g_aof_write_submitted = g_aof_write_offset;
-    if (fdatasync(g_aof_fd) != 0) return KVS_PERSIST_ERR;
+    if (fdatasync(g_aof_fd) != 0) { persist_note_aof_error(); return KVS_PERSIST_ERR; }
+    long long dur = kvs_now_us() - t0;
+    atomic_fetch_add_explicit(&g_aof_batch_count, 1, memory_order_relaxed);
+    if (dur > 0) atomic_fetch_add_explicit(&g_aof_batch_us_total, (unsigned long long)dur, memory_order_relaxed);
     g_aof_buf_len = 0;
     return KVS_PERSIST_OK;
 }
@@ -1147,8 +1167,10 @@ static int submit_one_slot(persist_slot_t *s) {
      * SQE：既不留半 prep（后续 submit 会写到本槽的隐患），也让已 pop 的槽安全归还 free 不泄漏。 */
     if (io_uring_sq_space_left(&g_persist_uring) < 2) {
         slot_abort_inflight(s);
+        persist_note_aof_error();
         return -1;
     }
+    s->submitted_us = kvs_now_us();
     struct io_uring_sqe *sqe_w = io_uring_get_sqe(&g_persist_uring);
     if (!sqe_w) { slot_abort_inflight(s); return -1; }
     io_uring_prep_write(sqe_w, g_persist_aof_registered ? 0 : g_aof_fd,
