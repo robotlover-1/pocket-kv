@@ -3286,13 +3286,74 @@ void repl_slave_set_sync_state(const char *replid, unsigned long long applied_of
 
 static int repl_slave_send_repldone(void);
 
+/* ---- fullsync 本地基线提交 ----
+ * 严格 fail-closed：fsync/校验/rename/头部修正/AOF rebase/replstate 任一步失败都
+ * 不得发送 REPLDONE；同时用 `.fullsync_commit_pending` 标记让重启跳过可能不一致的
+ * 本地 dump/AOF，强制重新 FULLRESYNC。 */
+static void repl_fullsync_marker_path(char *out, size_t cap) {
+    snprintf(out, cap, "%s.fullsync_commit_pending", g_cfg.dump_path);
+}
+
+static int repl_fsync_dir_of(const char *path) {
+    char dir[600];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+        if (slash == dir) slash[1] = '\0';
+        else *slash = '\0';
+    } else {
+        snprintf(dir, sizeof(dir), ".");
+    }
+    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    int rc = fsync(fd);
+    close(fd);
+    return rc;
+}
+
+static int repl_fullsync_marker_write(void) {
+    char path[600];
+    char buf[128];
+    repl_fullsync_marker_path(path, sizeof(path));
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return -1;
+    int n = snprintf(buf, sizeof(buf), "base=%llu\n",
+                     g_slave_fullsync_base_offset);
+    ssize_t w = write(fd, buf, (size_t)n);
+    int rc = (w == n) ? 0 : -1;
+    if (rc == 0 && fsync(fd) != 0) rc = -1;
+    close(fd);
+    if (rc == 0 && repl_fsync_dir_of(path) != 0) rc = -1;
+    return rc;
+}
+
+static int repl_fullsync_marker_remove(void) {
+    char path[600];
+    repl_fullsync_marker_path(path, sizeof(path));
+    if (unlink(path) != 0 && errno != ENOENT) return -1;
+    return repl_fsync_dir_of(path);
+}
+
+static int repl_test_fail_step(const char *step) {
+    const char *v = getenv("KVS_TEST_FULLSYNC_FAIL_STEP");
+    return v && *v && strcmp(v, step) == 0;
+}
+
+static void repl_test_crash_step(const char *step) {
+    const char *v = getenv("KVS_TEST_FULLSYNC_CRASH_STEP");
+    if (v && *v && strcmp(v, step) == 0) {
+        fprintf(stderr, "repl: TEST crash at fullsync step '%s'\n", step);
+        _exit(9);
+    }
+}
+
 void repl_slave_finish_fullsync(void) {
     if (g_slave_fullsync_finish_done) return;
     g_slave_fullsync_finish_done = 1;
     g_slave_loading_fullsync = 0;
     g_slave_fullsync_target_bytes = 0;
     g_slave_fullsync_loaded_bytes = 0;
-    int dump_committed = 0;
+
 #if KVS_ENABLE_RDMA
     if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma") || !strcasecmp(g_cfg.repl_transport_backend, "rdma")) {
         fprintf(stderr, "repl rdma: slave_fullsync - finished applied_offset=%llu durable_offset=%llu\n", g_slave_repl_applied_offset, g_slave_repl_durable_offset);
@@ -3314,68 +3375,115 @@ void repl_slave_finish_fullsync(void) {
         }
     }
 #endif
-    /* 全量同步完成后，从临时 KVSD 文件加载数据到内存并持久化。
-     * WRITE 模式：数据在 repl_rdma_slave_prepare_target 的 mmap 目标文件里；
-     * SEND/fallback 模式：数据在 parse_resp_stream 拦截写入的 legacy tmp 文件里。 */
-    {
-        repl_fullsync_target_t *tg = &g_slave_fullsync_target;
-        int fd = (tg->fd >= 0) ? tg->fd : g_slave_fullsync_tmp_fd;
-        char tmp_path[512];
-        if (tg->path[0]) {
-            snprintf(tmp_path, sizeof(tmp_path), "%s", tg->path);
-        } else {
-            snprintf(tmp_path, sizeof(tmp_path), "%s.fullsync.recv.tmp.%ld",
-                     g_cfg.dump_path, (long)getpid());
-        }
 
-        if (fd >= 0) {
-            fsync(fd);
-            close(fd);
+    repl_fullsync_target_t *tg = &g_slave_fullsync_target;
+    int fd = (tg->fd >= 0) ? tg->fd : g_slave_fullsync_tmp_fd;
+    char tmp_path[512] = {0};
+    if (tg->path[0]) {
+        snprintf(tmp_path, sizeof(tmp_path), "%s", tg->path);
+    } else {
+        snprintf(tmp_path, sizeof(tmp_path), "%s.fullsync.recv.tmp.%ld",
+                 g_cfg.dump_path, (long)getpid());
+    }
+
+    const char *fail_step = NULL;
+    int renamed = 0;
+
+    /* 1) 目标数据落盘 */
+    if (fd < 0) {
+        fail_step = "no target fd";
+    } else {
+        if (repl_test_fail_step("fsync")) {
+            fail_step = "fsync (injected)";
+        } else if (fsync(fd) != 0) {
+            fail_step = "fsync target";
         }
+        if (close(fd) != 0 && !fail_step) fail_step = "close target";
         g_slave_fullsync_tmp_fd = -1;
         if (tg->fd >= 0) tg->fd = -1;
-
-        if (fd >= 0 || tmp_path[0]) {
-            /* Load KVSD data into memory + TTL */
-            unsigned long long aof_off = replay_dump_file(tmp_path);
-            fprintf(stderr, "repl: slave fullsync loaded from %s, aof_offset=%llu\n",
-                    tmp_path, aof_off);
-
-            /* Move temp file to official dump path as the persistence base */
-            if (rename(tmp_path, g_cfg.dump_path) != 0) {
-                fprintf(stderr, "repl: slave fullsync rename to %s failed: %s\n",
-                        g_cfg.dump_path, strerror(errno));
-            } else {
-                /* 快照成为新的持久化基线：
-                 *  ① 头部的 aof_offset 是 master 生成时写入的 **master 复制 offset**，
-                 *     从机恢复却拿它当"自己 AOF 跳过的字节数"，量纲完全不同 ——
-                 *     不改写会在重启时跳过几乎全部本地 AOF（实测 5w 条只剩 ~1300 条）。
-                 *  ② 截断本地 AOF：快照之前的命令已被取代，留着会在恢复时重放到快照之上。
-                 * 两者必须成对做：头部写 0，AOF 也确实是 0 基线。 */
-                if (kvs_dump_set_aof_offset(g_cfg.dump_path, 0) != 0)
-                    fprintf(stderr, "repl: slave fullsync patch dump aof_offset failed: %s\n",
-                            strerror(errno));
-                if (persist_aof_rebase() != 0)
-                    fprintf(stderr, "repl: slave fullsync aof rebase failed\n");
-                fprintf(stderr, "repl: slave fullsync dump saved to %s "
-                                "(aof rebased to 0)\n", g_cfg.dump_path);
-                dump_committed = 1;
-            }
-        } else {
-            fprintf(stderr, "repl: slave fullsync finished but no temp file\n");
-        }
-        /* 目标文件已 rename 为正式 dump，清 path 元数据（不再 unlink） */
-        tg->path[0] = '\0';
-        tg->fd = -1;
     }
-    if (dump_committed) {
-        /* 快照已真正成为本地基线：此时才允许把 applied/durable 推进到快照基点。 */
+
+    /* 2) 严格校验 + 加载快照 */
+    if (!fail_step && repl_test_fail_step("replay"))
+        fail_step = "replay (injected)";
+    if (!fail_step) {
+        unsigned long long aof_off = 0;
+        if (replay_dump_file_checked(tmp_path, &aof_off) != 0)
+            fail_step = "validate/load snapshot";
+    }
+
+    /* 3) 持久化提交标记（必须在覆盖正式 dump 之前落盘） */
+    if (!fail_step && repl_test_fail_step("marker"))
+        fail_step = "write commit marker (injected)";
+    if (!fail_step && repl_fullsync_marker_write() != 0)
+        fail_step = "write commit marker";
+    repl_test_crash_step("after_marker");
+
+    /* 4) 原子 rename 覆盖正式 dump */
+    if (!fail_step && repl_test_fail_step("rename"))
+        fail_step = "rename (injected)";
+    if (!fail_step) {
+        if (rename(tmp_path, g_cfg.dump_path) != 0) {
+            fail_step = "rename dump";
+        } else {
+            renamed = 1;
+            repl_test_crash_step("after_rename");
+        }
+    }
+
+    /* 5) 头部 aof_offset 归零 + dump fsync */
+    if (!fail_step && repl_test_fail_step("patch"))
+        fail_step = "patch aof_offset (injected)";
+    if (!fail_step && kvs_dump_set_aof_offset(g_cfg.dump_path, 0) != 0)
+        fail_step = "patch dump aof_offset";
+    if (!fail_step) {
+        int dfd = open(g_cfg.dump_path, O_RDONLY | O_CLOEXEC);
+        if (dfd < 0 || fsync(dfd) != 0) fail_step = "fsync dump";
+        if (dfd >= 0) close(dfd);
+    }
+
+    /* 6) 本地 AOF 基线重建 */
+    if (!fail_step && repl_test_fail_step("rebase"))
+        fail_step = "aof rebase (injected)";
+    if (!fail_step && persist_aof_rebase() != 0)
+        fail_step = "aof rebase";
+    repl_test_crash_step("after_rebase");
+
+    /* 7) 推进 applied/durable 并持久化 replstate */
+    if (!fail_step) {
         g_slave_repl_applied_offset = g_slave_fullsync_base_offset;
         g_slave_repl_durable_offset = g_slave_fullsync_base_offset;
         g_slave_repl_offset = g_slave_fullsync_base_offset;
+        if (repl_test_fail_step("state") || repl_slave_state_save() != 0)
+            fail_step = "save replstate";
     }
+
+    /* 8) 提交完成：移除 pending marker */
+    if (!fail_step && repl_fullsync_marker_remove() != 0)
+        fail_step = "remove commit marker";
+
+    tg->path[0] = '\0';
+    tg->fd = -1;
+
+    if (!fail_step) {
+        fprintf(stderr, "repl: slave fullsync committed (base=%llu, dump=%s)\n",
+                g_slave_fullsync_base_offset, g_cfg.dump_path);
+        repl_slave_send_repldone();
+        return;
+    }
+
+    /* fail-closed：不发送 REPLDONE，断开控制连接并让下一次 REPLSYNC 走全量。 */
+    fprintf(stderr, "repl: slave fullsync commit FAILED at '%s' — no REPLDONE, "
+                    "forcing full resync\n", fail_step ? fail_step : "unknown");
+    if (!renamed && tmp_path[0]) unlink(tmp_path);
+    if (repl_fullsync_marker_write() != 0)
+        fprintf(stderr, "repl: failed to write fullsync commit marker\n");
+    g_slave_master_replid[0] = '\0';
+    g_slave_repl_applied_offset = 0;
+    g_slave_repl_durable_offset = 0;
+    g_slave_repl_offset = 0;
     repl_slave_state_save();
-    repl_slave_send_repldone();
+    if (g_slave_fd >= 0) shutdown(g_slave_fd, SHUT_RDWR);
 }
 
 void repl_slave_note_applied(size_t rawlen) {

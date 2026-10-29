@@ -225,15 +225,18 @@ class Writer(threading.Thread):
         except Exception as e:  # noqa: BLE001
             if not self.stop_evt.is_set():
                 self.error = repr(e)
-        finally:
-            if self._sock:
-                try:
-                    self._sock.close()
-                except Exception:
-                    pass
 
     def stop(self):
         self.stop_evt.set()
+
+    def close(self):
+        """测试结束/校验完成后再关闭客户端 socket，避免 FORGET 丢弃尾部提交。"""
+        if self._sock:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
 
 
 def stop(proc):
@@ -482,6 +485,7 @@ def main():
     finally:
         if writer:
             writer.stop()
+            writer.close()
         stop(slave_a)
         stop(slave_b)
         stop(master)

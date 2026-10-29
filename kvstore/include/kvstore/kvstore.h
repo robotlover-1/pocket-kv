@@ -818,6 +818,8 @@ int kvs_dump_to_fd(int fd, unsigned long long aof_offset);
 /* 改写 dump 头部的 aof_offset（从机采用 master 快照后必须重写为自己的 AOF 基线） */
 int kvs_dump_set_aof_offset(const char *path, unsigned long long off);
 unsigned long long replay_dump_file(const char *path);
+/* 严格版本：0=成功且 aof_offset 有效；-1=文件缺失/损坏/结构不完整。 */
+int replay_dump_file_checked(const char *path, unsigned long long *aof_offset);
 int kvs_load_dump_from_fd(int fd);
 int persist_bgsave_start(void);
 int persist_bgsave_poll(void);

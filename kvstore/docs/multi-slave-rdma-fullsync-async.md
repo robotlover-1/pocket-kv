@@ -153,13 +153,43 @@ cancel/丢弃，绝不会对新 Barrier 发 END/ABORT/reject。
   owner fail-closed 该副本并触发重试。Slave 在连接被拒前拿不到 PD，因此也不会先
   注册大目标 MR。
 
-### 3.5 崩溃一致性（评审 RDMA-07）
+### 3.5 崩溃一致性与全量提交（评审 RV-01/07）
 
 Slave 收到 `FULLRESYNC` 时只记录快照基点 `g_slave_fullsync_base_offset`，
-**不提前**把持久化的 `applied/durable` 推进到该 offset。只有快照真正
-`replay_dump_file` + rename 成功后才把偏移推进到基点并写 replstate。
-因此在全量中途被 kill -9 的 Slave 重启后仍使用旧 dump/旧 offset，要么重新全量、
-要么从旧 offset 安全 partial，不会出现“offset 已到快照基点但数据从未加载”的丢数据。
+**不提前**把持久化的 `applied/durable` 推进到该 offset。只有快照真正加载并
+完成本地基线切换后才推进。
+
+全量结束的提交顺序（任一步失败都 **不发送 REPLDONE**）：
+
+1. `fsync(target fd)`；
+2. `replay_dump_file_checked()`：先做结构校验、再写入引擎（坏文件不污染状态）；
+3. 写入 `.fullsync_commit_pending` 标记并 fsync 文件/目录；
+4. `rename(tmp, dump)`；
+5. 把 dump 头 `aof_offset` 归零并 fsync；
+6. `persist_aof_rebase()`；
+7. 推进 `applied/durable` 到快照基点并保存 replstate；
+8. 删除 pending marker 并 fsync 目录。
+
+失败时：保留 marker、清空 replid/offset、shutdown 控制连接 → Slave 重连后
+重新全量；Master 不会收到成功 REPLDONE。
+
+重启时 `persist_recover()` 若发现 marker，会**跳过本地 dump/AOF**、删除
+replstate，强制以 `? + 0` 重新 FULLRESYNC；成功提交后 marker 才被移除。
+测试钩子 `KVS_TEST_FULLSYNC_FAIL_STEP` / `KVS_TEST_FULLSYNC_CRASH_STEP`
+用于逐点注入 fsync/replay/rename/patch/rebase/state 失败与崩溃。
+
+### 3.6 资源/快照容量与观测（评审 RV-02/03/06）
+
+- `rdma_fullsync_max_registered_mb` 仅表示 **Master 发送 buffer MR** 预算
+  （INFO 同时输出 `rdma_fs_master_send_registered_bytes` 别名）；Slave 端
+  file-backed target 由 `repl_rdma_write_buf_max_mb` 限制，Master 在发送
+  FULLRESYNC 前若快照超过该值会提前拒绝并记录原因。
+- 快照写盘前检查 dump 目录可用空间（预留 16MiB），不足则 fail-closed。
+- 快照仍在 owner 线程同步生成（RV-02）：日志输出
+  `fullsync snapshot generated in Xms, bytes=...`，per-job INFO 也有 `snap_ms`；
+  先量化延迟，再评估后台/COW 快照，不在未做一致性设计时把引擎遍历移到后台。
+- 高频逐条 `slave_apply/slave_durable/slave_apply_cmd` 日志默认关闭，
+  `KVS_REPL_VERBOSE_APPLY=1` 打开。
 
 ## 4. 失败隔离
 
@@ -237,6 +267,9 @@ make check-multi-rdma-resource-limit REPL_RDMA_SMOKE_HOST=... RDMA_DEV=siw0
 # RDMA-03/07：eBPF+Commit Gate + 并发写 + kill B + 重启追平（需要 root）
 sudo make check-multi-rdma-ebpf REPL_RDMA_SMOKE_HOST=... RDMA_DEV=siw0 REPL_MULTI_RDMA_REQUIRE=1
 
+# RV-01：持久化失败/崩溃逐点注入，必须无 REPLDONE 且重启强制全量
+make check-fullsync-persistence-faults
+
 # 直接控制测试参数：
 python3 tools/repl/run_multi_rdma_fullsync.py --bin ./kvstore \
   --host 192.168.233.128 --master-port 5280 \
@@ -262,6 +295,6 @@ posted WR）才注入 SIGKILL；观察不到直接 FAIL，不会退化成“握�
 - **TCP sendfile 回退仍同步占用 owner/reactor**（RDMA manager 不可用或旧 Slave
   未协商 v2 时）。该路径是兼容/故障路径，大快照+慢 Slave 会阻塞事件循环；
   后续应将 RDMA 与 TCP 统一抽象成异步 FullsyncTask，或对回退大小设上限；
-- 快照 rename 与 replstate 落盘之间仍有极小的崩溃窗口（新 dump + 旧 offset），
-  当前顺序选择“旧 offset + 新 dump → 可能重复回放”而不是“丢快照”；彻底解决
-  需要原子提交 marker。
+- 全量提交失败后的**当前进程内**引擎可能已有部分新快照数据；当前策略是
+  断开连接并由下一次 FULLRESYNC 重新加载（marker 保证重启也会强制全量）。
+  若需要同一进程内立即恢复一致状态，应增加“加载前清空引擎”或受控重启。

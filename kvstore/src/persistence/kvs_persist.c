@@ -593,129 +593,142 @@ static int replay_file(const char *path, unsigned long long skip_bytes) {
     return replay_file_mmap(path, skip_bytes);
 }
 
-unsigned long long replay_dump_file(const char *path) {
-    int fd;
-    struct stat st;
-    unsigned char *mapped;
-    size_t pos = 0, size;
+/* 遍历 KVSD 内容。apply=0 只校验结构；apply=1 才写入各引擎。
+ * 返回 0 成功（整个文件结构完整），-1 表示截断/非法格式/内存不足。
+ * 校验与写入分两遍，避免坏文件被部分加载后再发 REPLDONE。 */
+static int kvsd_walk(const unsigned char *mapped, size_t size, int apply,
+                     unsigned long long *aof_out) {
+    size_t pos = 0;
     unsigned long long aof_offset = 0;
-
-    fd = open(path, O_RDONLY);
-    if (fd < 0) return 0;
-    if (fstat(fd, &st) != 0) { close(fd); return 0; }
-    if (st.st_size <= 0) { close(fd); return 0; }
-
-    mapped = mmap(NULL, (size_t)st.st_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
-    if (mapped == MAP_FAILED) { close(fd); return 0; }
-    size = (size_t)st.st_size;
-    g_recover_mmap_success++;
-    g_recover_last_mmap_bytes += (unsigned long long)size;
-
-    if (pos + sizeof(aof_offset) > size) goto out;
+    if (size < sizeof(aof_offset)) return -1;
     memcpy(&aof_offset, mapped + pos, sizeof(aof_offset));
     pos += sizeof(aof_offset);
 
-    while (pos + 2 + 4 <= size) {
-        uint8_t engine_id, flags;
-        uint32_t klen, vlen;
-        char *key, *value;
-
-        engine_id = mapped[pos++];
+    while (pos < size) {
+        if (size - pos < 2 + 4) return -1;
+        uint8_t engine_id = mapped[pos++];
+        uint8_t flags = mapped[pos++];
         if (engine_id < 1 || engine_id > 5) {
-            fprintf(stderr, "replay_dump_file: invalid engine_id %u at pos %zu (old format KVSD file?)\n",
-                (unsigned int)engine_id, pos - 1);
-            break;
+            fprintf(stderr, "replay_dump_file: invalid engine_id %u at pos %zu\n",
+                    (unsigned int)engine_id, pos - 1);
+            return -1;
         }
-
-        if (pos + 1 > size) break;
-        flags = mapped[pos++];
-
-        if (pos + 4 > size) break;
+        uint32_t klen = 0;
         memcpy(&klen, mapped + pos, sizeof(klen));
         pos += sizeof(klen);
-        if (pos + klen > size) break;
-
-        key = (char *)kvs_malloc(klen + 1);
-        if (!key) break;
-        if (klen > 0) memcpy(key, mapped + pos, klen);
-        key[klen] = '\0';
+        if ((size_t)klen > size - pos) return -1;
+        const unsigned char *keyp = mapped + pos;
         pos += klen;
 
-        if (pos + 4 > size) { kvs_free(key); break; }
-
+        if (size - pos < 4) return -1;
+        uint32_t vlen = 0;
         memcpy(&vlen, mapped + pos, sizeof(vlen));
         pos += sizeof(vlen);
-        if (pos + vlen > size) { kvs_free(key); break; }
-
-        value = (char *)kvs_malloc(vlen + 1);
-        if (!value) { kvs_free(key); break; }
-        if (vlen > 0) memcpy(value, mapped + pos, vlen);
-        value[vlen] = '\0';
+        if ((size_t)vlen > size - pos) return -1;
+        const unsigned char *valp = mapped + pos;
         pos += vlen;
 
-        switch (engine_id) {
-        case KVS_ENGINE_ARRAY:
-            kvs_array_set(&global_array, key, value);
-            break;
-        case KVS_ENGINE_RBTREE:
-            kvs_rbtree_set(&global_rbtree, key, value);
-            break;
-        case KVS_ENGINE_HASH:
-            kvs_hash_set(&global_hash, key, value);
-            break;
-        case KVS_ENGINE_SKIPTABLE:
-            kvs_skiptable_set(&global_skiptable, key, value);
-            break;
-        case KVS_ENGINE_DOC:
-            {
-                char *tok, *saveptr;
-                char *dup = (char *)kvs_malloc(vlen + 1);
-                if (dup) {
-                    memcpy(dup, value, vlen);
-                    dup[vlen] = '\0';
-                    tok = strtok_r(dup, " ", &saveptr);
-                    while (tok) {
-                        char *eq = strchr(tok, '=');
-                        if (eq) {
-                            *eq = '\0';
-                            kvs_doc_set(&global_doc, key, tok, eq + 1);
-                        }
-                        tok = strtok_r(NULL, " ", &saveptr);
-                    }
-                    kvs_free(dup);
-                }
-            }
-            break;
-        default:
-            break;
+        uint64_t expire_at_ms = 0;
+        if (flags & KVSD_FLAG_HAS_EXPIRE) {
+            if (size - pos < sizeof(expire_at_ms)) return -1;
+            memcpy(&expire_at_ms, mapped + pos, sizeof(expire_at_ms));
+            pos += sizeof(expire_at_ms);
         }
 
-        if (flags & KVSD_FLAG_HAS_EXPIRE) {
-            uint64_t expire_at_ms;
-            if (pos + sizeof(expire_at_ms) <= size) {
-                memcpy(&expire_at_ms, mapped + pos, sizeof(expire_at_ms));
-                pos += sizeof(expire_at_ms);
-                long long ttl_ms = (long long)expire_at_ms - kvs_now_ms();
-                if (ttl_ms > 0) {
-                    kvs_expire_set(&global_expire, engine_id, key, ttl_ms);
-                }
-            } else {
+        if (apply) {
+            char *key = (char *)kvs_malloc((size_t)klen + 1);
+            char *value = (char *)kvs_malloc((size_t)vlen + 1);
+            if (!key || !value) {
                 kvs_free(key);
                 kvs_free(value);
+                return -1;
+            }
+            if (klen) memcpy(key, keyp, klen);
+            key[klen] = '\0';
+            if (vlen) memcpy(value, valp, vlen);
+            value[vlen] = '\0';
+
+            switch (engine_id) {
+            case KVS_ENGINE_ARRAY:
+                kvs_array_set(&global_array, key, value);
+                break;
+            case KVS_ENGINE_RBTREE:
+                kvs_rbtree_set(&global_rbtree, key, value);
+                break;
+            case KVS_ENGINE_HASH:
+                kvs_hash_set(&global_hash, key, value);
+                break;
+            case KVS_ENGINE_SKIPTABLE:
+                kvs_skiptable_set(&global_skiptable, key, value);
+                break;
+            case KVS_ENGINE_DOC:
+                {
+                    char *tok, *saveptr;
+                    char *dup = (char *)kvs_malloc((size_t)vlen + 1);
+                    if (dup) {
+                        if (vlen) memcpy(dup, value, vlen);
+                        dup[vlen] = '\0';
+                        tok = strtok_r(dup, " ", &saveptr);
+                        while (tok) {
+                            char *eq = strchr(tok, '=');
+                            if (eq) {
+                                *eq = '\0';
+                                kvs_doc_set(&global_doc, key, tok, eq + 1);
+                            }
+                            tok = strtok_r(NULL, " ", &saveptr);
+                        }
+                        kvs_free(dup);
+                    }
+                }
+                break;
+            default:
                 break;
             }
+
+            if (flags & KVSD_FLAG_HAS_EXPIRE) {
+                long long ttl_ms = (long long)expire_at_ms - kvs_now_ms();
+                if (ttl_ms > 0)
+                    kvs_expire_set(&global_expire, engine_id, key, ttl_ms);
+            }
+            kvs_free(key);
+            kvs_free(value);
         }
-
-        kvs_free(key);
-        kvs_free(value);
-
-        if (pos >= size) break;
     }
+    if (pos != size) return -1;
+    if (aof_out) *aof_out = aof_offset;
+    return 0;
+}
 
-out:
-    g_recover_last_tail_bytes += (unsigned long long)pos;
+int replay_dump_file_checked(const char *path, unsigned long long *aof_out) {
+    int fd;
+    struct stat st;
+    unsigned char *mapped;
+    size_t size;
+    int rc;
+
+    if (!path) return -1;
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) { close(fd); return -1; }
+    size = (size_t)st.st_size;
+    mapped = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    if (mapped == MAP_FAILED) { close(fd); return -1; }
+    g_recover_mmap_success++;
+    g_recover_last_mmap_bytes += (unsigned long long)size;
+
+    /* 先校验结构，再应用；坏文件不会污染已加载状态。 */
+    rc = kvsd_walk(mapped, size, 0, NULL);
+    if (rc == 0) rc = kvsd_walk(mapped, size, 1, aof_out);
+
+    g_recover_last_tail_bytes += (unsigned long long)size;
     munmap(mapped, size);
     close(fd);
+    return rc;
+}
+
+unsigned long long replay_dump_file(const char *path) {
+    unsigned long long aof_offset = 0;
+    if (replay_dump_file_checked(path, &aof_offset) != 0) return 0;
     return aof_offset;
 }
 
@@ -1196,12 +1209,28 @@ int persist_recover(void) {
     g_recover_last_fread_bytes = 0;
     g_recover_last_tail_bytes = 0;
 
+    /* RV-01：上一次 fullsync 的本地基线提交未完成（fsync/rename/rebase/state
+     * 失败或中途崩溃）。此时 dump/AOF 可能互相不一致，必须跳过本地恢复，清掉
+     * replstate 让 Slave 以 "?" + 0 重新 FULLRESYNC；marker 在全量成功提交后移除。 */
+    char fs_pending[600];
+    snprintf(fs_pending, sizeof(fs_pending), "%s.fullsync_commit_pending",
+             g_cfg.dump_path);
+    int fullsync_pending = (g_cfg.role == ROLE_SLAVE && access(fs_pending, F_OK) == 0);
+    if (fullsync_pending) {
+        char state_path[600];
+        fprintf(stderr, "persist: fullsync commit pending marker present — "
+                        "skip local dump/AOF and force FULLRESYNC\n");
+        snprintf(state_path, sizeof(state_path), "%s.replstate", g_cfg.aof_path);
+        unlink(state_path);
+    }
+
     dump_begin_ms = kvs_now_ms();
-    unsigned long long aof_offset = replay_dump_file(g_cfg.dump_path);
+    unsigned long long aof_offset = fullsync_pending ? 0
+        : replay_dump_file(g_cfg.dump_path);
     g_recover_last_dump_ms = kvs_now_ms() - dump_begin_ms;
 
     aof_begin_ms = kvs_now_ms();
-    if (!g_aof_disabled) {
+    if (!fullsync_pending && !g_aof_disabled) {
         replay_file(g_cfg.aof_path, aof_offset);
     }
     g_recover_last_aof_ms = kvs_now_ms() - aof_begin_ms;

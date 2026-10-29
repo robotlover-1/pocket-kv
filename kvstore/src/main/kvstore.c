@@ -9,6 +9,7 @@
 #include <strings.h>
 #include <spawn.h>
 #include <dirent.h>
+#include <sys/statvfs.h>
 
 extern char **environ;
 
@@ -1326,6 +1327,33 @@ void repl_barrier_tick(void) {
     }
 }
 
+/* 返回 0 表示当前 dump 目录可用空间 >= need + 16MiB；statvfs 失败时放行（仅告警），
+ * 避免在不支持 statvfs 的文件系统上误拒绝。 */
+static int fullsync_check_disk_space(const char *dump_path, size_t need) {
+    char dir[600];
+    snprintf(dir, sizeof(dir), "%s", dump_path ? dump_path : ".");
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+        if (slash == dir) slash[1] = '\0';
+        else *slash = '\0';
+    } else {
+        snprintf(dir, sizeof(dir), ".");
+    }
+    struct statvfs vfs;
+    if (statvfs(dir, &vfs) != 0) {
+        fprintf(stderr, "master: fullsync statvfs(%s) failed: %s\n", dir, strerror(errno));
+        return 0;
+    }
+    unsigned long long avail = (unsigned long long)vfs.f_bavail * (unsigned long long)vfs.f_frsize;
+    unsigned long long margin = 16ULL * 1024 * 1024;
+    if (avail < (unsigned long long)need + margin) {
+        fprintf(stderr, "master: fullsync snapshot needs %zu bytes, only %llu available in %s\n",
+                need, avail, dir);
+        return -1;
+    }
+    return 0;
+}
+
 static int send_control_line(int fd, const char *line, size_t len) {
     size_t off = 0;
     int spins = 0;
@@ -1399,6 +1427,7 @@ static int queue_snapshot_async(conn_t *c, unsigned long long snap_base_offset,
         fprintf(stderr, "master: fullsync snapshot open %s failed: %s\n", tmp_path, strerror(errno));
         goto fail;
     }
+    long long snap_start_ms = kvs_now_ms();
     /* 测试钩子：模拟慢快照。用于验证 CM 建连超时不得早于 FULLRESYNC 发送。 */
     {
         const char *delay_ms = getenv("KVS_TEST_FULLSYNC_SNAPSHOT_DELAY_MS");
@@ -1417,10 +1446,22 @@ static int queue_snapshot_async(conn_t *c, unsigned long long snap_base_offset,
         goto fail;
     }
     total_bytes = (size_t)lseek(fd, 0, SEEK_END);
+    fprintf(stderr, "master: fullsync snapshot generated in %lldms, bytes=%zu\n",
+            kvs_now_ms() - snap_start_ms, total_bytes);
     if (total_bytes == 0) {
         fprintf(stderr, "master: fullsync snapshot empty\n");
         goto fail;
     }
+    if (use_rdma && g_cfg.repl_rdma_write_buf_max_mb > 0) {
+        size_t target_cap = (size_t)g_cfg.repl_rdma_write_buf_max_mb * 1024 * 1024;
+        if (total_bytes > target_cap) {
+            fprintf(stderr, "master: fullsync snapshot %zu exceeds Slave target cap %dMB\n",
+                    total_bytes, g_cfg.repl_rdma_write_buf_max_mb);
+            goto fail;
+        }
+    }
+    if (fullsync_check_disk_space(g_cfg.dump_path, total_bytes) != 0)
+        goto fail;
 
     if (use_rdma) {
         if (rdma_fs_snapshot_ready(tid, fd, tmp_path, total_bytes) != 0) {
@@ -1550,9 +1591,25 @@ static int queue_snapshot(conn_t *c, unsigned long long snap_base_offset) {
     snprintf(tmp_path, sizeof(tmp_path), "%s.fullsync.tmp.%ld", g_cfg.dump_path, (long)getpid());
     fd = open(tmp_path, O_RDWR | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) goto out;
-    if (kvs_dump_to_fd(fd, snap_base_offset) != 0) { close(fd); unlink(tmp_path); goto out; }
-    total_bytes = (size_t)lseek(fd, 0, SEEK_END);
+    {
+        long long snap_start_ms = kvs_now_ms();
+        if (kvs_dump_to_fd(fd, snap_base_offset) != 0) { close(fd); unlink(tmp_path); goto out; }
+        total_bytes = (size_t)lseek(fd, 0, SEEK_END);
+        fprintf(stderr, "master: fullsync snapshot generated in %lldms, bytes=%zu\n",
+                kvs_now_ms() - snap_start_ms, total_bytes);
+    }
     lseek(fd, 0, SEEK_SET);
+    if (rdma_ok && g_cfg.repl_rdma_write_buf_max_mb > 0) {
+        size_t target_cap = (size_t)g_cfg.repl_rdma_write_buf_max_mb * 1024 * 1024;
+        if (total_bytes > target_cap) {
+            fprintf(stderr, "master: fullsync snapshot %zu exceeds Slave target cap %dMB\n",
+                    total_bytes, g_cfg.repl_rdma_write_buf_max_mb);
+            close(fd); unlink(tmp_path); goto out;
+        }
+    }
+    if (fullsync_check_disk_space(g_cfg.dump_path, total_bytes) != 0) {
+        close(fd); unlink(tmp_path); goto out;
+    }
 
     uint64_t transfer_id = 0;
     if (rdma_ok) {
@@ -1856,6 +1913,11 @@ static int try_expire(int engine, char *key) {
 static int resp_array_from_values(char *out, size_t cap, int count, char **values);
 
 static void repl_log_applied_command(const char *cmd, int argc, char **argv, size_t rawlen) {
+    /* 高频逐条日志默认关闭（KVS_REPL_VERBOSE_APPLY=1 打开），避免拖慢 Slave。 */
+    {
+        const char *v = getenv("KVS_REPL_VERBOSE_APPLY");
+        if (!v || !*v || atoi(v) == 0) return;
+    }
     const char *key = (argc >= 2 && argv && argv[1]) ? argv[1] : "";
     unsigned long long before = repl_slave_offset();
     unsigned long long after = before + (unsigned long long)rawlen;
@@ -2007,7 +2069,7 @@ static int build_memstat_text(char *buf, size_t cap) {
     if (n < 0 || (size_t)n >= cap) return -1;
 
     size_t pos = (size_t)n;
-    for (size_t i = 0; i < st.class_count && i < 16; ++i) {
+    for (size_t i = 0; i < st.class_count; ++i) {
         n = snprintf(
             buf + pos, cap - pos,
             "class_%zu_size=%zu\nclass_%zu_pages=%zu\nclass_%zu_total_chunks=%zu\nclass_%zu_free_chunks=%zu\nclass_%zu_page_bytes=%zu\n",
@@ -2689,10 +2751,12 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             "rdma_fs_cm_rejects:%llu\n"
             "rdma_fs_cq_errors:%llu\n"
             "rdma_fs_registered_bytes:%llu\n"
+            "rdma_fs_master_send_registered_bytes:%llu\n"
             "rdma_fs_connected_jobs:%u\n"
             "rdma_fs_resource_rejects:%llu\n"
             "rdma_fs_max_connected:%u\n"
             "rdma_fs_max_registered_bytes:%llu\n"
+            "rdma_fs_max_master_send_registered_bytes:%llu\n"
             "rdma_fs_max_concurrency_seen:%u\n"
             "rdma_fs_jobs:%s\n"
             "repl_backlog_size:%llu\n"
@@ -2817,9 +2881,11 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             fs_stats.cm_rejects,
             fs_stats.cq_errors,
             fs_stats.registered_bytes,
+            fs_stats.registered_bytes,
             fs_stats.connected_jobs,
             fs_stats.resource_rejects,
             fs_stats.max_connected,
+            fs_stats.max_registered_bytes,
             fs_stats.max_registered_bytes,
             fs_stats.max_concurrency_seen,
             fs_jobs,
@@ -4306,7 +4372,7 @@ int main(int argc, char **argv) {
                 "  --rdma-fullsync-pause-us N        每个 WRITE chunk 间隔 µs (默认 0)\n"
                 "  --rdma-fullsync-repldone-timeout-ms N  FULLSYNCEND 后等待 REPLDONE 超时 (默认 60000)\n"
                 "  --rdma-fullsync-max-connected N   同时持有 RDMA 资源的 job 上限 (默认 4)\n"
-                "  --rdma-fullsync-max-registered-mb N 发送 buffer MR 总预算 MB (默认 64)\n"
+                "  --rdma-fullsync-max-registered-mb N Master 发送 buffer MR 总预算 MB (默认 64，不含 Slave target)\n"
                 "  --appendfsync always|off  AOF fsync 策略 (默认 always)\n"
                 "  --ebpf-enabled          启用 eBPF sockmap\n"
                 "  --ebpf-obj PATH         eBPF 对象文件路径\n"
