@@ -65,6 +65,18 @@ typedef struct rdma_fs_job {
     int cq_error;
     int wc_status;
     int cm_disconnected;
+    /* 首发错误（只写第一次；后续 flush 错误不覆盖） */
+    int fe_valid;
+    int fe_source;             /* 1=poll_cq 2=wc 3=post_send 4=cm 5=timeout */
+    int fe_wc_status;
+    int fe_post_rc;
+    uint32_t fe_vendor_err;
+    uint32_t fe_qp_num;
+    uint64_t fe_wr_id;
+    uint64_t fe_posted_bytes;
+    uint64_t fe_completed_bytes;
+    int fe_inflight;
+    long long fe_ts_ms;
 
     /* RDMA 资源（CM listener 线程分配；worker 只使用 qp/cq） */
     struct rdma_cm_id *id;
@@ -129,6 +141,18 @@ extern pthread_cond_t g_rdma_fs_cv;
 extern int g_rdma_fs_sending;
 extern int g_rdma_fs_max_concurrent;
 extern unsigned g_rdma_fs_max_seen;
+
+/* 错误分类计数（mgr.c 实现；INFO/Exporter 使用）。 */
+void rdma_fs_note_wc_error(int wc_status);
+void rdma_fs_note_post_send_error(void);
+void rdma_fs_note_poll_cq_failure(void);
+void rdma_fs_note_cm_disconnect(void);
+
+/* 保留最近若干次 job 首发错误（job 销毁后 INFO 仍可查看）。 */
+void rdma_fs_remember_first_error(uint64_t tid, int slot, int source, int wc_status,
+                                  uint32_t vendor, uint32_t qp_num, uint64_t wr_id,
+                                  int post_rc, uint64_t posted, uint64_t completed,
+                                  int inflight, long long ts_ms);
 
 /* 供 transfer.c 使用：worker 入口（pthread 参数为 job*）。 */
 void *rdma_fs_job_worker(void *arg);

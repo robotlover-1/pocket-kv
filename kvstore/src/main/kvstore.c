@@ -2738,11 +2738,13 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
         kvs_repl_kprobe_stats_t kprobe_stats;
         rdma_fs_stats_t fs_stats;
         char fs_jobs[4096];
+        char fs_first_errors[4096] = {0};
         char replica_slots[1024] = {0};
         int recover_n = persist_build_recover_text(recover, sizeof(recover));
         persist_aof_debug_state(&aof_dbg);
         rdma_fs_get_stats(&fs_stats);
         (void)rdma_fs_format_jobs(fs_jobs, sizeof(fs_jobs));
+        (void)rdma_fs_format_first_errors(fs_first_errors, sizeof(fs_first_errors));
         repl_ebpf_get_stats(&ebpf_stats);
         repl_ebpf_proxy_get_stats(&proxy_stats);
         repl_kprobe_rdma_get_stats(&kprobe_stats);
@@ -2803,6 +2805,16 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             "rdma_fs_total_failed:%llu\n"
             "rdma_fs_cm_rejects:%llu\n"
             "rdma_fs_cq_errors:%llu\n"
+            "rdma_fs_wc_retry_exc_err:%llu\n"
+            "rdma_fs_wc_flush_err:%llu\n"
+            "rdma_fs_wc_remote_access_err:%llu\n"
+            "rdma_fs_wc_local_prot_err:%llu\n"
+            "rdma_fs_wc_rnr_retry_exc_err:%llu\n"
+            "rdma_fs_wc_other_errors:%llu\n"
+            "rdma_fs_post_send_errors:%llu\n"
+            "rdma_fs_poll_cq_failures:%llu\n"
+            "rdma_fs_cm_disconnects:%llu\n"
+            "rdma_fs_first_errors:%s\n"
             "rdma_fs_registered_bytes:%llu\n"
             "rdma_fs_master_send_registered_bytes:%llu\n"
             "rdma_fs_connected_jobs:%u\n"
@@ -2938,6 +2950,16 @@ int handle_parsed_command(conn_t *c, int argc, char **argv, size_t *argl, const 
             fs_stats.total_failed,
             fs_stats.cm_rejects,
             fs_stats.cq_errors,
+            fs_stats.wc_retry_exc_err,
+            fs_stats.wc_flush_err,
+            fs_stats.wc_remote_access_err,
+            fs_stats.wc_local_prot_err,
+            fs_stats.wc_rnr_retry_exc_err,
+            fs_stats.wc_other_errors,
+            fs_stats.post_send_errors,
+            fs_stats.poll_cq_failures,
+            fs_stats.cm_disconnects,
+            fs_first_errors,
             fs_stats.registered_bytes,
             fs_stats.registered_bytes,
             fs_stats.connected_jobs,

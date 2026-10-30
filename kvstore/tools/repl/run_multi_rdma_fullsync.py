@@ -324,6 +324,9 @@ def main():
         if not wait_master(args.host, args.master_port):
             print("MULTI_RDMA_FULLSYNC_FAIL: master not ready")
             return 1
+        base_info = master_info(args.host, args.master_port)
+        base_cq = int(base_info.get("rdma_fs_cq_errors", "0") or 0)
+        base_failed = int(base_info.get("rdma_fs_total_failed", "0") or 0)
 
         print(f"[1/5] preload {args.preload} keys")
         preload(args.host, args.master_port, args.preload)
@@ -433,13 +436,20 @@ def main():
             failed = int(info.get("rdma_fs_total_failed", "0"))
             max_conc = int(info.get("rdma_fs_max_concurrency_seen", "0"))
             rrej = int(info.get("rdma_fs_resource_rejects", "0") or 0)
+            cq_now = int(info.get("rdma_fs_cq_errors", "0") or 0)
         except ValueError:
-            completed = failed = max_conc = rrej = 0
+            completed = failed = max_conc = rrej = cq_now = 0
+        cq_delta = cq_now - base_cq
+        failed_delta = failed - base_failed
         active = info.get("rdma_fs_active_jobs", "?")
+        mtext = (wd / "master.log").read_text(errors="ignore") if (wd / "master.log").exists() else ""
+        unexpected_fallback = ("RDMA start failed" in mtext) or ("falling back to TCP" in mtext)
 
         print("[5/5] result")
         print(f"  master_completed={completed} failed={failed} "
               f"max_concurrency_seen={max_conc} resource_rejects={rrej} active_jobs={active}")
+        print(f"  cq_errors_delta={cq_delta} failed_delta={failed_delta} "
+              f"unexpected_fallback={unexpected_fallback}")
         leftovers = sorted(p.name for p in wd.glob("*fullsync.tmp*"))
         b_state = "skipped(killed)" if ok_b is None else str(ok_b)
         print(f"  slave_a_verified={ok_a} slave_b_verified={b_state} "
@@ -455,9 +465,11 @@ def main():
             ok = (ok_a and failed >= 1 and max_observed_posted >= 2
                   and active_zero and not leftovers and master.poll() is None)
         else:
+            # 正常路径：除了数据一致/真实重叠，还必须没有非预期 CQE 和 TCP 回退。
             ok = (ok_a and ok_b and completed >= 2 and max_conc >= 2
                   and max_observed_posted >= 2
-                  and overlap and active_zero and not leftovers)
+                  and overlap and active_zero and not leftovers
+                  and failed_delta == 0 and cq_delta == 0 and not unexpected_fallback)
         if ok:
             print("MULTI_RDMA_FULLSYNC_PASS")
             rc = 0

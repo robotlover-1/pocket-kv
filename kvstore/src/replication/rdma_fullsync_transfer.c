@@ -61,6 +61,67 @@ static int fs_job_cancel_requested(rdma_fs_job_t *job) {
     return c;
 }
 
+
+enum {
+    RDMA_FS_FE_POLL = 1,
+    RDMA_FS_FE_WC = 2,
+    RDMA_FS_FE_POST = 3,
+    RDMA_FS_FE_CM = 4,
+    RDMA_FS_FE_TIMEOUT = 5,
+};
+
+/* 调用方必须持 g_rdma_fs_mu。仅保存第一次错误，返回 1 表示本次写入。 */
+static int fs_first_error_locked(rdma_fs_job_t *job, int source, int wc_status,
+                                 uint32_t vendor_err, uint64_t wr_id, int post_rc,
+                                 int inflight) {
+    if (!job || job->fe_valid) return 0;
+    job->fe_valid = 1;
+    job->fe_source = source;
+    job->fe_wc_status = wc_status;
+    job->fe_vendor_err = vendor_err;
+    job->fe_qp_num = job->qp ? job->qp->qp_num : 0;
+    job->fe_wr_id = wr_id;
+    job->fe_post_rc = post_rc;
+    job->fe_posted_bytes = job->posted_bytes;
+    job->fe_completed_bytes = job->completed_bytes;
+    job->fe_inflight = inflight;
+    job->fe_ts_ms = kvs_now_ms();
+    return 1;
+}
+
+static void fs_log_first_error(rdma_fs_job_t *job) {
+    char wcbuf[64];
+    if (job->fe_wc_status >= 0)
+        snprintf(wcbuf, sizeof(wcbuf), "%d(%s)", job->fe_wc_status,
+                 ibv_wc_status_str((enum ibv_wc_status)job->fe_wc_status));
+    else
+        snprintf(wcbuf, sizeof(wcbuf), "n/a");
+    fprintf(stderr,
+            "repl rdma-fs: FIRST ERROR tid=%llu slot=%d source=%d wc=%s "
+            "vendor=%u qp=%u wr=%llu post_rc=%d posted=%llu/%llu completed=%llu "
+            "inflight=%d ts_ms=%lld\n",
+            (unsigned long long)job->tid, job->slot, job->fe_source, wcbuf,
+            job->fe_vendor_err, job->fe_qp_num, (unsigned long long)job->fe_wr_id,
+            job->fe_post_rc, (unsigned long long)job->fe_posted_bytes,
+            (unsigned long long)job->snap_size,
+            (unsigned long long)job->fe_completed_bytes, job->fe_inflight,
+            job->fe_ts_ms);
+}
+
+static void fs_record_first_error(rdma_fs_job_t *job, int source, int wc_status,
+                                  uint32_t vendor_err, uint64_t wr_id, int post_rc,
+                                  int inflight) {
+    pthread_mutex_lock(&g_rdma_fs_mu);
+    int first = fs_first_error_locked(job, source, wc_status, vendor_err, wr_id, post_rc, inflight);
+    pthread_mutex_unlock(&g_rdma_fs_mu);
+    if (first) {
+        fs_log_first_error(job);
+        rdma_fs_remember_first_error(job->tid, job->slot, job->fe_source,
+            job->fe_wc_status, job->fe_vendor_err, job->fe_qp_num, job->fe_wr_id,
+            job->fe_post_rc, job->fe_posted_bytes, job->fe_completed_bytes,
+            job->fe_inflight, job->fe_ts_ms);
+    }
+}
 /* 构造 CLOCK_REALTIME 绝对超时，供 pthread_cond_timedwait 使用。 */
 static struct timespec fs_deadline_after_ms(long long ms) {
     struct timespec ts;
@@ -207,6 +268,8 @@ static int fs_poll_cq(rdma_fs_job_t *job, int slot_inflight[], size_t slot_len[]
         if (n < 0) {
             *cq_err = 1;
             if (wc_status) *wc_status = -1;
+            rdma_fs_note_poll_cq_failure();
+            fs_record_first_error(job, RDMA_FS_FE_POLL, -1, 0, 0, 0, *inflight);
             fprintf(stderr, "repl rdma-fs: tid=%llu ibv_poll_cq failed\n",
                     (unsigned long long)job->tid);
             break;
@@ -216,10 +279,15 @@ static int fs_poll_cq(rdma_fs_job_t *job, int slot_inflight[], size_t slot_len[]
             if (wc[i].status != IBV_WC_SUCCESS) {
                 *cq_err = 1;
                 if (wc_status) *wc_status = (int)wc[i].status;
-                fprintf(stderr, "repl rdma-fs: tid=%llu CQE error status=%d opcode=%d "
-                        "vendor=%u wr_id=%llu\n",
-                        (unsigned long long)job->tid, wc[i].status, wc[i].opcode,
-                        wc[i].vendor_err, (unsigned long long)wc[i].wr_id);
+                rdma_fs_note_wc_error((int)wc[i].status);
+                fs_record_first_error(job, RDMA_FS_FE_WC, (int)wc[i].status,
+                                      wc[i].vendor_err, wc[i].wr_id, 0, *inflight);
+                fprintf(stderr, "repl rdma-fs: tid=%llu CQE error status=%d(%s) opcode=%d "
+                        "vendor=%u qp=%u wr_id=%llu\n",
+                        (unsigned long long)job->tid, wc[i].status,
+                        ibv_wc_status_str(wc[i].status), wc[i].opcode,
+                        wc[i].vendor_err, wc[i].qp_num,
+                        (unsigned long long)wc[i].wr_id);
                 continue;
             }
             int slot = (wc[i].wr_id > 0 && wc[i].wr_id <= (uint64_t)job->slot_count)
@@ -227,6 +295,9 @@ static int fs_poll_cq(rdma_fs_job_t *job, int slot_inflight[], size_t slot_len[]
             if (wc[i].opcode != IBV_WC_RDMA_WRITE || slot < 0 || !slot_inflight[slot]) {
                 *cq_err = 1;
                 if (wc_status) *wc_status = (int)wc[i].status;
+                rdma_fs_note_wc_error(-1);
+                fs_record_first_error(job, RDMA_FS_FE_WC, (int)wc[i].status,
+                                      wc[i].vendor_err, wc[i].wr_id, 0, *inflight);
                 fprintf(stderr, "repl rdma-fs: tid=%llu unexpected CQE opcode=%d "
                         "wr_id=%llu (slot in_flight=%d)\n",
                         (unsigned long long)job->tid, wc[i].opcode,
@@ -479,10 +550,13 @@ void *rdma_fs_job_worker(void *arg) {
                 continue;
             }
             if (post_rc != 0) {
+                rdma_fs_note_post_send_error();
+                fs_record_first_error(job, RDMA_FS_FE_POST, -1, 0, wr.wr_id, post_rc, inflight);
                 fprintf(stderr, "repl rdma-fs: tid=%llu ibv_post_send failed rc=%d (%s) "
-                        "bad_wr=%s\n",
+                        "bad_wr=%s slot=%d posted=%llu/%llu inflight=%d\n",
                         (unsigned long long)job->tid, post_rc, strerror(post_rc),
-                        bad ? "set" : "null");
+                        bad ? "set" : "null", slot, (unsigned long long)job->posted_bytes,
+                        (unsigned long long)total, inflight);
                 reason = RDMA_FS_REASON_CQ;
                 failed = 1;
                 break;
@@ -547,6 +621,14 @@ finish:
         reason = job->cancel_reason ? job->cancel_reason : RDMA_FS_REASON_CANCELLED;
     }
     if (failed) {
+        if (reason == RDMA_FS_REASON_TIMEOUT) {
+            if (fs_first_error_locked(job, RDMA_FS_FE_TIMEOUT, -1, 0, 0, 0, inflight)) {
+                rdma_fs_remember_first_error(job->tid, job->slot, job->fe_source,
+                    job->fe_wc_status, job->fe_vendor_err, job->fe_qp_num, job->fe_wr_id,
+                    job->fe_post_rc, job->fe_posted_bytes, job->fe_completed_bytes,
+                    job->fe_inflight, job->fe_ts_ms);
+            }
+        }
         job->state = RDMA_FS_ST_FAILED;
         job->cancel = 1;
         job->cancel_reason = reason;

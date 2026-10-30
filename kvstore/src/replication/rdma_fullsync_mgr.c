@@ -112,9 +112,45 @@ static struct {
     unsigned long long total_failed;
     unsigned long long cm_rejects;
     unsigned long long cq_errors;
+    unsigned long long wc_retry_exc_err;
+    unsigned long long wc_flush_err;
+    unsigned long long wc_remote_access_err;
+    unsigned long long wc_local_prot_err;
+    unsigned long long wc_rnr_retry_exc_err;
+    unsigned long long wc_other_errors;
+    unsigned long long post_send_errors;
+    unsigned long long poll_cq_failures;
+    unsigned long long cm_disconnects;
     unsigned long long registered_bytes;
     unsigned long long resource_rejects;
 } g_mgr = { .cmd_pipe = { -1, -1 } };
+
+/* 最近 8 次 job 首发错误：job 销毁后仍可在 INFO 中定位第一现场。 */
+typedef struct {
+    int valid;
+    uint64_t tid;
+    int slot, source, wc_status, post_rc, inflight;
+    uint32_t vendor, qp_num;
+    uint64_t wr_id, posted, completed;
+    long long ts_ms;
+} fs_first_error_entry_t;
+static fs_first_error_entry_t g_fe_ring[8];
+static unsigned g_fe_next;
+static pthread_mutex_t g_fe_mu = PTHREAD_MUTEX_INITIALIZER;
+
+void rdma_fs_remember_first_error(uint64_t tid, int slot, int source, int wc_status,
+                                  uint32_t vendor, uint32_t qp_num, uint64_t wr_id,
+                                  int post_rc, uint64_t posted, uint64_t completed,
+                                  int inflight, long long ts_ms) {
+    pthread_mutex_lock(&g_fe_mu);
+    fs_first_error_entry_t *e = &g_fe_ring[g_fe_next++ % 8];
+    e->valid = 1;
+    e->tid = tid; e->slot = slot; e->source = source; e->wc_status = wc_status;
+    e->post_rc = post_rc; e->inflight = inflight; e->vendor = vendor;
+    e->qp_num = qp_num; e->wr_id = wr_id; e->posted = posted; e->completed = completed;
+    e->ts_ms = ts_ms;
+    pthread_mutex_unlock(&g_fe_mu);
+}
 
 static const char *fs_fullsync_transport_name(void) {
     if (g_cfg.repl_fullsync_transport[0]) return g_cfg.repl_fullsync_transport;
@@ -316,6 +352,28 @@ static void fs_handle_cm_gone(struct rdma_cm_id *id, const char *why) {
             if (!job->cancel_reason) job->cancel_reason = RDMA_FS_REASON_CM;
             if (job->state != RDMA_FS_ST_FAILED)
                 job->state = RDMA_FS_ST_FAILED;
+            rdma_fs_note_cm_disconnect();
+            if (!job->fe_valid) {
+                job->fe_valid = 1;
+                job->fe_source = 4; /* CM */
+                job->fe_wc_status = -1;
+                job->fe_qp_num = job->qp ? job->qp->qp_num : 0;
+                job->fe_posted_bytes = job->posted_bytes;
+                job->fe_completed_bytes = job->completed_bytes;
+                job->fe_inflight = job->inflight_wr;
+                job->fe_ts_ms = kvs_now_ms();
+                rdma_fs_remember_first_error(job->tid, job->slot, job->fe_source,
+                    job->fe_wc_status, job->fe_vendor_err, job->fe_qp_num, job->fe_wr_id,
+                    job->fe_post_rc, job->fe_posted_bytes, job->fe_completed_bytes,
+                    job->fe_inflight, job->fe_ts_ms);
+                fprintf(stderr, "repl rdma-fs: FIRST ERROR tid=%llu slot=%d source=CM "
+                        "why=%s posted=%llu/%llu completed=%llu inflight=%d ts_ms=%lld\n",
+                        (unsigned long long)job->tid, job->slot, why,
+                        (unsigned long long)job->posted_bytes,
+                        (unsigned long long)job->snap_size,
+                        (unsigned long long)job->completed_bytes,
+                        job->inflight_wr, job->fe_ts_ms);
+            }
             fprintf(stderr, "repl rdma-fs: tid=%llu CM %s\n",
                     (unsigned long long)job->tid, why);
         }
@@ -930,6 +988,30 @@ int rdma_fs_format_jobs(char *out, size_t cap) {
     return (int)pos;
 }
 
+int rdma_fs_format_first_errors(char *out, size_t cap) {
+    if (!out || cap == 0) return 0;
+    out[0] = '\0';
+    size_t pos = 0;
+    pthread_mutex_lock(&g_fe_mu);
+    for (unsigned i = 0; i < 8; i++) {
+        fs_first_error_entry_t *e = &g_fe_ring[i];
+        if (!e->valid) continue;
+        const char *status = (e->wc_status >= 0)
+            ? ibv_wc_status_str((enum ibv_wc_status)e->wc_status) : "n/a";
+        int n = snprintf(out + pos, cap - pos,
+            "%stid=%llu slot=%d source=%d wc=%d(%s) vendor=%u qp=%u wr=%llu "
+            "post_rc=%d posted=%llu completed=%llu inflight=%d ts_ms=%lld",
+            pos ? ";" : "", (unsigned long long)e->tid, e->slot, e->source,
+            e->wc_status, status, e->vendor, e->qp_num, (unsigned long long)e->wr_id,
+            e->post_rc, (unsigned long long)e->posted,
+            (unsigned long long)e->completed, e->inflight, e->ts_ms);
+        if (n < 0 || (size_t)n >= cap - pos) break;
+        pos += (size_t)n;
+    }
+    pthread_mutex_unlock(&g_fe_mu);
+    return (int)pos;
+}
+
 int rdma_fs_drain_events_owner(rdma_fs_event_t *out, int max) {
     if (!out || max <= 0) return 0;
 
@@ -1069,6 +1151,33 @@ int rdma_fs_drain_events_owner(rdma_fs_event_t *out, int max) {
     return n;
 }
 
+void rdma_fs_note_wc_error(int wc_status) {
+    switch (wc_status) {
+    case IBV_WC_RETRY_EXC_ERR:
+        __atomic_add_fetch(&g_mgr.wc_retry_exc_err, 1, __ATOMIC_RELAXED); break;
+    case IBV_WC_WR_FLUSH_ERR:
+        __atomic_add_fetch(&g_mgr.wc_flush_err, 1, __ATOMIC_RELAXED); break;
+    case IBV_WC_REM_ACCESS_ERR:
+        __atomic_add_fetch(&g_mgr.wc_remote_access_err, 1, __ATOMIC_RELAXED); break;
+    case IBV_WC_LOC_PROT_ERR:
+    case IBV_WC_LOC_ACCESS_ERR:
+        __atomic_add_fetch(&g_mgr.wc_local_prot_err, 1, __ATOMIC_RELAXED); break;
+    case IBV_WC_RNR_RETRY_EXC_ERR:
+        __atomic_add_fetch(&g_mgr.wc_rnr_retry_exc_err, 1, __ATOMIC_RELAXED); break;
+    default:
+        __atomic_add_fetch(&g_mgr.wc_other_errors, 1, __ATOMIC_RELAXED); break;
+    }
+}
+void rdma_fs_note_post_send_error(void) {
+    __atomic_add_fetch(&g_mgr.post_send_errors, 1, __ATOMIC_RELAXED);
+}
+void rdma_fs_note_poll_cq_failure(void) {
+    __atomic_add_fetch(&g_mgr.poll_cq_failures, 1, __ATOMIC_RELAXED);
+}
+void rdma_fs_note_cm_disconnect(void) {
+    __atomic_add_fetch(&g_mgr.cm_disconnects, 1, __ATOMIC_RELAXED);
+}
+
 void rdma_fs_get_stats(rdma_fs_stats_t *out) {
     if (!out) return;
     memset(out, 0, sizeof(*out));
@@ -1102,7 +1211,16 @@ void rdma_fs_get_stats(rdma_fs_stats_t *out) {
     out->total_completed = g_mgr.total_completed;
     out->total_failed = g_mgr.total_failed;
     out->cm_rejects = g_mgr.cm_rejects;
-    out->cq_errors = g_mgr.cq_errors;
+    out->cq_errors = __atomic_load_n(&g_mgr.cq_errors, __ATOMIC_RELAXED);
+    out->wc_retry_exc_err = __atomic_load_n(&g_mgr.wc_retry_exc_err, __ATOMIC_RELAXED);
+    out->wc_flush_err = __atomic_load_n(&g_mgr.wc_flush_err, __ATOMIC_RELAXED);
+    out->wc_remote_access_err = __atomic_load_n(&g_mgr.wc_remote_access_err, __ATOMIC_RELAXED);
+    out->wc_local_prot_err = __atomic_load_n(&g_mgr.wc_local_prot_err, __ATOMIC_RELAXED);
+    out->wc_rnr_retry_exc_err = __atomic_load_n(&g_mgr.wc_rnr_retry_exc_err, __ATOMIC_RELAXED);
+    out->wc_other_errors = __atomic_load_n(&g_mgr.wc_other_errors, __ATOMIC_RELAXED);
+    out->post_send_errors = __atomic_load_n(&g_mgr.post_send_errors, __ATOMIC_RELAXED);
+    out->poll_cq_failures = __atomic_load_n(&g_mgr.poll_cq_failures, __ATOMIC_RELAXED);
+    out->cm_disconnects = __atomic_load_n(&g_mgr.cm_disconnects, __ATOMIC_RELAXED);
     out->max_concurrency_seen = g_rdma_fs_max_seen;
     pthread_mutex_unlock(&g_rdma_fs_mu);
 }
@@ -1141,6 +1259,21 @@ int rdma_fs_mark_fullsyncend_sent(uint64_t tid) { (void)tid; return -1; }
 int rdma_fs_format_jobs(char *out, size_t cap) {
     if (out && cap) out[0] = '\0';
     return 0;
+}
+int rdma_fs_format_first_errors(char *out, size_t cap) {
+    if (out && cap) out[0] = '\0';
+    return 0;
+}
+void rdma_fs_note_wc_error(int s) { (void)s; }
+void rdma_fs_note_post_send_error(void) {}
+void rdma_fs_note_poll_cq_failure(void) {}
+void rdma_fs_note_cm_disconnect(void) {}
+void rdma_fs_remember_first_error(uint64_t tid, int slot, int source, int wc_status,
+                                  uint32_t vendor, uint32_t qp_num, uint64_t wr_id,
+                                  int post_rc, uint64_t posted, uint64_t completed,
+                                  int inflight, long long ts_ms) {
+    (void)tid; (void)slot; (void)source; (void)wc_status; (void)vendor; (void)qp_num;
+    (void)wr_id; (void)post_rc; (void)posted; (void)completed; (void)inflight; (void)ts_ms;
 }
 int rdma_fs_drain_events_owner(rdma_fs_event_t *out, int max) { (void)out; (void)max; return 0; }
 void rdma_fs_get_stats(rdma_fs_stats_t *out) { if (out) memset(out, 0, sizeof(*out)); }

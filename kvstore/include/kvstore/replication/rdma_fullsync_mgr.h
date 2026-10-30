@@ -146,6 +146,15 @@ typedef struct rdma_fs_stats {
     unsigned long long total_failed;
     unsigned long long cm_rejects;
     unsigned long long cq_errors;
+    unsigned long long wc_retry_exc_err;
+    unsigned long long wc_flush_err;
+    unsigned long long wc_remote_access_err;
+    unsigned long long wc_local_prot_err;
+    unsigned long long wc_rnr_retry_exc_err;
+    unsigned long long wc_other_errors;
+    unsigned long long post_send_errors;
+    unsigned long long poll_cq_failures;
+    unsigned long long cm_disconnects;
     unsigned long long registered_bytes;
     unsigned connected_jobs;
     unsigned long long resource_rejects;
@@ -161,6 +170,9 @@ void rdma_fs_get_stats(rdma_fs_stats_t *out);
  * 返回写入长度；无 job 或 RDMA 关闭时输出空串。
  */
 int rdma_fs_format_jobs(char *out, size_t cap);
+
+/* 每个活动 job 的首个错误（tid/qp/wr/status/post_rc/进度），INFO 用。 */
+int rdma_fs_format_first_errors(char *out, size_t cap);
 
 #ifdef __cplusplus
 }
