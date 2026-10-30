@@ -321,7 +321,9 @@ void repl_commit_publish_skip(conn_t *c) {
 }
 
 static int commit_send_msg(uint32_t type, const repl_commit_kv_t *kv,
-                           uint64_t global_seq, uint64_t epoch) {
+                           uint64_t global_seq, uint64_t epoch,
+                           uint64_t replica_id, uint64_t replica_gen,
+                           uint64_t barrier_seq) {
     repl_commit_msg_t m;
     memset(&m, 0, sizeof(m));
     m.magic = REPL_COMMIT_MAGIC;
@@ -330,6 +332,9 @@ static int commit_send_msg(uint32_t type, const repl_commit_kv_t *kv,
     m.count = kv ? 1 : 0;
     m.epoch = epoch;
     m.global_seq = global_seq;
+    m.replica_id = replica_id;
+    m.replica_gen = replica_gen;
+    m.barrier_seq = barrier_seq;
     unsigned char buf[sizeof(m) + sizeof(repl_commit_kv_t)];
     memcpy(buf, &m, sizeof(m));
     if (kv) memcpy(buf + sizeof(m), kv, sizeof(*kv));
@@ -344,7 +349,7 @@ void repl_commit_baseline(conn_t *c) {
                             .value = c->repl_parsed_seq + 1 };
     pthread_mutex_lock(&g_commit_lock);
     if (g_commit_fd >= 0)
-        commit_send_msg(REPL_COMMIT_MSG_BASELINE, &kv, 0, g_commit_session);
+        commit_send_msg(REPL_COMMIT_MSG_BASELINE, &kv, 0, g_commit_session, 0, 0, 0);
     pthread_mutex_unlock(&g_commit_lock);
 }
 
@@ -354,7 +359,7 @@ void repl_commit_ignore(conn_t *c) {
     repl_commit_kv_t kv = { .cookie = c->repl_socket_cookie, .value = 0 };
     pthread_mutex_lock(&g_commit_lock);
     if (g_commit_fd >= 0)
-        commit_send_msg(REPL_COMMIT_MSG_IGNORE, &kv, 0, g_commit_session);
+        commit_send_msg(REPL_COMMIT_MSG_IGNORE, &kv, 0, g_commit_session, 0, 0, 0);
     pthread_mutex_unlock(&g_commit_lock);
 }
 
@@ -364,25 +369,29 @@ void repl_commit_forget(conn_t *c) {
     repl_commit_kv_t kv = { .cookie = c->repl_socket_cookie, .value = 0 };
     pthread_mutex_lock(&g_commit_lock);
     if (g_commit_fd >= 0)
-        commit_send_msg(REPL_COMMIT_MSG_FORGET, &kv, 0, 0);  /* 0=wildcard */
+        commit_send_msg(REPL_COMMIT_MSG_FORGET, &kv, 0, 0, 0, 0, 0);  /* 0=wildcard */
     pthread_mutex_unlock(&g_commit_lock);
 }
 
 /* 屏障放行时发送 RESUME：proxy 丢弃 recovery 缓冲中 global_seq <= marker 的提交
  * （已被快照/backlog replay 覆盖），并按 global_seq 放行其余记录。
  * 返回 -1 表示控制通道不可用/发送失败；调用方必须 fail-closed，不能继续 flush。 */
-int repl_commit_resume(uint64_t global_seq) {
+int repl_commit_resume(uint64_t replica_id, uint64_t replica_gen,
+                       uint64_t barrier_seq, uint64_t global_seq) {
     if (!commit_active_mode() || g_commit_session == 0) return 0;
     pthread_mutex_lock(&g_commit_lock);
     int rc = 0;
     if (g_commit_fd < 0) {
-        fprintf(stderr, "repl commit: RESUME(marker=%llu) not sent: channel fd<0 "
-                        "(session=%llu)\n",
+        fprintf(stderr, "repl commit: RESUME(slot=%llu gen=%llu seq=%llu marker=%llu) "
+                        "not sent: channel fd<0 (session=%llu)\n",
+                (unsigned long long)replica_id, (unsigned long long)replica_gen,
+                (unsigned long long)barrier_seq,
                 (unsigned long long)global_seq,
                 (unsigned long long)g_commit_session);
         rc = -1;
     } else if (commit_send_msg(REPL_COMMIT_MSG_RESUME, NULL, global_seq,
-                               g_commit_session) != 0) {
+                               g_commit_session, replica_id, replica_gen,
+                               barrier_seq) != 0) {
         commit_set_fault("CHANNEL");
         rc = -1;
     }

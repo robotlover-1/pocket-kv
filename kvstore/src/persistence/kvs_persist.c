@@ -74,6 +74,7 @@ typedef struct persist_slot_s {
     int            cqe_ok;
     int            last_error;
     int            in_use;
+    long long      submitted_us;     /* 提交 write+fsync 的时间点（批耗时观测） */
     struct persist_slot_s *ready_next, *completed_next;
 } persist_slot_t;
 
@@ -105,6 +106,13 @@ static size_t g_aof_buf_cap = 0;
 
 static int g_persist_eventfd = -1;
 static int g_persist_fatal_error = 0;
+/* 低开销观测计数器：仅原子累加，不在命令热路径做日志/动态注册。 */
+static _Atomic unsigned long long g_aof_batch_count = 0;
+static _Atomic unsigned long long g_aof_batch_us_total = 0;
+static _Atomic unsigned long long g_aof_error_count = 0;
+static inline void persist_note_aof_error(void) {
+    atomic_fetch_add_explicit(&g_aof_error_count, 1, memory_order_relaxed);
+}
 static int g_persist_aof_registered = 0;
 
 static int g_persist_uring_ready = 0;
@@ -142,6 +150,7 @@ static void slot_push_free(persist_slot_t *s) {   /* 仅主线程 */
     s->cqe_ok = 0;
     s->last_error = 0;
     s->in_use = 0;
+    s->submitted_us = 0;
     s->completed_next = NULL;
     s->ready_next = g_free_slots;
     g_free_slots = s;
@@ -323,10 +332,14 @@ static void reap_completions_inline(void) {
         }
         io_uring_cqe_seen(&g_persist_uring, cqe);
         if (s && s->cqe_seen == 2) {
+            long long dur = (s->submitted_us > 0) ? (kvs_now_us() - s->submitted_us) : 0;
+            atomic_fetch_add_explicit(&g_aof_batch_count, 1, memory_order_relaxed);
+            if (dur > 0) atomic_fetch_add_explicit(&g_aof_batch_us_total, (unsigned long long)dur, memory_order_relaxed);
             if (s->cqe_ok != 2) {
                 fprintf(stderr, "persist: CQE error cqe_ok=%d last_error=%d\n",
                         s->cqe_ok, s->last_error);
                 g_persist_fatal_error = 1;
+                persist_note_aof_error();
             }
             pthread_mutex_lock(&g_slot_lock);
             slot_push_completed(s);
@@ -349,7 +362,7 @@ static void aof_thread_drain_impl(int signal_main) {
         persist_slot_t *s = slot_pop_ready();
         pthread_mutex_unlock(&g_slot_lock);
         if (!s) break;
-        if (submit_one_slot(s) != 0) { g_persist_fatal_error = 1; break; }
+        if (submit_one_slot(s) != 0) { g_persist_fatal_error = 1; persist_note_aof_error(); break; }
     }
     while (atomic_load_explicit(&g_outstanding, memory_order_acquire) > 0) {
         io_uring_submit_and_wait(&g_persist_uring, 1);
@@ -370,7 +383,7 @@ static void aof_thread_submit_all_ready(void) {
         persist_slot_t *s = slot_pop_ready();
         pthread_mutex_unlock(&g_slot_lock);
         if (!s) break;
-        if (submit_one_slot(s) != 0) { g_persist_fatal_error = 1; break; }
+        if (submit_one_slot(s) != 0) { g_persist_fatal_error = 1; persist_note_aof_error(); break; }
     }
 }
 
@@ -593,129 +606,142 @@ static int replay_file(const char *path, unsigned long long skip_bytes) {
     return replay_file_mmap(path, skip_bytes);
 }
 
-unsigned long long replay_dump_file(const char *path) {
-    int fd;
-    struct stat st;
-    unsigned char *mapped;
-    size_t pos = 0, size;
+/* 遍历 KVSD 内容。apply=0 只校验结构；apply=1 才写入各引擎。
+ * 返回 0 成功（整个文件结构完整），-1 表示截断/非法格式/内存不足。
+ * 校验与写入分两遍，避免坏文件被部分加载后再发 REPLDONE。 */
+static int kvsd_walk(const unsigned char *mapped, size_t size, int apply,
+                     unsigned long long *aof_out) {
+    size_t pos = 0;
     unsigned long long aof_offset = 0;
-
-    fd = open(path, O_RDONLY);
-    if (fd < 0) return 0;
-    if (fstat(fd, &st) != 0) { close(fd); return 0; }
-    if (st.st_size <= 0) { close(fd); return 0; }
-
-    mapped = mmap(NULL, (size_t)st.st_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
-    if (mapped == MAP_FAILED) { close(fd); return 0; }
-    size = (size_t)st.st_size;
-    g_recover_mmap_success++;
-    g_recover_last_mmap_bytes += (unsigned long long)size;
-
-    if (pos + sizeof(aof_offset) > size) goto out;
+    if (size < sizeof(aof_offset)) return -1;
     memcpy(&aof_offset, mapped + pos, sizeof(aof_offset));
     pos += sizeof(aof_offset);
 
-    while (pos + 2 + 4 <= size) {
-        uint8_t engine_id, flags;
-        uint32_t klen, vlen;
-        char *key, *value;
-
-        engine_id = mapped[pos++];
+    while (pos < size) {
+        if (size - pos < 2 + 4) return -1;
+        uint8_t engine_id = mapped[pos++];
+        uint8_t flags = mapped[pos++];
         if (engine_id < 1 || engine_id > 5) {
-            fprintf(stderr, "replay_dump_file: invalid engine_id %u at pos %zu (old format KVSD file?)\n",
-                (unsigned int)engine_id, pos - 1);
-            break;
+            fprintf(stderr, "replay_dump_file: invalid engine_id %u at pos %zu\n",
+                    (unsigned int)engine_id, pos - 1);
+            return -1;
         }
-
-        if (pos + 1 > size) break;
-        flags = mapped[pos++];
-
-        if (pos + 4 > size) break;
+        uint32_t klen = 0;
         memcpy(&klen, mapped + pos, sizeof(klen));
         pos += sizeof(klen);
-        if (pos + klen > size) break;
-
-        key = (char *)kvs_malloc(klen + 1);
-        if (!key) break;
-        if (klen > 0) memcpy(key, mapped + pos, klen);
-        key[klen] = '\0';
+        if ((size_t)klen > size - pos) return -1;
+        const unsigned char *keyp = mapped + pos;
         pos += klen;
 
-        if (pos + 4 > size) { kvs_free(key); break; }
-
+        if (size - pos < 4) return -1;
+        uint32_t vlen = 0;
         memcpy(&vlen, mapped + pos, sizeof(vlen));
         pos += sizeof(vlen);
-        if (pos + vlen > size) { kvs_free(key); break; }
-
-        value = (char *)kvs_malloc(vlen + 1);
-        if (!value) { kvs_free(key); break; }
-        if (vlen > 0) memcpy(value, mapped + pos, vlen);
-        value[vlen] = '\0';
+        if ((size_t)vlen > size - pos) return -1;
+        const unsigned char *valp = mapped + pos;
         pos += vlen;
 
-        switch (engine_id) {
-        case KVS_ENGINE_ARRAY:
-            kvs_array_set(&global_array, key, value);
-            break;
-        case KVS_ENGINE_RBTREE:
-            kvs_rbtree_set(&global_rbtree, key, value);
-            break;
-        case KVS_ENGINE_HASH:
-            kvs_hash_set(&global_hash, key, value);
-            break;
-        case KVS_ENGINE_SKIPTABLE:
-            kvs_skiptable_set(&global_skiptable, key, value);
-            break;
-        case KVS_ENGINE_DOC:
-            {
-                char *tok, *saveptr;
-                char *dup = (char *)kvs_malloc(vlen + 1);
-                if (dup) {
-                    memcpy(dup, value, vlen);
-                    dup[vlen] = '\0';
-                    tok = strtok_r(dup, " ", &saveptr);
-                    while (tok) {
-                        char *eq = strchr(tok, '=');
-                        if (eq) {
-                            *eq = '\0';
-                            kvs_doc_set(&global_doc, key, tok, eq + 1);
-                        }
-                        tok = strtok_r(NULL, " ", &saveptr);
-                    }
-                    kvs_free(dup);
-                }
-            }
-            break;
-        default:
-            break;
+        uint64_t expire_at_ms = 0;
+        if (flags & KVSD_FLAG_HAS_EXPIRE) {
+            if (size - pos < sizeof(expire_at_ms)) return -1;
+            memcpy(&expire_at_ms, mapped + pos, sizeof(expire_at_ms));
+            pos += sizeof(expire_at_ms);
         }
 
-        if (flags & KVSD_FLAG_HAS_EXPIRE) {
-            uint64_t expire_at_ms;
-            if (pos + sizeof(expire_at_ms) <= size) {
-                memcpy(&expire_at_ms, mapped + pos, sizeof(expire_at_ms));
-                pos += sizeof(expire_at_ms);
-                long long ttl_ms = (long long)expire_at_ms - kvs_now_ms();
-                if (ttl_ms > 0) {
-                    kvs_expire_set(&global_expire, engine_id, key, ttl_ms);
-                }
-            } else {
+        if (apply) {
+            char *key = (char *)kvs_malloc((size_t)klen + 1);
+            char *value = (char *)kvs_malloc((size_t)vlen + 1);
+            if (!key || !value) {
                 kvs_free(key);
                 kvs_free(value);
+                return -1;
+            }
+            if (klen) memcpy(key, keyp, klen);
+            key[klen] = '\0';
+            if (vlen) memcpy(value, valp, vlen);
+            value[vlen] = '\0';
+
+            switch (engine_id) {
+            case KVS_ENGINE_ARRAY:
+                kvs_array_set(&global_array, key, value);
+                break;
+            case KVS_ENGINE_RBTREE:
+                kvs_rbtree_set(&global_rbtree, key, value);
+                break;
+            case KVS_ENGINE_HASH:
+                kvs_hash_set(&global_hash, key, value);
+                break;
+            case KVS_ENGINE_SKIPTABLE:
+                kvs_skiptable_set(&global_skiptable, key, value);
+                break;
+            case KVS_ENGINE_DOC:
+                {
+                    char *tok, *saveptr;
+                    char *dup = (char *)kvs_malloc((size_t)vlen + 1);
+                    if (dup) {
+                        if (vlen) memcpy(dup, value, vlen);
+                        dup[vlen] = '\0';
+                        tok = strtok_r(dup, " ", &saveptr);
+                        while (tok) {
+                            char *eq = strchr(tok, '=');
+                            if (eq) {
+                                *eq = '\0';
+                                kvs_doc_set(&global_doc, key, tok, eq + 1);
+                            }
+                            tok = strtok_r(NULL, " ", &saveptr);
+                        }
+                        kvs_free(dup);
+                    }
+                }
+                break;
+            default:
                 break;
             }
+
+            if (flags & KVSD_FLAG_HAS_EXPIRE) {
+                long long ttl_ms = (long long)expire_at_ms - kvs_now_ms();
+                if (ttl_ms > 0)
+                    kvs_expire_set(&global_expire, engine_id, key, ttl_ms);
+            }
+            kvs_free(key);
+            kvs_free(value);
         }
-
-        kvs_free(key);
-        kvs_free(value);
-
-        if (pos >= size) break;
     }
+    if (pos != size) return -1;
+    if (aof_out) *aof_out = aof_offset;
+    return 0;
+}
 
-out:
-    g_recover_last_tail_bytes += (unsigned long long)pos;
+int replay_dump_file_checked(const char *path, unsigned long long *aof_out) {
+    int fd;
+    struct stat st;
+    unsigned char *mapped;
+    size_t size;
+    int rc;
+
+    if (!path) return -1;
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) { close(fd); return -1; }
+    size = (size_t)st.st_size;
+    mapped = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    if (mapped == MAP_FAILED) { close(fd); return -1; }
+    g_recover_mmap_success++;
+    g_recover_last_mmap_bytes += (unsigned long long)size;
+
+    /* 先校验结构，再应用；坏文件不会污染已加载状态。 */
+    rc = kvsd_walk(mapped, size, 0, NULL);
+    if (rc == 0) rc = kvsd_walk(mapped, size, 1, aof_out);
+
+    g_recover_last_tail_bytes += (unsigned long long)size;
     munmap(mapped, size);
     close(fd);
+    return rc;
+}
+
+unsigned long long replay_dump_file(const char *path) {
+    unsigned long long aof_offset = 0;
+    if (replay_dump_file_checked(path, &aof_offset) != 0) return 0;
     return aof_offset;
 }
 
@@ -856,7 +882,7 @@ int persist_init(void) {
         for (int i = 0; i < PERSIST_INFLIGHT_SIZE; ++i)
             slot_push_free(&g_inflight[i]);
         /* T2：AOF 线程接管 io_uring（SINGLE_ISSUER）。主线程不再 uring_init_once。 */
-        if (aof_thread_start() != 0) g_persist_fatal_error = 1;
+        if (aof_thread_start() != 0) { g_persist_fatal_error = 1; persist_note_aof_error(); }
     }
     return 0;
 }
@@ -908,6 +934,31 @@ void persist_aof_debug_state(kvs_aof_debug_t *out) {
     out->aof_write_submitted = g_aof_write_submitted;
     out->aof_write_offset = g_aof_write_offset;
     out->aof_outstanding = (int)atomic_load_explicit(&g_outstanding, memory_order_relaxed);
+    out->aof_batch_count = atomic_load_explicit(&g_aof_batch_count, memory_order_relaxed);
+    out->aof_batch_us_total = atomic_load_explicit(&g_aof_batch_us_total, memory_order_relaxed);
+    out->aof_error_count = atomic_load_explicit(&g_aof_error_count, memory_order_relaxed);
+}
+
+/* fsync 目录项：rename/truncate 之外，文件条目本身（新建/替换）也要落盘确认。 */
+static int persist_fsync_dir_of(const char *path) {
+    char dir[600];
+    int fd;
+    int rc;
+
+    if (!path || !*path) return -1;
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+        if (slash == dir) slash[1] = '\0';
+        else *slash = '\0';
+    } else {
+        snprintf(dir, sizeof(dir), ".");
+    }
+    fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    rc = fsync(fd);
+    close(fd);
+    return rc;
 }
 
 /* 全量同步完成后把 AOF 重定基线：drain 在途写 → 截断为 0 → 计数归零。
@@ -915,16 +966,39 @@ void persist_aof_debug_state(kvs_aof_debug_t *out) {
  * 还会在恢复时把旧命令重放到快照之上（复活已删 key、非幂等命令双倍执行）。
  * 调用方（从机 fullsync 收尾）必须同步把 dump 头部的 aof_offset 也改成 0。 */
 int persist_aof_rebase(void) {
-    if (g_aof_disabled || g_aof_fd < 0) return -1;
+    if (g_aof_disabled) {
+        /* AOF 关闭：没有旧日志需要丢弃，dump 就是唯一基线。按“仅 dump”语义返回
+         * 成功，Slave 才能完成 fullsync；恢复路径也不会回放 AOF。 */
+        return 0;
+    }
+    if (g_aof_fd < 0) return -1;
     persist_drain_pending();                       /* 等在途批次落盘，之后才可安全截断 */
+    if (g_persist_fatal_error) {
+        /* AOF 线程已出现过写/fsync 失败：drain 返回不代表在途数据已经落盘。 */
+        fprintf(stderr, "persist: aof rebase rejected: AOF persist fatal error\n");
+        return -1;
+    }
     if (ftruncate(g_aof_fd, 0) != 0) {
         fprintf(stderr, "persist: aof rebase ftruncate failed errno=%d(%s)\n",
                 errno, strerror(errno));
         return -1;
     }
+    /* 截断已经发生：先让内存 offset 与文件长度一致，后续 O_APPEND 写入才不会
+     * 把旧 offset 当成回放基线（即使下面的 fsync 失败）。 */
     g_aof_write_offset = 0;
     g_aof_write_submitted = 0;
     g_cur_slot = NULL;
+    /* ftruncate 只改页缓存/元数据，必须显式 fsync 才能宣称新基线（长度）已持久化。 */
+    if (fsync(g_aof_fd) != 0) {
+        fprintf(stderr, "persist: aof rebase fsync failed errno=%d(%s)\n",
+                errno, strerror(errno));
+        return -1;
+    }
+    if (persist_fsync_dir_of(g_cfg.aof_path) != 0) {
+        fprintf(stderr, "persist: aof rebase dir fsync failed errno=%d(%s)\n",
+                errno, strerror(errno));
+        return -1;
+    }
     return 0;
 }
 
@@ -959,11 +1033,15 @@ int persist_force_aof_flush(void) {
 /* 同步直接写 AOF 缓冲 + fdatasync（对齐 redis：直接系统调用，无 io_uring/fsync 元数据开销）。 */
 static int persist_sync_append_write(void) {
     if (!g_aof_buf || g_aof_buf_len == 0) return KVS_PERSIST_OK;
+    long long t0 = kvs_now_us();
     ssize_t w = pwrite(g_aof_fd, g_aof_buf, g_aof_buf_len, (off_t)g_aof_write_offset);
-    if (w < 0 || (size_t)w != g_aof_buf_len) return KVS_PERSIST_ERR;
+    if (w < 0 || (size_t)w != g_aof_buf_len) { persist_note_aof_error(); return KVS_PERSIST_ERR; }
     g_aof_write_offset += (long long)w;
     g_aof_write_submitted = g_aof_write_offset;
-    if (fdatasync(g_aof_fd) != 0) return KVS_PERSIST_ERR;
+    if (fdatasync(g_aof_fd) != 0) { persist_note_aof_error(); return KVS_PERSIST_ERR; }
+    long long dur = kvs_now_us() - t0;
+    atomic_fetch_add_explicit(&g_aof_batch_count, 1, memory_order_relaxed);
+    if (dur > 0) atomic_fetch_add_explicit(&g_aof_batch_us_total, (unsigned long long)dur, memory_order_relaxed);
     g_aof_buf_len = 0;
     return KVS_PERSIST_OK;
 }
@@ -1089,8 +1167,10 @@ static int submit_one_slot(persist_slot_t *s) {
      * SQE：既不留半 prep（后续 submit 会写到本槽的隐患），也让已 pop 的槽安全归还 free 不泄漏。 */
     if (io_uring_sq_space_left(&g_persist_uring) < 2) {
         slot_abort_inflight(s);
+        persist_note_aof_error();
         return -1;
     }
+    s->submitted_us = kvs_now_us();
     struct io_uring_sqe *sqe_w = io_uring_get_sqe(&g_persist_uring);
     if (!sqe_w) { slot_abort_inflight(s); return -1; }
     io_uring_prep_write(sqe_w, g_persist_aof_registered ? 0 : g_aof_fd,
@@ -1196,12 +1276,28 @@ int persist_recover(void) {
     g_recover_last_fread_bytes = 0;
     g_recover_last_tail_bytes = 0;
 
+    /* RV-01：上一次 fullsync 的本地基线提交未完成（fsync/rename/rebase/state
+     * 失败或中途崩溃）。此时 dump/AOF 可能互相不一致，必须跳过本地恢复，清掉
+     * replstate 让 Slave 以 "?" + 0 重新 FULLRESYNC；marker 在全量成功提交后移除。 */
+    char fs_pending[600];
+    snprintf(fs_pending, sizeof(fs_pending), "%s.fullsync_commit_pending",
+             g_cfg.dump_path);
+    int fullsync_pending = (g_cfg.role == ROLE_SLAVE && access(fs_pending, F_OK) == 0);
+    if (fullsync_pending) {
+        char state_path[600];
+        fprintf(stderr, "persist: fullsync commit pending marker present — "
+                        "skip local dump/AOF and force FULLRESYNC\n");
+        snprintf(state_path, sizeof(state_path), "%s.replstate", g_cfg.aof_path);
+        unlink(state_path);
+    }
+
     dump_begin_ms = kvs_now_ms();
-    unsigned long long aof_offset = replay_dump_file(g_cfg.dump_path);
+    unsigned long long aof_offset = fullsync_pending ? 0
+        : replay_dump_file(g_cfg.dump_path);
     g_recover_last_dump_ms = kvs_now_ms() - dump_begin_ms;
 
     aof_begin_ms = kvs_now_ms();
-    if (!g_aof_disabled) {
+    if (!fullsync_pending && !g_aof_disabled) {
         replay_file(g_cfg.aof_path, aof_offset);
     }
     g_recover_last_aof_ms = kvs_now_ms() - aof_begin_ms;

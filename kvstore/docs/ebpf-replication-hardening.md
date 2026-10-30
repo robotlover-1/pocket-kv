@@ -375,3 +375,41 @@ vsearch_queries/candidates/returned/total_us/max_us/topk_sum/dim_*
   `--commit-sock` 与 Master 相同路径。
 - Commit Gate 故障按 fail-closed 处理：当前复制会话失效 + Slave REPLSYNC；
   proxy 重启后的重新对齐阶段可能短暂关闭 capture（客户端保持连接即可）。
+
+## 11. 多 Slave（M1/M2）附注
+
+- **控制键扩展**：`client_ctl` 从 16 扩到 64，`16 + slot*4 + {BARRIER,ACK,FAULT}`
+  是 per-replica 控制位；`proxy_cfg` 从 16 扩到 64，新增
+  `slave_addr.<slot>` / `slave_port.<slot>` / `replica_gen.<slot>`。
+  **BPF 对象与 proxy/Master 必须成对升级**；旧 pin 会被 proxy 重新加载覆盖。
+- **RESUME 带 replica_id**：`repl_commit_msg_t` 增加 `replica_id` 字段（Zero-init
+  时等于 slot 0，兼容旧单元测试语义）。Commit Gate 的恢复缓冲改为 per-replica
+  链表；一个副本的 barrier 不再让其他副本停止直发。
+- **barrier 仍是 Master 阻塞握手**：`repl_barrier_begin(c)` 在 owner 线程等待该
+  slot 的 ACK（≤3s）。handshake 通常 1~10ms；`queue_snapshot()` 仍是同步的，
+  因此在 B 全量生成/发送期间 Master 不处理新的客户端写（A 的已提交流仍由 proxy
+  继续下发）。这是 M1 的已知限制，异步快照留待后续。
+- **共享 backlog 只有一个**：B 做 fullsync 时会以 B 的 `snap_base_offset` 重建
+  backlog。若 A 当时落后于该边界且随后断线，A 也只能走 fullsync；A 仍 LIVE 时
+  不受影响。
+- **多副本 fullsync 只支持 TCP**：`repl-fullsync-transport=rdma` 且副本数 >1 时
+  `queue_snapshot` 直接返回失败（只拒绝该副本），避免共享 QP/MR 串扰。
+- **同机多 Slave**：slot 身份为 (源 IP, proxy 数据端口)。设置
+  `--repl-proxy-port`（rdma+ebpf+tcp）或使用各自主端口（tcp+ebpf+tcp）即可；
+  REPLSYNC 第 5 参数上报该端口，不再依赖 `slave_port == master_port+1`。
+- **故障隔离**：proxy 单副本 FIFO/恢复缓冲超限时写 `SLOT_FAULT=1` 并断开该副本；
+  Master 在 REPLACK 中只 `repl_reject_replica(c)`，不影响其他 LIVE 副本。
+- **2026-10-29 评审整改**：数据通道任何不可确定投递都 per-slot fail-closed（不跨连接续发半包）；
+  proxy 数据入口改为 `REPLDATA <token>` 握手，普通客户端写 Slave 一律 READONLY；
+  fullsync 失败走 cancel 而非 release；RESUME 绑定 `replica_gen+barrier_seq`；
+  B fullsync 在 backlog 连续时不重置全局历史；复制路径统一 apply/AOF/applied/durable 顺序。
+  详见 multi-slave-design.md §11.5。注意 `durable` 仍表示 AOF 写队列边界，不是 fsync。
+- **REPLACK 空闲心跳（本次修复）**：Slave 控制连接 `SO_RCVTIMEO=1s` 超时时也会
+  发 REPLACK。原实现只在收到数据时 ACK；若 partial replay 最后一包之后没有新
+  数据，Master 的 `applied >= catchup_end` 放行条件可能永远等不到，活跃副本
+  会被 hold timeout 误判为故障（实测 A 的 partial 屏障 4s 后被拒绝）。
+- **测试**：`sudo make check-multi-slave`（非 root SKIP）覆盖双活、B kill -9、
+  B 强制 fullsync、proxy kill 自动拉起、以及“只 REPLSYNC 不 REPLACK 的假副本
+  被单独拒绝”；单测 `test_commit_gate` 覆盖 A LIVE 时 B barrier 独立缓存 /
+  RESUME(slot=1) 只放行 B。跨机（128 6.1 → 129 5.15）2 Slave + 远端 partial
+  resync 已实测通过（见 multi-slave-design.md §11.4）。

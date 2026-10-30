@@ -31,8 +31,12 @@ typedef struct {
     uint32_t version;
     uint32_t type;
     uint32_t count;       /* BATCH: 描述符条数 */
-    uint64_t epoch;       /* HELLO: master 实例 epoch */
+    uint64_t epoch;       /* HELLO: master 实例 epoch；BATCH/RESUME: session id */
     uint64_t global_seq;  /* RESUME: marker */
+    uint64_t replica_id;  /* RESUME: 目标副本 slot（多副本 fan-out 用；
+                           * 0 = slot 0 / 旧版单副本语义） */
+    uint64_t replica_gen; /* RESUME: 目标 slot 注册 generation（旧消息=0） */
+    uint64_t barrier_seq; /* RESUME: 本次恢复对应的 BARRIER seq（旧消息=0） */
 } repl_commit_msg_t;
 
 typedef struct {

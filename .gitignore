@@ -106,3 +106,5 @@ Thumbs.db
 # ============================================
 .env
 .env.local
+/kvstore/tests/test_multi_rdma_fullsync
+/kvstore/artifacts/

@@ -1,6 +1,8 @@
 #define _GNU_SOURCE   /* sendfile(2) 需要 */
 #include "kvstore/kvstore.h"
 #include "kvstore/replication/repl_kprobe.h"
+#include "kvstore/replication/rdma_fullsync_mgr.h"
+#include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <string.h>
@@ -470,6 +472,10 @@ unsigned long long g_slave_fullsync_target_bytes = 0;
 /* 防止同一次 fullsync 被 RDMA IMM / TCP FULLSYNCEND / 字节计数重复 finalize；
  * 新的 FULLRESYNC 建立时在 repl_slave_set_sync_state() 里复位。 */
 static int g_slave_fullsync_finish_done = 0;
+/* FULLRESYNC 头里的 master 快照基点。只有快照真正加载/rename 成功后才允许把
+ * applied/durable 推进到该值；否则中途崩溃会让 Slave 用“未加载的快照 offset”
+ * 去 partial resync，丢掉快照里的全部数据。 */
+static unsigned long long g_slave_fullsync_base_offset = 0;
 unsigned long long g_slave_fullsync_loaded_bytes = 0;
 int g_slave_fullsync_tmp_fd = -1;   /* temp file fd for receiving KVSD full sync data */
 static char g_slave_state_path[512] = {0};
@@ -616,6 +622,18 @@ static uint64_t g_slave_fullsync_aborted_tid = 0;
 /* One-Sided WRITE: 是否已收到最终 WRITE_WITH_IMM（= g_slave_fullsync_target.imm_received 别名） */
 #endif
 
+/* Slave: 新并发路径 FULLRESYNC v2 携带的 transfer_id / master epoch。
+ * RDMA connect 在后台线程执行，握手时用它们填充 CM private_data hello。
+ * epoch==0 表示旧 master（或 TCP 回退），不发送 private_data，保持旧 listener 兼容。 */
+static uint64_t g_slave_pending_fullsync_tid = 0;
+static uint64_t g_slave_pending_fullsync_epoch = 0;
+
+void repl_rdma_slave_set_pending_fullsync(uint64_t tid, uint64_t epoch) {
+    g_slave_pending_fullsync_tid = tid;
+    g_slave_pending_fullsync_epoch = epoch;
+    if (tid && !epoch) g_slave_pending_fullsync_epoch = 0;
+}
+
 typedef struct repl_transport_ops_s {
     const char *name;
     int supported;
@@ -670,6 +688,17 @@ static int repl_transport_tcp_connect_slave(const char *host, int port) {
 }
 
 #if KVS_ENABLE_RDMA
+/* 每条增量应用的调试日志：默认关闭（KVS_REPL_VERBOSE_APPLY=1 打开）。
+ * eBPF+RDMA 高频增量下逐条 fprintf 会严重拖慢 Slave。 */
+static int repl_rdma_verbose_apply(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("KVS_REPL_VERBOSE_APPLY");
+        v = (e && *e && atoi(e) != 0) ? 1 : 0;
+    }
+    return v;
+}
+
 static void repl_rdma_log(const char *stage, const char *detail) {
     fprintf(stderr, "repl rdma: %s%s%s\n", stage ? stage : "?", detail ? " - " : "", detail ? detail : "");
 }
@@ -1118,7 +1147,18 @@ static int repl_rdma_connect_handshake(void) {
     if (!g_repl_rdma_ctx.id || !g_repl_rdma_ctx.qp_ready) return -1;
     repl_rdma_log("connect", "issuing rdma_connect");
     repl_rdma_set_state(REPL_RDMA_STATE_CONNECTING, "rdma_connect");
-    if (rdma_connect(g_repl_rdma_ctx.id, NULL) != 0) {
+    /* 新并发 fullsync listener 需要 hello(tid, epoch) 把连接派发给正确的 job。
+     * 旧 master/纯 RDMA 实时路径不带 epoch → 不发送 private_data。 */
+    struct rdma_conn_param param;
+    memset(&param, 0, sizeof(param));
+    unsigned char hello[RDMA_FS_CM_HELLO_LEN];
+    if (g_slave_pending_fullsync_tid != 0 && g_slave_pending_fullsync_epoch != 0) {
+        rdma_fs_cm_hello_encode(hello, g_slave_pending_fullsync_tid,
+                                g_slave_pending_fullsync_epoch);
+        param.private_data = hello;
+        param.private_data_len = (uint8_t)sizeof(hello);
+    }
+    if (rdma_connect(g_repl_rdma_ctx.id, &param) != 0) {
         repl_rdma_log("connect", "rdma_connect failed");
         return -1;
     }
@@ -2880,7 +2920,13 @@ void repl_rdma_slave_target_cleanup(int remove_incomplete) {
 /* Master: 幂等清理全量同步 transfer 状态。不关闭共享 RDMA 连接。
  * 在传输完成、失败、超时、owner 连接断开时调用。 */
 void repl_rdma_master_transfer_cleanup(conn_t *c) {
+    /* 新并发路径：owner 连接关闭/被拒绝时取消其所有 job，之后 manager 不再把
+     * 任何事件指向该 conn（防 UAF）。旧路径没有 job，这里是无害的空遍历。 */
+    rdma_fs_cancel_owner(c);
     if (c) {
+        /* 注意：不要在这里清 repl_fs_mode。旧单实例路径在 queue_snapshot 末尾
+         * 也会调用本函数清理 WRITE 状态，但此时还要等 Slave 的 legacy REPLDONE
+         * 才 release Barrier；模式由 REPLDONE/失败/显式 reset 负责清除。 */
         c->repl_transfer_id = 0;
         c->repl_fullsync_state = KVS_FULLSYNC_ST_IDLE;
         c->repl_fullsync_expected_bytes = 0;
@@ -3056,30 +3102,42 @@ int repl_rdma_wait_all_sends(int timeout_ms) {
     return g_repl_rdma_ctx.send_slots_in_flight > 0 ? -1 : 0;
 }
 
+/* 完整写出一条小控制消息（最多等待 ~50ms，避免 owner 线程长时间阻塞）。
+ * 返回 0 表示整条消息已进内核缓冲；-1 表示短写/断线/EAGAIN 超时。
+ * 注意：失败前可能已经写出部分字节，调用方必须关闭/拒绝该连接，不能继续拼接。 */
+static int repl_send_control_msg(int fd, const char *msg, size_t len) {
+    size_t off = 0;
+    int spins = 0;
+    while (off < len && spins < 50) {
+        ssize_t w = send(fd, msg + off, len - off, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (w > 0) { off += (size_t)w; continue; }
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            usleep(1000);
+            spins++;
+            continue;
+        }
+        if (w < 0 && errno == EINTR) continue;
+        return -1;
+    }
+    return off == len ? 0 : -1;
+}
+
 /* Master: 向 slave 发送 FULLSYNCEND（TCP 完成信号，兜底 rxe IMM 事件丢失）。 */
-void repl_fullsync_send_end(int tcp_fd, uint64_t tid) {
+int repl_fullsync_send_end(int tcp_fd, uint64_t tid) {
     char msg[128];
     int n = snprintf(msg, sizeof(msg), "+FULLSYNCEND %llu\r\n",
                      (unsigned long long)tid);
-    for (int i = 0; i < 100 && n > 0; i++) {
-        ssize_t w = send(tcp_fd, msg, (size_t)n, MSG_NOSIGNAL | MSG_DONTWAIT);
-        if (w > 0) break;
-        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { usleep(1000); continue; }
-        break;
-    }
+    if (n <= 0) return -1;
+    return repl_send_control_msg(tcp_fd, msg, (size_t)n);
 }
 
 /* Master: 向 slave 发送 FULLSYNCABORT，丢弃该 transfer 的残留 WRITE 目标（best-effort）。 */
-void repl_fullsync_abort_master(int tcp_fd, uint64_t tid) {
+int repl_fullsync_abort_master(int tcp_fd, uint64_t tid) {
     char msg[128];
     int n = snprintf(msg, sizeof(msg), "+FULLSYNCABORT %llu\r\n",
                      (unsigned long long)tid);
-    for (int i = 0; i < 100 && n > 0; i++) {
-        ssize_t w = send(tcp_fd, msg, (size_t)n, MSG_NOSIGNAL | MSG_DONTWAIT);
-        if (w > 0) break;
-        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { usleep(1000); continue; }
-        break;
-    }
+    if (n <= 0) return -1;
+    return repl_send_control_msg(tcp_fd, msg, (size_t)n);
 }
 
 /* Slave: 把全量 KVSD 数据写入 file-backed 目标映射（SEND 预热 chunk 走这里，
@@ -3178,14 +3236,29 @@ void repl_slave_set_sync_state(const char *replid, unsigned long long applied_of
     if (replid && *replid) {
         snprintf(g_slave_master_replid, sizeof(g_slave_master_replid), "%s", replid);
     }
-    g_slave_repl_applied_offset = applied_offset;
-    g_slave_repl_durable_offset = durable_offset;
-    g_slave_repl_offset = applied_offset;
+    if (fullsync_loading) {
+        /* 快照尚未加载：只记录基点，持久化的 applied/durable 保持旧值。
+         * 若此时崩溃，重启后仍会用旧 dump + 旧 offset 重新 fullsync/partial。 */
+        g_slave_fullsync_base_offset = applied_offset;
+    } else {
+        g_slave_repl_applied_offset = applied_offset;
+        g_slave_repl_durable_offset = durable_offset;
+        g_slave_repl_offset = applied_offset;
+    }
     g_slave_loading_fullsync = fullsync_loading;
     g_slave_fullsync_target_bytes = fullsync_loading ? fullsync_target_bytes : 0;
     g_slave_fullsync_loaded_bytes = 0;
     /* 新一次 fullsync（同进程内多次重连）：允许再次 finalize。 */
-    if (fullsync_loading) g_slave_fullsync_finish_done = 0;
+    if (fullsync_loading) {
+        g_slave_fullsync_finish_done = 0;
+        /* 清掉上一次的 transfer 身份：TCP 回退（tid=0）或 v1 协议不得把旧 tid
+         * 带进 REPLDONE；prepare_target 会在新 transfer 中重新设置。 */
+        g_slave_pending_fullsync_tid = 0;
+        g_slave_pending_fullsync_epoch = 0;
+#if KVS_ENABLE_RDMA
+        g_slave_fullsync_target.transfer_id = 0;
+#endif
+    }
 #if KVS_ENABLE_RDMA
     if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma") || !strcasecmp(g_cfg.repl_transport_backend, "rdma"))
         fprintf(stderr, "repl rdma: slave_sync_state - replid=%s applied_offset=%llu durable_offset=%llu fullsync_loading=%d target_bytes=%llu\n",
@@ -3209,10 +3282,72 @@ void repl_slave_set_sync_state(const char *replid, unsigned long long applied_of
         unlink(tmp_path);
         g_slave_fullsync_tmp_fd = -1;
     }
-    repl_slave_state_save();
+    if (!fullsync_loading) repl_slave_state_save();
 }
 
 static int repl_slave_send_repldone(void);
+static int repl_slave_state_save_fast(void);
+
+/* ---- fullsync 本地基线提交 ----
+ * 严格 fail-closed：fsync/校验/rename/头部修正/AOF rebase/replstate 任一步失败都
+ * 不得发送 REPLDONE；同时用 `.fullsync_commit_pending` 标记让重启跳过可能不一致的
+ * 本地 dump/AOF，强制重新 FULLRESYNC。 */
+static void repl_fullsync_marker_path(char *out, size_t cap) {
+    snprintf(out, cap, "%s.fullsync_commit_pending", g_cfg.dump_path);
+}
+
+static int repl_fsync_dir_of(const char *path) {
+    char dir[600];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+        if (slash == dir) slash[1] = '\0';
+        else *slash = '\0';
+    } else {
+        snprintf(dir, sizeof(dir), ".");
+    }
+    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    int rc = fsync(fd);
+    close(fd);
+    return rc;
+}
+
+static int repl_fullsync_marker_write(void) {
+    char path[600];
+    char buf[128];
+    repl_fullsync_marker_path(path, sizeof(path));
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return -1;
+    int n = snprintf(buf, sizeof(buf), "base=%llu\n",
+                     g_slave_fullsync_base_offset);
+    ssize_t w = write(fd, buf, (size_t)n);
+    int rc = (w == n) ? 0 : -1;
+    if (rc == 0 && fsync(fd) != 0) rc = -1;
+    close(fd);
+    if (rc == 0 && repl_fsync_dir_of(path) != 0) rc = -1;
+    return rc;
+}
+
+static int repl_fullsync_marker_remove(void) {
+    char path[600];
+    repl_fullsync_marker_path(path, sizeof(path));
+    if (unlink(path) != 0 && errno != ENOENT) return -1;
+    return repl_fsync_dir_of(path);
+}
+
+static int repl_test_fail_step(const char *step) {
+    const char *v = getenv("KVS_TEST_FULLSYNC_FAIL_STEP");
+    return v && *v && strcmp(v, step) == 0;
+}
+
+static void repl_test_crash_step(const char *step) {
+    const char *v = getenv("KVS_TEST_FULLSYNC_CRASH_STEP");
+    if (v && *v && strcmp(v, step) == 0) {
+        fprintf(stderr, "repl: TEST crash at fullsync step '%s'\n", step);
+        _exit(9);
+    }
+}
 
 void repl_slave_finish_fullsync(void) {
     if (g_slave_fullsync_finish_done) return;
@@ -3220,9 +3355,7 @@ void repl_slave_finish_fullsync(void) {
     g_slave_loading_fullsync = 0;
     g_slave_fullsync_target_bytes = 0;
     g_slave_fullsync_loaded_bytes = 0;
-    if (g_slave_repl_durable_offset < g_slave_repl_applied_offset) {
-        g_slave_repl_durable_offset = g_slave_repl_applied_offset;
-    }
+
 #if KVS_ENABLE_RDMA
     if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma") || !strcasecmp(g_cfg.repl_transport_backend, "rdma")) {
         fprintf(stderr, "repl rdma: slave_fullsync - finished applied_offset=%llu durable_offset=%llu\n", g_slave_repl_applied_offset, g_slave_repl_durable_offset);
@@ -3244,61 +3377,115 @@ void repl_slave_finish_fullsync(void) {
         }
     }
 #endif
-    /* 全量同步完成后，从临时 KVSD 文件加载数据到内存并持久化。
-     * WRITE 模式：数据在 repl_rdma_slave_prepare_target 的 mmap 目标文件里；
-     * SEND/fallback 模式：数据在 parse_resp_stream 拦截写入的 legacy tmp 文件里。 */
-    {
-        repl_fullsync_target_t *tg = &g_slave_fullsync_target;
-        int fd = (tg->fd >= 0) ? tg->fd : g_slave_fullsync_tmp_fd;
-        char tmp_path[512];
-        if (tg->path[0]) {
-            snprintf(tmp_path, sizeof(tmp_path), "%s", tg->path);
-        } else {
-            snprintf(tmp_path, sizeof(tmp_path), "%s.fullsync.recv.tmp.%ld",
-                     g_cfg.dump_path, (long)getpid());
-        }
 
-        if (fd >= 0) {
-            fsync(fd);
-            close(fd);
+    repl_fullsync_target_t *tg = &g_slave_fullsync_target;
+    int fd = (tg->fd >= 0) ? tg->fd : g_slave_fullsync_tmp_fd;
+    char tmp_path[512] = {0};
+    if (tg->path[0]) {
+        snprintf(tmp_path, sizeof(tmp_path), "%s", tg->path);
+    } else {
+        snprintf(tmp_path, sizeof(tmp_path), "%s.fullsync.recv.tmp.%ld",
+                 g_cfg.dump_path, (long)getpid());
+    }
+
+    const char *fail_step = NULL;
+    int renamed = 0;
+
+    /* 1) 目标数据落盘 */
+    if (fd < 0) {
+        fail_step = "no target fd";
+    } else {
+        if (repl_test_fail_step("fsync")) {
+            fail_step = "fsync (injected)";
+        } else if (fsync(fd) != 0) {
+            fail_step = "fsync target";
         }
+        if (close(fd) != 0 && !fail_step) fail_step = "close target";
         g_slave_fullsync_tmp_fd = -1;
         if (tg->fd >= 0) tg->fd = -1;
-
-        if (fd >= 0 || tmp_path[0]) {
-            /* Load KVSD data into memory + TTL */
-            unsigned long long aof_off = replay_dump_file(tmp_path);
-            fprintf(stderr, "repl: slave fullsync loaded from %s, aof_offset=%llu\n",
-                    tmp_path, aof_off);
-
-            /* Move temp file to official dump path as the persistence base */
-            if (rename(tmp_path, g_cfg.dump_path) != 0) {
-                fprintf(stderr, "repl: slave fullsync rename to %s failed: %s\n",
-                        g_cfg.dump_path, strerror(errno));
-            } else {
-                /* 快照成为新的持久化基线：
-                 *  ① 头部的 aof_offset 是 master 生成时写入的 **master 复制 offset**，
-                 *     从机恢复却拿它当"自己 AOF 跳过的字节数"，量纲完全不同 ——
-                 *     不改写会在重启时跳过几乎全部本地 AOF（实测 5w 条只剩 ~1300 条）。
-                 *  ② 截断本地 AOF：快照之前的命令已被取代，留着会在恢复时重放到快照之上。
-                 * 两者必须成对做：头部写 0，AOF 也确实是 0 基线。 */
-                if (kvs_dump_set_aof_offset(g_cfg.dump_path, 0) != 0)
-                    fprintf(stderr, "repl: slave fullsync patch dump aof_offset failed: %s\n",
-                            strerror(errno));
-                if (persist_aof_rebase() != 0)
-                    fprintf(stderr, "repl: slave fullsync aof rebase failed\n");
-                fprintf(stderr, "repl: slave fullsync dump saved to %s "
-                                "(aof rebased to 0)\n", g_cfg.dump_path);
-            }
-        } else {
-            fprintf(stderr, "repl: slave fullsync finished but no temp file\n");
-        }
-        /* 目标文件已 rename 为正式 dump，清 path 元数据（不再 unlink） */
-        tg->path[0] = '\0';
-        tg->fd = -1;
     }
+
+    /* 2) 严格校验 + 加载快照 */
+    if (!fail_step && repl_test_fail_step("replay"))
+        fail_step = "replay (injected)";
+    if (!fail_step) {
+        unsigned long long aof_off = 0;
+        if (replay_dump_file_checked(tmp_path, &aof_off) != 0)
+            fail_step = "validate/load snapshot";
+    }
+
+    /* 3) 持久化提交标记（必须在覆盖正式 dump 之前落盘） */
+    if (!fail_step && repl_test_fail_step("marker"))
+        fail_step = "write commit marker (injected)";
+    if (!fail_step && repl_fullsync_marker_write() != 0)
+        fail_step = "write commit marker";
+    repl_test_crash_step("after_marker");
+
+    /* 4) 原子 rename 覆盖正式 dump */
+    if (!fail_step && repl_test_fail_step("rename"))
+        fail_step = "rename (injected)";
+    if (!fail_step) {
+        if (rename(tmp_path, g_cfg.dump_path) != 0) {
+            fail_step = "rename dump";
+        } else {
+            renamed = 1;
+            repl_test_crash_step("after_rename");
+        }
+    }
+
+    /* 5) 头部 aof_offset 归零 + dump fsync */
+    if (!fail_step && repl_test_fail_step("patch"))
+        fail_step = "patch aof_offset (injected)";
+    if (!fail_step && kvs_dump_set_aof_offset(g_cfg.dump_path, 0) != 0)
+        fail_step = "patch dump aof_offset";
+    if (!fail_step) {
+        int dfd = open(g_cfg.dump_path, O_RDONLY | O_CLOEXEC);
+        if (dfd < 0 || fsync(dfd) != 0) fail_step = "fsync dump";
+        if (dfd >= 0) close(dfd);
+    }
+
+    /* 6) 本地 AOF 基线重建 */
+    if (!fail_step && repl_test_fail_step("rebase"))
+        fail_step = "aof rebase (injected)";
+    if (!fail_step && persist_aof_rebase() != 0)
+        fail_step = "aof rebase";
+    repl_test_crash_step("after_rebase");
+
+    /* 7) 推进 applied/durable 并持久化 replstate */
+    if (!fail_step) {
+        g_slave_repl_applied_offset = g_slave_fullsync_base_offset;
+        g_slave_repl_durable_offset = g_slave_fullsync_base_offset;
+        g_slave_repl_offset = g_slave_fullsync_base_offset;
+        if (repl_test_fail_step("state") || repl_slave_state_save() != 0)
+            fail_step = "save replstate";
+    }
+
+    /* 8) 提交完成：移除 pending marker */
+    if (!fail_step && repl_fullsync_marker_remove() != 0)
+        fail_step = "remove commit marker";
+
+    tg->path[0] = '\0';
+    tg->fd = -1;
+
+    if (!fail_step) {
+        fprintf(stderr, "repl: slave fullsync committed (base=%llu, dump=%s)\n",
+                g_slave_fullsync_base_offset, g_cfg.dump_path);
+        repl_slave_send_repldone();
+        return;
+    }
+
+    /* fail-closed：不发送 REPLDONE，断开控制连接并让下一次 REPLSYNC 走全量。 */
+    fprintf(stderr, "repl: slave fullsync commit FAILED at '%s' — no REPLDONE, "
+                    "forcing full resync\n", fail_step ? fail_step : "unknown");
+    if (!renamed && tmp_path[0]) unlink(tmp_path);
+    if (repl_fullsync_marker_write() != 0)
+        fprintf(stderr, "repl: failed to write fullsync commit marker\n");
+    g_slave_master_replid[0] = '\0';
+    g_slave_repl_applied_offset = 0;
+    g_slave_repl_durable_offset = 0;
+    g_slave_repl_offset = 0;
     repl_slave_state_save();
-    repl_slave_send_repldone();
+    if (g_slave_fd >= 0) shutdown(g_slave_fd, SHUT_RDWR);
 }
 
 void repl_slave_note_applied(size_t rawlen) {
@@ -3307,15 +3494,19 @@ void repl_slave_note_applied(size_t rawlen) {
         g_slave_repl_applied_offset += (unsigned long long)rawlen;
         g_slave_repl_offset = g_slave_repl_applied_offset;
 #if KVS_ENABLE_RDMA
-    if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma") || !strcasecmp(g_cfg.repl_transport_backend, "rdma"))
+    if (repl_rdma_verbose_apply() &&
+        (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma") || !strcasecmp(g_cfg.repl_transport_backend, "rdma")))
         fprintf(stderr, "repl rdma: slave_apply - applied_before=%llu rawlen=%zu applied_after=%llu durable=%llu\n",
             before, rawlen, g_slave_repl_applied_offset, g_slave_repl_durable_offset);
 #endif
-        repl_slave_state_save();
+        /* 热路径：每条命令都会推进 applied offset，只做原子替换，不逐条 fsync。
+         * fullsync 提交点的持久化确认由 repl_slave_state_save()（durable）负责。 */
+        repl_slave_state_save_fast();
     } else {
         g_slave_fullsync_loaded_bytes += (unsigned long long)rawlen;
 #if KVS_ENABLE_RDMA
-        if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma") || !strcasecmp(g_cfg.repl_transport_backend, "rdma"))
+        if (repl_rdma_verbose_apply() &&
+            (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma") || !strcasecmp(g_cfg.repl_transport_backend, "rdma")))
             fprintf(stderr, "repl rdma: slave_apply - fullsync_chunk=%zu loaded=%llu target=%llu\n",
                 rawlen, g_slave_fullsync_loaded_bytes, g_slave_fullsync_target_bytes);
 #endif
@@ -3333,10 +3524,11 @@ void repl_slave_note_durable(size_t rawlen) {
     }
     if (g_slave_repl_durable_offset < g_slave_repl_applied_offset) {
         g_slave_repl_durable_offset = g_slave_repl_applied_offset;
-        repl_slave_state_save();
+        repl_slave_state_save_fast();
     }
 #if KVS_ENABLE_RDMA
-    if (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma") || !strcasecmp(g_cfg.repl_transport_backend, "rdma"))
+    if (repl_rdma_verbose_apply() &&
+        (!strcasecmp(g_cfg.repl_fullsync_transport, "rdma") || !strcasecmp(g_cfg.repl_transport_backend, "rdma")))
         fprintf(stderr, "repl rdma: slave_durable - applied=%llu durable=%llu\n",
             g_slave_repl_applied_offset, g_slave_repl_durable_offset);
 #endif
@@ -3389,11 +3581,26 @@ static int repl_slave_send_repldone(void) {
 
     if (g_slave_fd < 0) return -1;
 
-    n = resp_build_cmd1(cmd, sizeof(cmd), "REPLDONE");
+    /* v2（并发多 Slave）必须回传 transfer_id，Master 才能把完成绑定到正确 job；
+     * 旧 master（epoch==0）保持 *1 REPLDONE，避免旧解析路径被多参数打乱。 */
+#if KVS_ENABLE_RDMA
+    uint64_t repldone_tid = g_slave_pending_fullsync_epoch
+        ? g_slave_fullsync_target.transfer_id : 0;
+#else
+    uint64_t repldone_tid = 0;
+#endif
+    if (repldone_tid != 0) {
+        char idbuf[32];
+        snprintf(idbuf, sizeof(idbuf), "%llu", (unsigned long long)repldone_tid);
+        n = resp_build_cmd2(cmd, sizeof(cmd), "REPLDONE", idbuf);
+    } else {
+        n = resp_build_cmd1(cmd, sizeof(cmd), "REPLDONE");
+    }
 
     ssize_t sent = send(g_slave_fd, cmd, n, 0);
     if (sent == (ssize_t)n) {
-        fprintf(stderr, "repl: slave sent REPLDONE to master\n");
+        fprintf(stderr, "repl: slave sent REPLDONE to master (tid=%llu)\n",
+                (unsigned long long)repldone_tid);
         return 0;
     }
     fprintf(stderr, "repl: slave REPLDONE send failed: %s\n", strerror(errno));
@@ -3409,6 +3616,30 @@ void repl_replica_update_ack(conn_t *c, unsigned long long applied_offset, unsig
 
 const char *repl_slave_master_id(void) {
     return g_slave_master_replid;
+}
+
+/* proxy 数据入口 token：Slave 进程级随机值，随 REPLSYNC 上报给 Master，
+ * Master 再通过 proxy_cfg 交给 ebpf-proxy；proxy 在数据连接首条命令
+ * REPLDATA <token> 中回显。普通客户端无法伪造（64-bit 随机），也不再因为
+ * realtime=ebpf+tcp 就放行所有客户端写。不要打印到日志/INFO。 */
+static unsigned long long g_slave_data_token = 0;
+
+unsigned long long repl_slave_data_token(void) {
+    if (g_slave_data_token) return g_slave_data_token;
+    unsigned long long t = 0;
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (f) {
+        if (fread(&t, 1, sizeof(t), f) != sizeof(t)) t = 0;
+        fclose(f);
+    }
+    if (!t) {
+        t = ((unsigned long long)kvs_now_ms() << 32)
+            ^ ((unsigned long long)getpid() << 16)
+            ^ (unsigned long long)(uintptr_t)&g_slave_data_token;
+    }
+    if (!t) t = 1;
+    g_slave_data_token = t;
+    return t;
 }
 
 unsigned long long repl_slave_offset(void) {
@@ -3453,17 +3684,69 @@ int repl_slave_state_load(void) {
     return 0;
 }
 
-int repl_slave_state_save(void) {
-    FILE *fp;
+/* replstate 原子落盘：先写 tmp，再 rename 覆盖正式文件，任何一步失败都不会留下
+ * 半截 replstate（旧 fopen(path,"w") 会在写入中途失败时把正式文件截成空）。
+ *
+ * durable=1：额外 fsync(file) 与 fsync(dir)，返回 0 即代表内容已确认落盘；
+ *   fullsync 提交等“返回 0 才能移除 marker / 发送 REPLDONE”的路径必须用它。
+ * durable=0：仅用于 applied/durable offset 前进的热路径（每条命令都会调用），
+ *   保持原子替换但不对每条命令做磁盘栅栏；崩溃最多让重启回到更早的 offset，
+ *   随后由 partial/full resync 补回，方向是重放而不是静默丢数据。 */
+static int repl_slave_state_write(int durable) {
+    char tmp[640];
+    char buf[128];
+    long long now;
+    int fd, n, rc = 0;
+    ssize_t w;
+    size_t off = 0;
+    static long long err_log_ms = 0;
+
     build_slave_state_path();
-    fp = fopen(g_slave_state_path, "w");
-    if (!fp) return -1;
-    fprintf(fp, "%s %llu %llu\n",
+    n = snprintf(buf, sizeof(buf), "%s %llu %llu\n",
         g_slave_master_replid[0] ? g_slave_master_replid : "?",
         g_slave_repl_applied_offset,
         g_slave_repl_durable_offset);
-    fclose(fp);
-    return 0;
+    if (n <= 0 || (size_t)n >= sizeof(buf)) return -1;
+
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", g_slave_state_path, (long)getpid());
+    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return -1;
+    if (repl_test_fail_step("state-write")) {
+        errno = ENOSPC;              /* 故障注入：模拟写入阶段 ENOSPC */
+        rc = -1;
+    }
+    while (rc == 0 && off < (size_t)n) {
+        w = write(fd, buf + off, (size_t)n - off);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            rc = -1;
+            break;
+        }
+        if (w == 0) { rc = -1; break; }
+        off += (size_t)w;
+    }
+    if (rc == 0 && durable && fsync(fd) != 0) rc = -1;
+    if (close(fd) != 0 && rc == 0) rc = -1;
+    if (rc == 0 && rename(tmp, g_slave_state_path) != 0) rc = -1;
+    if (rc == 0 && durable && repl_fsync_dir_of(g_slave_state_path) != 0) rc = -1;
+    if (rc != 0) {
+        unlink(tmp);
+        now = kvs_now_ms();
+        if (now - err_log_ms >= 5000) {   /* 热路径失败时避免逐命令刷日志 */
+            err_log_ms = now;
+            fprintf(stderr, "repl: save replstate failed (durable=%d): %s\n",
+                    durable, strerror(errno));
+        }
+    }
+    return rc;
+}
+
+int repl_slave_state_save(void) {
+    return repl_slave_state_write(1);
+}
+
+static int repl_slave_state_save_fast(void) {
+    return repl_slave_state_write(0);
 }
 
 /* partial resync 判定（§10）：除 offset 落在 backlog 区间外，还必须保证 backlog 历史
@@ -3739,8 +4022,9 @@ static void *slave_thread(void *arg) {
                 char offbuf[32], durablebuf[32];
                 snprintf(offbuf, sizeof(offbuf), "%llu", g_slave_repl_offset);
                 snprintf(durablebuf, sizeof(durablebuf), "%llu", g_slave_repl_durable_offset);
-                size_t n = resp_build_cmd4(cmd, sizeof(cmd), "REPLSYNC",
-                    g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf, durablebuf);
+                size_t n = resp_build_cmd5(cmd, sizeof(cmd), "REPLSYNC",
+                    g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf,
+                    durablebuf, "rdma-fs-v2");
                 if (send(tcp_fd, cmd, n, 0) < 0) { close(tcp_fd); continue; }
                 fprintf(stderr, "kprobe rdma: REPLSYNC sent over TCP immediately\n");
             }
@@ -3855,7 +4139,9 @@ static void *slave_thread(void *arg) {
                  * 在发送 REPLSYNC 之前创建，确保 master 通知 proxy 时 listener 已就绪。 */
                 int proxy_listen_fd = -1;
                 int proxy_fd = -1;
-                int proxy_port = g_cfg.master_port + 1;
+                int proxy_port = g_cfg.repl_proxy_port > 0
+                                     ? g_cfg.repl_proxy_port
+                                     : g_cfg.master_port + 1;
                 {
                     proxy_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
                     if (proxy_listen_fd >= 0) {
@@ -3888,13 +4174,19 @@ static void *slave_thread(void *arg) {
 
                 {
                     unsigned char cmd[256];
-                    char offbuf[32], durablebuf[32];
+                    char offbuf[32], durablebuf[32], portbuf[16], tokbuf[32];
                     snprintf(offbuf, sizeof(offbuf), "%llu", g_slave_repl_offset);
                     snprintf(durablebuf, sizeof(durablebuf), "%llu", g_slave_repl_durable_offset);
-                    size_t n = resp_build_cmd4(cmd, sizeof(cmd), "REPLSYNC",
-                        g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf, durablebuf);
+                    snprintf(portbuf, sizeof(portbuf), "%d", proxy_port);
+                    snprintf(tokbuf, sizeof(tokbuf), "%llu", repl_slave_data_token());
+                    /* 第 5 参数=proxy 数据端口；第 6 参数=REPLDATA 握手 token。
+                     * 专用数据端口同样必须认证，避免任意客户端连接后注入复制写。 */
+                    size_t n = resp_build_cmd7(cmd, sizeof(cmd), "REPLSYNC",
+                        g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf,
+                        durablebuf, portbuf, tokbuf, "rdma-fs-v2");
                     if (send(tcp_fd, cmd, n, 0) < 0) { close(tcp_fd); continue; }
-                    fprintf(stderr, "repl ebpf-tcp: REPLSYNC sent over TCP\n");
+                    fprintf(stderr, "repl ebpf-tcp: REPLSYNC sent over TCP (proxy_port=%d)\n",
+                            proxy_port);
                 }
 
                 /* REPLSYNC 已发。RDMA 连接延迟到 slave 收到 +FULLRESYNC 再建立：
@@ -3925,6 +4217,44 @@ static void *slave_thread(void *arg) {
                         proxy_fd = accept(proxy_listen_fd, NULL, NULL);
                         if (proxy_fd >= 0) {
                             fprintf(stderr, "repl ebpf-tcp: proxy connected fd=%d\n", proxy_fd);
+                            /* 专用 proxy 数据端口也要求 REPLDATA <token> 握手：
+                             * 端口可达不代表可信，普通客户端不得注入复制写。 */
+                            struct timeval htv = { .tv_sec = 1, .tv_usec = 0 };
+                            setsockopt(proxy_fd, SOL_SOCKET, SO_RCVTIMEO, &htv, sizeof(htv));
+                            char hs[128];
+                            size_t hl = 0;
+                            int hs_ok = 0;
+                            while (hl < sizeof(hs) - 1) {
+                                ssize_t hn = recv(proxy_fd, hs + hl, sizeof(hs) - 1 - hl, 0);
+                                if (hn > 0) {
+                                    hl += (size_t)hn;
+                                    if (memchr(hs, '\n', hl)) break;
+                                    continue;
+                                }
+                                if (hn < 0 && errno == EINTR) continue;
+                                break;
+                            }
+                            hs[hl] = '\0';
+                            char *nl = strchr(hs, '\n');
+                            if (nl) *nl = '\0';
+                            nl = strchr(hs, '\r');
+                            if (nl) *nl = '\0';
+                            if (!strncmp(hs, "REPLDATA ", 9)) {
+                                unsigned long long tok = (unsigned long long)strtoull(hs + 9, NULL, 10);
+                                unsigned long long want = repl_slave_data_token();
+                                if (want != 0 && tok == want) hs_ok = 1;
+                            }
+                            if (!hs_ok) {
+                                fprintf(stderr, "repl ebpf-tcp: proxy REPLDATA handshake rejected\n");
+                                close(proxy_fd);
+                                proxy_fd = -1;
+                            } else {
+                                const char okline[] = "+OK\r\n";
+                                send(proxy_fd, okline, sizeof(okline) - 1, MSG_NOSIGNAL);
+                                struct timeval zero = { 0, 0 };
+                                setsockopt(proxy_fd, SOL_SOCKET, SO_RCVTIMEO, &zero, sizeof(zero));
+                                fprintf(stderr, "repl ebpf-tcp: proxy data channel authenticated\n");
+                            }
                         } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
                             fprintf(stderr, "repl ebpf-tcp: proxy accept error: %s\n", strerror(errno));
                         }
@@ -4012,9 +4342,13 @@ static void *slave_thread(void *arg) {
                         parse_resp_stream(NULL, buf, &blen, 1);
                     }
 
-                    /* 无数据时短暂休眠避免忙循环 */
-                    if (!had_new_data)
+                    /* 无数据时短暂休眠避免忙循环；同时补 REPLACK 心跳
+                     * （partial barrier 的放行依赖 applied 回报，不能只在
+                     * 收到数据时才 ACK）。 */
+                    if (!had_new_data) {
+                        repl_slave_ack_heartbeat();
                         usleep(1000);
+                    }
                 }
 
                 g_slave_fd = -1;
@@ -4065,8 +4399,9 @@ static void *slave_thread(void *arg) {
                 char offbuf[32], durablebuf[32];
                 snprintf(offbuf, sizeof(offbuf), "%llu", g_slave_repl_offset);
                 snprintf(durablebuf, sizeof(durablebuf), "%llu", g_slave_repl_durable_offset);
-                size_t n = resp_build_cmd4(cmd, sizeof(cmd), "REPLSYNC",
-                    g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf, durablebuf);
+                size_t n = resp_build_cmd5(cmd, sizeof(cmd), "REPLSYNC",
+                    g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf,
+                    durablebuf, "rdma-fs-v2");
                 if (send(tcp_fd, cmd, n, 0) < 0) break;
                 fprintf(stderr, "repl: REPLSYNC sent over TCP immediately\n");
             }
@@ -4192,7 +4527,7 @@ static void *slave_thread(void *arg) {
             repl_rdma_set_state(REPL_RDMA_STATE_SYNCING, "slave_replsync_sent");
             snprintf(offbuf, sizeof(offbuf), "%llu", g_slave_repl_offset);
             snprintf(durablebuf, sizeof(durablebuf), "%llu", g_slave_repl_durable_offset);
-            n = resp_build_cmd4(cmd, sizeof(cmd), "REPLSYNC", g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf, durablebuf);
+            n = resp_build_cmd5(cmd, sizeof(cmd), "REPLSYNC", g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf, durablebuf, "rdma-fs-v2");
             if (repl_transport_send_on_slave_link(cmd, n) != 0) {
                 repl_rdma_log("slave_loop", "link down because initial REPLSYNC send failed");
                 repl_transport_ops()->disconnect_slave(fd);
@@ -4275,7 +4610,23 @@ static void *slave_thread(void *arg) {
         char durablebuf[32];
         snprintf(offbuf, sizeof(offbuf), "%llu", g_slave_repl_offset);
         snprintf(durablebuf, sizeof(durablebuf), "%llu", g_slave_repl_durable_offset);
-        size_t n = resp_build_cmd4(cmd, sizeof(cmd), "REPLSYNC", g_slave_master_replid[0] ? g_slave_master_replid : "?", offbuf, durablebuf);
+        size_t n;
+        if (!strcasecmp(repl_realtime_transport_name(), "ebpf+tcp")) {
+            /* ebpf+tcp 的增量由 proxy 直连 Slave **主端口**注入（主端口写路径的
+             * !from_replication 分支会推进 replicated offset）。把主端口作为第 5
+             * 参数带给 Master：多 Slave 可部署在同一主机/任意端口，不再依赖
+             * “Slave 端口 == Master 端口 + 1” 的隐式约定。 */
+            char portbuf[16], tokbuf[32];
+            snprintf(portbuf, sizeof(portbuf), "%d", g_cfg.port);
+            snprintf(tokbuf, sizeof(tokbuf), "%llu", repl_slave_data_token());
+            n = resp_build_cmd7(cmd, sizeof(cmd), "REPLSYNC",
+                g_slave_master_replid[0] ? g_slave_master_replid : "?",
+                offbuf, durablebuf, portbuf, tokbuf, "rdma-fs-v2");
+        } else {
+            n = resp_build_cmd5(cmd, sizeof(cmd), "REPLSYNC",
+                g_slave_master_replid[0] ? g_slave_master_replid : "?",
+                offbuf, durablebuf, "rdma-fs-v2");
+        }
         if (send(fd, cmd, n, 0) < 0) {
             repl_transport_mark_active("tcp");
             g_slave_transport_kind = KVS_REPL_TRANSPORT_TCP;
@@ -4308,7 +4659,15 @@ static void *slave_thread(void *arg) {
                 continue;
             }
             if (r == 0) break;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* 控制连接空闲（SO_RCVTIMEO 1s）也要发 REPLACK 心跳。
+                 * partial resync 的屏障放行条件是 applied >= catchup_end；
+                 * 如果 replay 最后一包之后没有新数据，只在收到数据时 ACK 会
+                 * 让 Master 一直等到 barrier hold timeout 并误判副本故障
+                 * （实测：活跃 Slave 的 partial 屏障被 4s 超时拒绝）。 */
+                repl_slave_ack_heartbeat();
+                continue;
+            }
             break;
         }
 

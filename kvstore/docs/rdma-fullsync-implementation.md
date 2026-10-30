@@ -2,6 +2,13 @@
 
 > 本文档从代码层面逐层剖析 kvstore 中 RDMA 全量复制（fullsync）的完整实现，
 > 覆盖建链、握手、数据传输、CQ 并发控制、异常处理全流程。格式与 `tech-roadmap.md` 一致。
+>
+> **多 Slave 并发路径**：当 `repl-fullsync-transport=rdma` 且实时传输为
+> eBPF/TCP（非纯 RDMA/kprobe-rdma）时，全量同步改由新的 per-transfer 管理器
+> （`rdma_fullsync_mgr.c` / `rdma_fullsync_transfer.c`）执行，支持多个 Slave
+> 真正同时 RDMA WRITE。详见
+> [`multi-slave-rdma-fullsync-async.md`](multi-slave-rdma-fullsync-async.md)。
+> 本文其余章节描述的单实例 `g_repl_rdma_ctx` 仍用于旧实时路径与兼容回退。
 
 ---
 

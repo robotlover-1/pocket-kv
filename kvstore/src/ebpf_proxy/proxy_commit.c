@@ -85,19 +85,26 @@ static uint64_t g_session_epoch = 0;
 
 static proxy_commit_emit_fn g_emit = NULL;
 static proxy_commit_fault_fn g_fault = NULL;
+static proxy_commit_replica_fault_fn g_replica_fault = NULL;
+static proxy_commit_resume_fn g_on_resume = NULL;
 static int g_faulted = 0;
 
 static pc_ctx_t *g_buckets[PC_MAX_COOKIES];
 
 static uint64_t g_next_global = 0;       /* 0 = 未初始化，接受第一个 global_seq */
 static pc_cmd_t *g_ready_head = NULL;
-static int g_buffering = 0;
-static int g_wait_resume = 0;
-static long long g_wait_resume_ms = 0;
-static int g_resume_event = 0;
 
-static pc_rec_t *g_rec_head = NULL, *g_rec_tail = NULL;
-static size_t g_rec_bytes = 0;
+/* ---- per-replica fan-out / recovery ----
+ * 命令流仍是全局一份（全局序在 pc_drain_ready 保证）。恢复缓冲必须按副本拆开：
+ * A 处于 LIVE 时，B 的 barrier/replay 不能把 A 的数据也扣在 recovery 里。
+ * 恢复内存计入与 pending 共享的总预算，单副本另有上限；超限只摘除该副本。 */
+#define PC_REPL_RECOVERY_MAX (128ull * 1024 * 1024)
+static uint64_t g_replica_mask = 0;        /* active slots */
+static uint64_t g_replica_buffering = 0;   /* slots currently in recovery */
+static pc_rec_t *g_rec_head[PROXY_COMMIT_MAX_REPLICAS];
+static pc_rec_t *g_rec_tail[PROXY_COMMIT_MAX_REPLICAS];
+static size_t g_rec_bytes_r[PROXY_COMMIT_MAX_REPLICAS];
+static size_t g_rec_bytes = 0;             /* 所有副本合计 */
 static unsigned long long g_pending_bytes = 0;
 
 static unsigned long long g_st_desc = 0, g_st_writes = 0, g_st_skips = 0;
@@ -122,11 +129,11 @@ static void pc_fault(int reason) {
     else if (reason == 4) g_st_channel++;
     if (reason == 1) {
         long long now = pc_now_ms();
-        fprintf(stderr, "[commit] timeout detail: buffering=%d wait_resume=%d(age=%lldms) "
+        fprintf(stderr, "[commit] timeout detail: buffering_mask=0x%llx replicas=0x%llx "
                         "rec_bytes=%zu pending_bytes=%llu pending_cmds=%lld ctxs=%d "
                         "ready_global=%llu next_global=%llu\n",
-                g_buffering, g_wait_resume,
-                g_wait_resume ? now - g_wait_resume_ms : 0,
+                (unsigned long long)g_replica_buffering,
+                (unsigned long long)g_replica_mask,
                 g_rec_bytes, g_pending_bytes, g_pending_cmd_count, g_ctx_count,
                 g_ready_head ? (unsigned long long)g_ready_head->global_seq : 0,
                 (unsigned long long)g_next_global);
@@ -214,11 +221,23 @@ static void pc_ready_free_all(void) {
     g_ready_head = NULL;
 }
 
+static void pc_recovery_free_one(int id) {
+    if (id < 0 || id >= PROXY_COMMIT_MAX_REPLICAS) return;
+    pc_rec_t *r = g_rec_head[id];
+    while (r) {
+        pc_rec_t *nx = r->next;
+        if (g_rec_bytes >= r->len) g_rec_bytes -= r->len;
+        free(r);
+        r = nx;
+    }
+    g_rec_head[id] = g_rec_tail[id] = NULL;
+    g_rec_bytes_r[id] = 0;
+}
+
 static void pc_recovery_free_all(void) {
-    pc_rec_t *r = g_rec_head;
-    while (r) { pc_rec_t *nx = r->next; free(r); r = nx; }
-    g_rec_head = g_rec_tail = NULL;
+    for (int i = 0; i < PROXY_COMMIT_MAX_REPLICAS; ++i) pc_recovery_free_one(i);
     g_rec_bytes = 0;
+    g_replica_buffering = 0;
 }
 
 void proxy_commit_purge(void) {
@@ -230,13 +249,47 @@ void proxy_commit_purge(void) {
     pc_ready_free_all();
     pc_recovery_free_all();
     g_next_global = 0;
-    g_wait_resume = 0;
-    g_wait_resume_ms = 0;
-    g_resume_event = 0;
     g_pending_bytes = 0;
     g_ctx_count = 0;
     g_pending_cmd_count = 0;
     g_faulted = 0;
+}
+
+void proxy_commit_set_replica(uint64_t replica_id, int active) {
+    if (replica_id >= PROXY_COMMIT_MAX_REPLICAS) return;
+    uint64_t bit = 1ull << replica_id;
+    if (active) {
+        pc_recovery_free_one((int)replica_id);
+        g_replica_mask |= bit;
+    } else {
+        pc_recovery_free_one((int)replica_id);
+        g_replica_mask &= ~bit;
+        g_replica_buffering &= ~bit;
+    }
+}
+
+void proxy_commit_set_buffering(uint64_t replica_id, int buffering) {
+    if (replica_id >= PROXY_COMMIT_MAX_REPLICAS) return;
+    uint64_t bit = 1ull << replica_id;
+    /* 进入恢复：丢弃上一轮未完成的恢复数据（新 barrier 的 replay/快照会覆盖）。
+     * 离开恢复：同样丢弃未 RESUME 的残余，绝不把未确认数据交给该副本（fail-closed）。 */
+    pc_recovery_free_one((int)replica_id);
+    if (buffering) g_replica_buffering |= bit;
+    else g_replica_buffering &= ~bit;
+}
+
+/* 单副本交付失败：只摘除该副本（置 FAULT，由 main 断开数据通道并通知 Master
+ * 重新同步），其他副本继续。返回 -1 表示该副本已不可用。 */
+static int pc_replica_fault(uint64_t id, int reason) {
+    if (id >= PROXY_COMMIT_MAX_REPLICAS) return -1;
+    pc_recovery_free_one((int)id);
+    g_replica_mask &= ~(1ull << id);
+    g_replica_buffering &= ~(1ull << id);
+    fprintf(stderr, "ebpf-proxy: commit replica %llu fault reason=%d "
+                    "(isolated; other replicas continue)\n",
+            (unsigned long long)id, reason);
+    if (g_replica_fault) g_replica_fault(id, reason);
+    return -1;
 }
 
 /* ---------------- framer（复刻 Master client 解析路径） ---------------- */
@@ -353,36 +406,59 @@ static void pc_ready_insert(pc_cmd_t *cmd) {
     *pp = cmd;
 }
 
-static void pc_recovery_append(pc_cmd_t *cmd) {
+/* 为该副本追加一条恢复记录。返回 0 成功；-1 = 该副本恢复缓冲超限/OOM，
+ * 调用方必须只摘除该副本（pc_replica_fault），不能拖垮其他副本。 */
+static int pc_recovery_append(int id, const pc_cmd_t *cmd) {
+    if (id < 0 || id >= PROXY_COMMIT_MAX_REPLICAS) return -1;
+    if (g_rec_bytes_r[id] + cmd->len > PC_REPL_RECOVERY_MAX ||
+        g_pending_bytes + g_rec_bytes + cmd->len > PC_MEMORY_MAX) {
+        g_st_mem_hard++;
+        return -1;
+    }
     pc_rec_t *r = (pc_rec_t *)malloc(sizeof(*r) + cmd->len);
-    if (!r) { pc_fault(1); return; }
+    if (!r) return -1;
     r->next = NULL;
     r->global_seq = cmd->global_seq;
     r->len = cmd->len;
     memcpy(r->data, cmd->data, cmd->len);
-    if (g_rec_tail) g_rec_tail->next = r; else g_rec_head = r;
-    g_rec_tail = r;
+    if (g_rec_tail[id]) g_rec_tail[id]->next = r; else g_rec_head[id] = r;
+    g_rec_tail[id] = r;
+    g_rec_bytes_r[id] += cmd->len;
     g_rec_bytes += cmd->len;
-    if (g_pending_bytes + g_rec_bytes > PC_MEMORY_MAX) {
-        g_st_mem_hard++;
-        pc_fault(5);
-        return;
-    }
+    return 0;
 }
 
-/* 返回 0 = 已入 recovery 缓冲或已成功交付；-1 = 交付失败（已置 fault）。 */
+/* 返回 0 = 至少有一个副本接收（直发或恢复缓冲）；-1 = 所有副本都不可用，
+ * 全局 fail-closed（调用方停止放行后续记录）。单个副本失败只隔离该副本。 */
 static int pc_emit_cmd(pc_cmd_t *cmd) {
-    if (g_buffering || g_wait_resume || g_rec_bytes > 0) {
-        pc_recovery_append(cmd);
-        return g_faulted ? -1 : 0;
+    if (g_replica_mask == 0) {
+        /* 没有注册任何副本：已提交数据无处可去，静默丢弃会形成 silent loss。 */
+        pc_fault(1);
+        return -1;
     }
-    if (g_emit) {
-        if (g_emit(cmd->data, cmd->len) != 0) {
-            /* 未交付：不能计入 emitted，也不能继续放行后续记录。 */
-            pc_fault(1);
-            return -1;
+    int delivered = 0, buffered = 0;
+    uint64_t mask = g_replica_mask;
+    while (mask) {
+        int id = __builtin_ctzll(mask);
+        mask &= mask - 1;
+        if (g_replica_buffering & (1ull << id)) {
+            if (pc_recovery_append(id, cmd) == 0)
+                buffered++;
+            else
+                pc_replica_fault((uint64_t)id, 5);
+            continue;
         }
+        if (g_emit && g_emit((uint64_t)id, cmd->global_seq, cmd->data, cmd->len) != 0) {
+            /* main 侧的副本级失败（队列/内存）：只隔离该副本。 */
+            pc_replica_fault((uint64_t)id, 5);
+            continue;
+        }
+        delivered++;
         g_st_emitted += cmd->len;
+    }
+    if (!delivered && !buffered) {
+        pc_fault(1);
+        return -1;
     }
     return 0;
 }
@@ -557,19 +633,53 @@ static void pc_on_baseline(uint64_t cookie, uint64_t next_seq) {
     pc_try_match(ctx);
 }
 
-static void pc_on_resume(uint64_t marker) {
-    /* 丢弃 <= marker（已被 backlog/快照覆盖），其余按序交出。
-     * 交付失败必须 fail-closed：未交付的记录不能计入 emitted，也不能继续放行。 */
+static void pc_on_resume(uint64_t replica_id, uint64_t replica_gen,
+                         uint64_t barrier_seq, uint64_t marker) {
+    if (replica_id >= PROXY_COMMIT_MAX_REPLICAS) {
+        fprintf(stderr, "ebpf-proxy: RESUME for unknown replica %llu ignored\n",
+                (unsigned long long)replica_id);
+        return;
+    }
+    int id = (int)replica_id;
+    uint64_t bit = 1ull << id;
+
+    /* 陈旧/错代 RESUME：同 session 内 slot 重注册后，旧 barrier 的 RESUME 可能
+     * 晚到。必须忽略，且绝不能释放新恢复缓冲（否则会丢数据/错放行）。 */
+    if (g_on_resume && !g_on_resume(replica_id, replica_gen, barrier_seq, marker)) {
+        fprintf(stderr, "ebpf-proxy: RESUME slot=%llu gen=%llu seq=%llu marker=%llu "
+                        "rejected (stale generation/barrier) — ignored\n",
+                (unsigned long long)replica_id, (unsigned long long)replica_gen,
+                (unsigned long long)barrier_seq, (unsigned long long)marker);
+        return;
+    }
+
+    /* 每个副本独立丢弃 <= marker（已被该副本的 backlog/快照覆盖），其余按序交付。
+     * 未注册/已隔离的副本没有恢复数据可放行。 */
+    pc_rec_t *r = g_rec_head[id];
+    g_rec_head[id] = g_rec_tail[id] = NULL;
+    size_t rec_bytes = g_rec_bytes_r[id];
+    g_rec_bytes_r[id] = 0;
+    if (g_rec_bytes >= rec_bytes) g_rec_bytes -= rec_bytes;
+    else g_rec_bytes = 0;
+    g_replica_buffering &= ~bit;
+
+    if (!(g_replica_mask & bit)) {
+        while (r) { pc_rec_t *nx = r->next; free(r); r = nx; }
+        fprintf(stderr, "ebpf-proxy: RESUME slot=%llu marker=%llu: replica inactive, "
+                        "recovery discarded\n",
+                (unsigned long long)replica_id, (unsigned long long)marker);
+        return;
+    }
+
     unsigned long long dropped_bytes = 0, emitted_bytes = 0;
     int dropped = 0, emitted = 0, deliver_failed = 0;
-    pc_rec_t *r = g_rec_head;
     while (r) {
         pc_rec_t *nx = r->next;
         if (!deliver_failed && r->global_seq <= marker) {
             dropped++;
             dropped_bytes += r->len;
         } else if (!deliver_failed) {
-            if (g_emit && g_emit(r->data, r->len) != 0) {
+            if (g_emit && g_emit(replica_id, r->global_seq, r->data, r->len) != 0) {
                 deliver_failed = 1;
             } else {
                 emitted++;
@@ -580,22 +690,18 @@ static void pc_on_resume(uint64_t marker) {
         free(r);
         r = nx;
     }
-    g_rec_head = g_rec_tail = NULL;
-    g_rec_bytes = 0;
-    g_wait_resume = 0;
-    g_wait_resume_ms = 0;
     if (deliver_failed) {
-        fprintf(stderr, "ebpf-proxy: RESUME marker=%llu: delivery failed after "
-                        "%d/%llu bytes — fail-closed\n",
-                (unsigned long long)marker, emitted, emitted_bytes);
-        pc_fault(1);
+        fprintf(stderr, "ebpf-proxy: RESUME slot=%llu marker=%llu: delivery failed after "
+                        "%d/%llu bytes — isolating this replica\n",
+                (unsigned long long)replica_id, (unsigned long long)marker,
+                emitted, emitted_bytes);
+        pc_replica_fault(replica_id, 5);
         return;
     }
-    g_resume_event = 1;
-    fprintf(stderr, "ebpf-proxy: RESUME marker=%llu: emitted %d/%llu bytes, "
+    fprintf(stderr, "ebpf-proxy: RESUME slot=%llu marker=%llu: emitted %d/%llu bytes, "
                     "dropped %d/%llu bytes (<=marker)\n",
-            (unsigned long long)marker, emitted, emitted_bytes,
-            dropped, dropped_bytes);
+            (unsigned long long)replica_id, (unsigned long long)marker,
+            emitted, emitted_bytes, dropped, dropped_bytes);
 }
 
 /* 旧 session/旧 epoch 的消息：epoch=0 视为通配（兼容手动测试/旧 Master），
@@ -662,7 +768,7 @@ static void pc_process_msg(const unsigned char *buf, size_t len) {
                     (unsigned long long)h.epoch, (unsigned long long)g_session_epoch);
             break;
         }
-        pc_on_resume(h.global_seq);
+        pc_on_resume(h.replica_id, h.replica_gen, h.barrier_seq, h.global_seq);
         break;
     case REPL_COMMIT_MSG_BATCH: {
         if (pc_epoch_stale(h.epoch)) {
@@ -719,25 +825,13 @@ static void pc_read_master(void) {
     }
 }
 
-void proxy_commit_poll(int buffering) {
+void proxy_commit_poll(void) {
     if (g_listen_fd < 0) return;
 
     if (g_master_fd < 0) {
         pc_accept_master();
     } else {
         pc_read_master();
-    }
-
-    if (buffering != g_buffering) {
-        g_buffering = buffering;
-        if (!buffering && g_rec_bytes > 0 && !g_wait_resume) {
-            g_wait_resume = 1;
-            g_wait_resume_ms = pc_now_ms();
-        }
-    }
-    if (g_wait_resume && pc_now_ms() - g_wait_resume_ms > PC_TIMEOUT_MS) {
-        pc_fault(1);
-        return;
     }
 
     /* 超时检查：已就绪写等待更早 global_seq / 待匹配命令 */
@@ -768,9 +862,13 @@ void proxy_commit_poll(int buffering) {
 /* ---------------- 初始化/清理/统计 ---------------- */
 int proxy_commit_init(const char *sock_path,
                       proxy_commit_emit_fn emit,
-                      proxy_commit_fault_fn fault) {
+                      proxy_commit_fault_fn fault,
+                      proxy_commit_replica_fault_fn replica_fault,
+                      proxy_commit_resume_fn resume) {
     g_emit = emit;
     g_fault = fault;
+    g_replica_fault = replica_fault;
+    g_on_resume = resume;
     snprintf(g_sock_path, sizeof(g_sock_path), "%s",
              (sock_path && sock_path[0]) ? sock_path : "./kvstore.commit.sock");
 
@@ -802,20 +900,13 @@ int proxy_commit_init(const char *sock_path,
 
 void proxy_commit_cleanup(void) {
     proxy_commit_purge();
+    g_replica_mask = 0;
+    g_replica_buffering = 0;
     if (g_master_fd >= 0) { close(g_master_fd); g_master_fd = -1; }
     if (g_listen_fd >= 0) { close(g_listen_fd); g_listen_fd = -1; }
     if (g_sock_path[0]) unlink(g_sock_path);
 }
 
-int proxy_commit_recovery_pending(void) {
-    return g_wait_resume || g_rec_bytes > 0;
-}
-
-int proxy_commit_take_resume_event(void) {
-    int v = g_resume_event;
-    g_resume_event = 0;
-    return v;
-}
 
 void proxy_commit_get_stats(proxy_commit_stats_t *out) {
     if (!out) return;
@@ -840,8 +931,6 @@ void proxy_commit_get_stats(proxy_commit_stats_t *out) {
     long long now = pc_now_ms();
     long long oldest = 0;
     if (g_ready_head) oldest = g_ready_head->created_ms;
-    if (g_wait_resume_ms && (oldest == 0 || g_wait_resume_ms < oldest))
-        oldest = g_wait_resume_ms;
     for (int i = 0; i < PC_MAX_COOKIES; ++i) {
         for (pc_ctx_t *c = g_buckets[i]; c; c = c->next) {
             long long t = 0;

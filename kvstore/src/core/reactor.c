@@ -139,6 +139,7 @@ static void on_accept(conn_t *lc) {
 
         c->fd = cfd;
         c->repl_transport_kind = KVS_REPL_TRANSPORT_TCP;
+        c->repl_slot = -1;   /* 多副本 proxy slot：注册前无效 */
         (void)kvs_socket_cookie(cfd, &c->repl_socket_cookie);
         kvs_conn_register(c);
         if (repl_commit_active_mode()) repl_commit_baseline(c);
@@ -340,6 +341,9 @@ int reactor_start(void) {
             repl_barrier_tick();
             g_last_expire = now;
         }
+        /* 并发 RDMA 全量同步：后台 worker 的完成/失败事件必须在 owner 线程处理
+         * （发 FULLSYNCEND / 只拒绝失败副本）。每轮都 drain，空闲时开销是一次空遍历。 */
+        repl_rdma_fs_tick();
 
         if (n < 0) {
             if (errno == EINTR) continue;
@@ -406,5 +410,9 @@ int reactor_start(void) {
         flush_conn_output(NULL);
     }
 
+    /* 事件循环正常退出（epoll 错误）时收敛并发 RDMA fullsync 资源。
+     * 注意：SIGINT/SIGTERM 仍走默认动作直接退出，由 OS 回收；这里覆盖的是
+     * reactor_start() 返回的控制路径。 */
+    repl_rdma_fs_shutdown();
     return 0;
 }

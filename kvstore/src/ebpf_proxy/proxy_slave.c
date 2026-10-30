@@ -131,6 +131,55 @@ int proxy_slave_fd(proxy_slave_ctx_t *ctx) {
     return slave_locked_fd(ctx);
 }
 
+int proxy_slave_handshake(proxy_slave_ctx_t *ctx, unsigned long long token) {
+    char cmd[64], buf[128];
+    int len = snprintf(cmd, sizeof(cmd), "REPLDATA %llu\r\n", token);
+    int rc = -1;
+    if (len <= 0 || (size_t)len >= sizeof(cmd)) return -1;
+    pthread_mutex_lock(&g_slave_lock);
+    if (!ctx || ctx->fd <= 0) {
+        pthread_mutex_unlock(&g_slave_lock);
+        return -1;
+    }
+    size_t off = 0;
+    while (off < (size_t)len) {
+        ssize_t w = send(ctx->fd, cmd + off, (size_t)len - off, MSG_NOSIGNAL);
+        if (w > 0) { off += (size_t)w; continue; }
+        if (w < 0 && errno == EINTR) continue;
+        break;
+    }
+    if (off == (size_t)len) {
+        ssize_t r;
+        do {
+            r = recv(ctx->fd, buf, sizeof(buf) - 1, 0);
+        } while (r < 0 && errno == EINTR);
+        if (r > 0) {
+            buf[r] = '\0';
+            rc = (r >= 3 && buf[0] == '+' && buf[1] == 'O' && buf[2] == 'K') ? 0 : -1;
+        }
+    }
+    pthread_mutex_unlock(&g_slave_lock);
+    return rc;
+}
+
+int proxy_slave_drain(proxy_slave_ctx_t *ctx) {
+    char buf[4096];
+    int closed = 0;
+    pthread_mutex_lock(&g_slave_lock);
+    if (ctx && ctx->fd > 0) {
+        /* 有界排空：避免对端持续输出时在本线程无限循环。 */
+        for (int i = 0; i < 64; i++) {
+            ssize_t n = recv(ctx->fd, buf, sizeof(buf), MSG_DONTWAIT);
+            if (n > 0) continue;
+            if (n == 0) { closed = 1; break; }
+            if (errno == EINTR) continue;
+            break;   /* EAGAIN/EWOULDBLOCK 或错误：留给写路径处理 */
+        }
+    }
+    pthread_mutex_unlock(&g_slave_lock);
+    return closed ? -1 : 0;
+}
+
 ssize_t proxy_slave_writev(proxy_slave_ctx_t *ctx, struct iovec *iov, int iovcnt) {
     ssize_t w = -1;
     pthread_mutex_lock(&g_slave_lock);
