@@ -308,7 +308,11 @@ $(CLIENT_CAPTURE_BPF_OBJ): $(CLIENT_CAPTURE_BPF_SRC)
 	@mkdir -p build/replication/bpf
 	$(CLANG) $(BPF_KPROBE_CFLAGS) -c $< -o $@
 
-client_capture_bpf: $(CLIENT_CAPTURE_BPF_OBJ)
+# ABI 由编译宏决定；强制每次显式构建，避免 make 认为旧 .bpf.o 仍是最新。
+.PHONY: client_capture_bpf
+client_capture_bpf: $(CLIENT_CAPTURE_BPF_SRC)
+	@mkdir -p build/replication/bpf
+	$(CLANG) $(BPF_KPROBE_CFLAGS) -c $< -o $(CLIENT_CAPTURE_BPF_OBJ)
 
 # ---- 持久化演示测试 ----
 TEST_PERSIST_DUMP_SRC=tests/test_persist_dump_demo.c
