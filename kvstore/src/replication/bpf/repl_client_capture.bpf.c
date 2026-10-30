@@ -4,8 +4,9 @@
 // fexit: 从 ctx[5] 直接取 tcp_recvmsg 返回值（实际读字节数），
 //        再从 msghdr（ctx[1]）读取已接收数据，写入 ringbuf。
 //
-// kernel 6.1.176 已实测：ctx[5] = tcp_recvmsg 返回值。因此不再需要
-// fentry 保存 count_before，也无需 per-thread 上下文 map。
+// kernel 6.1.176 已实测：ctx[5] = tcp_recvmsg 返回值（5 参数签名）。
+// kernel 5.15 的 tcp_recvmsg 是 6 参数签名，返回值为 ctx[6] 且宽度为 int；
+// 在目标内核上用 -DKVS_TCP_RECVMSG_6ARGS=1 编译（Makefile: BPF_KERNEL_5_15=1）。
 // ============================================================
 
 #include <linux/bpf.h>
@@ -186,7 +187,11 @@ int fexit_tcp_recvmsg(__u64 *ctx)
     /* tcp_recvmsg 返回类型是 int；ctx[5] 在错误返回时可能是未符号扩展的
      * 32 位负数（如 EAGAIN=0xFFFFFFF5），直接当 long long 会变成巨大正数并
      * 误判截断。必须按 int 解释。 */
+#ifdef KVS_TCP_RECVMSG_6ARGS
+    int ret_i = ((int *)ctx)[6];   /* kernel 5.15: 6 args, return at ctx[6] */
+#else
     int ret_i = (int)(__u32)ctx[5];
+#endif
     if (ret_i <= 0) {
         cstat_inc(ST_RETVAL_LE0);
         return 0;
